@@ -1,0 +1,47 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# Bluetooth traces, packet captures, and diagnostic output
+*.btsnoop
+*.btsnoop.*
+*.log
+*.pcap
+*.pcapng
+captures/
+dumps/
+
+# Credentials and secrets
+*keys*.json
+*Keys*.json
+*linkkey*
+*LinkKey*
+secrets/
+credentials/
+*.pem
+*.key
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
