@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock
+
 from airpods_hr.address import BluetoothAddress, InvalidBluetoothAddressError
-from airpods_hr.discovery import BlueZDeviceDiscovery, MultipleAirPodsCandidatesError, NoAirPodsCandidatesError, select_single_candidate
+from airpods_hr.discovery import (
+    BlueZDeviceDiscovery,
+    MultipleAirPodsCandidatesError,
+    NoAirPodsCandidatesError,
+    select_single_candidate,
+)
+from tools.probe_device_discovery import run_probe
 
 
 def synthetic_address(start: int) -> str:
     return ":".join(f"{start + offset:02x}" for offset in range(6))
-
 
 
 def device_object(
@@ -31,7 +38,6 @@ def device_object(
     return {"org.bluez.Device1": properties}
 
 
-
 def managed_objects(
     devices: dict[str, dict[str, dict[str, object]]],
 ) -> dict[str, dict[str, dict[str, object]]]:
@@ -46,14 +52,12 @@ def managed_objects(
     }
 
 
-
 class FakeManagedObjectsBackend:
     def __init__(self, objects: dict[str, dict[str, dict[str, object]]]) -> None:
         self.objects = objects
 
     async def get_managed_objects(self):
         return self.objects
-
 
 
 class BluetoothAddressTests(unittest.TestCase):
@@ -90,7 +94,6 @@ class BluetoothAddressTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(InvalidBluetoothAddressError):
                     BluetoothAddress.parse(value)
-
 
 
 class BlueZDeviceDiscoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -180,3 +183,22 @@ class BlueZDeviceDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(candidates, ())
 
+
+class DeviceDiscoveryProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_dry_run_does_not_create_backend(self) -> None:
+        factory = AsyncMock()
+        output: list[str] = []
+
+        result = await run_probe(
+            discover=False,
+            output=output.append,
+            backend_factory=factory,
+        )
+
+        self.assertEqual(result, 0)
+        factory.assert_not_awaited()
+        self.assertTrue(output[0].startswith("DRY RUN"))
+
+
+if __name__ == "__main__":
+    unittest.main()
