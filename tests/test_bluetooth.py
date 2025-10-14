@@ -6,8 +6,17 @@ import asyncio
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
-from airpods_hr.bluetooth import AdapterNotFoundError, AdapterReappearanceTimeoutError, AdapterRestoreError, AdapterState, BumbleHCITransportBackend, ControllerPermissionError, ControllerHandoff
-from airpods_hr.bluetooth import AdapterNotFoundError, AdapterReappearanceTimeoutError, AdapterRestoreError, AdapterState, ControllerHandoff
+
+from airpods_hr.bluetooth import (
+    AdapterNotFoundError,
+    AdapterReappearanceTimeoutError,
+    AdapterRestoreError,
+    AdapterState,
+    BumbleHCITransportBackend,
+    ControllerPermissionError,
+    ControllerHandoff,
+)
+from tools.probe_controller_handoff import run_probe
 
 
 class FakeClock:
@@ -19,7 +28,6 @@ class FakeClock:
 
     async def sleep(self, delay: float) -> None:
         self.now += delay
-
 
 
 class FakeBlueZ:
@@ -65,7 +73,6 @@ class FakeBlueZ:
         self.events.append("close")
 
 
-
 class FakeTransport:
     def __init__(
         self,
@@ -94,7 +101,6 @@ class FakeTransport:
                 self.on_release()
 
 
-
 def make_handoff(bluez: FakeBlueZ, transport: FakeTransport, clock: FakeClock):
     return ControllerHandoff(
         bluez,
@@ -105,7 +111,6 @@ def make_handoff(bluez: FakeBlueZ, transport: FakeTransport, clock: FakeClock):
         sleep=clock.sleep,
         clock=clock.monotonic,
     )
-
 
 
 class ControllerHandoffTests(unittest.IsolatedAsyncioTestCase):
@@ -312,6 +317,54 @@ class ControllerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(caught.exception.__cause__, RuntimeError)
 
 
+class ProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dry_run_does_not_create_or_invoke_backends(self) -> None:
+        factory = AsyncMock()
+        output: list[str] = []
+
+        result = await run_probe(
+            adapter_name="hci0",
+            execute=False,
+            output=output.append,
+            backend_factory=factory,
+        )
+
+        self.assertEqual(result, 0)
+        factory.assert_not_awaited()
+        self.assertTrue(output[0].startswith("DRY RUN"))
+
+    async def test_restore_failure_diagnostic_only_reads_final_state(self) -> None:
+        events: list[str] = []
+        output: list[str] = []
+        clock = FakeClock()
+        bluez = FakeBlueZ(powered=True, events=events)
+        bluez.fail_restore = True
+        transport = FakeTransport(events=events)
+
+        async def backend_factory():
+            return bluez, transport
+
+        result = await run_probe(
+            adapter_name="hci0",
+            execute=True,
+            output=output.append,
+            backend_factory=backend_factory,
+            handoff_factory=lambda selected_bluez, selected_transport: make_handoff(
+                selected_bluez, selected_transport, clock
+            ),
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(result, 1)
+        self.assertTrue(
+            any(
+                line.startswith("FAIL: restoration operation reported")
+                for line in output
+            )
+        )
+        self.assertIn("Final observed adapter state: Powered=False", output)
+        self.assertEqual(events[-2:], ["read:False", "close"])
+
 
 class BumbleTransportBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_permission_failure_has_concise_dedicated_error(self) -> None:
@@ -324,3 +377,6 @@ class BumbleTransportBackendTests(unittest.IsolatedAsyncioTestCase):
             async with backend.acquire(0):
                 self.fail("transport body must not run")
 
+
+if __name__ == "__main__":
+    unittest.main()
