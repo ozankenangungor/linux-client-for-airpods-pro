@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import unittest
 from contextlib import asynccontextmanager
-
-
+from unittest.mock import AsyncMock
+from airpods_hr.bluetooth import AdapterNotFoundError, AdapterReappearanceTimeoutError, AdapterRestoreError, AdapterState, BumbleHCITransportBackend, ControllerPermissionError, ControllerHandoff
 from airpods_hr.bluetooth import AdapterNotFoundError, AdapterReappearanceTimeoutError, AdapterRestoreError, AdapterState, ControllerHandoff
 
 
@@ -19,6 +19,7 @@ class FakeClock:
 
     async def sleep(self, delay: float) -> None:
         self.now += delay
+
 
 
 class FakeBlueZ:
@@ -64,6 +65,7 @@ class FakeBlueZ:
         self.events.append("close")
 
 
+
 class FakeTransport:
     def __init__(
         self,
@@ -92,6 +94,7 @@ class FakeTransport:
                 self.on_release()
 
 
+
 def make_handoff(bluez: FakeBlueZ, transport: FakeTransport, clock: FakeClock):
     return ControllerHandoff(
         bluez,
@@ -102,6 +105,7 @@ def make_handoff(bluez: FakeBlueZ, transport: FakeTransport, clock: FakeClock):
         sleep=clock.sleep,
         clock=clock.monotonic,
     )
+
 
 
 class ControllerHandoffTests(unittest.IsolatedAsyncioTestCase):
@@ -307,4 +311,16 @@ class ControllerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Powered=True", str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, RuntimeError)
 
+
+
+class BumbleTransportBackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_failure_has_concise_dedicated_error(self) -> None:
+        backend = BumbleHCITransportBackend()
+        backend._open_transport = AsyncMock(side_effect=PermissionError)
+
+        with self.assertRaisesRegex(
+            ControllerPermissionError, "permission denied opening"
+        ):
+            async with backend.acquire(0):
+                self.fail("transport body must not run")
 

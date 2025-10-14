@@ -8,17 +8,29 @@ Real backends import their optional dependencies only when used.
 from __future__ import annotations
 
 import asyncio
-
-
+import errno
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncContextManager, Protocol, TypeVar
+from typing import Any, AsyncContextManager, Protocol, TypeVar
 
 
 class HandoffError(RuntimeError):
     """Base error for controller handoff failures."""
+
+
+class OptionalDependencyError(HandoffError):
+    """Raised when a real backend's optional dependency is unavailable."""
+
+
+class BlueZUnavailableError(HandoffError):
+    """Raised when the BlueZ service cannot be reached over D-Bus."""
+
+
+class BlueZOperationError(HandoffError):
+    """Raised when a BlueZ D-Bus operation fails."""
 
 
 class AdapterNotFoundError(HandoffError):
@@ -35,6 +47,14 @@ class AdapterRestoreError(HandoffError):
 
 class AdapterReappearanceTimeoutError(AdapterRestoreError):
     """Raised when an adapter does not reappear in BlueZ after handoff."""
+
+
+class ControllerPermissionError(HandoffError):
+    """Raised when HCI user-channel access is denied."""
+
+
+class TransportAcquisitionError(HandoffError):
+    """Raised when Bumble cannot acquire the HCI user-channel transport."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,3 +273,172 @@ class ControllerHandoff:
         return await asyncio.wait_for(operation(), timeout=remaining)
 
 
+class DBusNextBlueZBackend:
+    """BlueZ Adapter1 backend implemented with the pure-Python dbus-next API.
+
+    Every adapter operation starts from ObjectManager data. In particular,
+    restoration does not retain or reuse an adapter proxy that existed before
+    the HCI user channel was acquired.
+    """
+
+    BLUEZ_SERVICE = "org.bluez"
+    OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
+    PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+    ADAPTER_INTERFACE = "org.bluez.Adapter1"
+    _ADAPTER_NAME = re.compile(r"^hci(?P<index>[0-9]+)$")
+
+    def __init__(self) -> None:
+        self._bus: Any | None = None
+        self._variant_type: Any | None = None
+
+    async def connect(self) -> None:
+        if self._bus is not None:
+            return
+
+        try:
+            from dbus_next import BusType, Variant
+            from dbus_next.aio import MessageBus
+        except ModuleNotFoundError as error:
+            raise OptionalDependencyError(
+                "dbus-next is required for the live controller handoff probe"
+            ) from error
+
+        try:
+            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            self._variant_type = Variant
+        except Exception as error:
+            raise BlueZUnavailableError(
+                "could not connect to the system D-Bus"
+            ) from error
+
+    def close(self) -> None:
+        """Disconnect from D-Bus without changing adapter state."""
+
+        if self._bus is not None:
+            self._bus.disconnect()
+            self._bus = None
+
+    async def ensure_available(self) -> None:
+        await self._get_managed_objects()
+
+    async def get_adapter(self, adapter_name: str) -> AdapterState:
+        adapter_path, properties = await self._find_adapter(adapter_name)
+        del adapter_path
+        powered = properties.get("Powered")
+        if powered is None:
+            raise BlueZOperationError(
+                f"BlueZ adapter {adapter_name} has no Powered property"
+            )
+        return AdapterState(
+            name=adapter_name,
+            index=self._adapter_index(adapter_name),
+            powered=bool(powered.value),
+        )
+
+    async def set_powered(self, adapter_name: str, powered: bool) -> None:
+        adapter_path, _ = await self._find_adapter(adapter_name)
+        bus = self._require_bus()
+
+        try:
+            introspection = await bus.introspect(self.BLUEZ_SERVICE, adapter_path)
+            proxy = bus.get_proxy_object(
+                self.BLUEZ_SERVICE, adapter_path, introspection
+            )
+            properties = proxy.get_interface(self.PROPERTIES_INTERFACE)
+            await properties.call_set(
+                self.ADAPTER_INTERFACE,
+                "Powered",
+                self._variant_type("b", powered),
+            )
+        except Exception as error:
+            raise BlueZOperationError(
+                f"could not set {adapter_name} Powered={powered}"
+            ) from error
+
+    async def _find_adapter(
+        self, adapter_name: str
+    ) -> tuple[str, dict[str, Any]]:
+        self._adapter_index(adapter_name)
+        managed_objects = await self._get_managed_objects()
+
+        for object_path, interfaces in managed_objects.items():
+            if object_path.rsplit("/", 1)[-1] != adapter_name:
+                continue
+            adapter_properties = interfaces.get(self.ADAPTER_INTERFACE)
+            if adapter_properties is not None:
+                return object_path, adapter_properties
+
+        raise AdapterNotFoundError(
+            f"BlueZ adapter {adapter_name} is not currently available"
+        )
+
+    async def _get_managed_objects(self) -> dict[str, Any]:
+        bus = self._require_bus()
+        try:
+            introspection = await bus.introspect(self.BLUEZ_SERVICE, "/")
+            proxy = bus.get_proxy_object(self.BLUEZ_SERVICE, "/", introspection)
+            manager = proxy.get_interface(self.OBJECT_MANAGER_INTERFACE)
+            return await manager.call_get_managed_objects()
+        except Exception as error:
+            raise BlueZUnavailableError(
+                "org.bluez is not available on the system bus"
+            ) from error
+
+    def _require_bus(self) -> Any:
+        if self._bus is None:
+            raise BlueZUnavailableError("the system D-Bus backend is not connected")
+        return self._bus
+
+    @classmethod
+    def _adapter_index(cls, adapter_name: str) -> int:
+        match = cls._ADAPTER_NAME.fullmatch(adapter_name)
+        if match is None:
+            raise ValueError("adapter must use the form hci<index>")
+        return int(match.group("index"))
+
+
+class BumbleHCITransportBackend:
+    """Acquire only Bumble's Linux hci-socket transport, without a Device."""
+
+    def __init__(self) -> None:
+        self._open_transport: Any | None = None
+
+    async def ensure_available(self) -> None:
+        if self._open_transport is not None:
+            return
+        try:
+            from bumble.transport import open_transport
+        except ModuleNotFoundError as error:
+            raise OptionalDependencyError(
+                "Bumble is required for the live controller handoff probe"
+            ) from error
+        self._open_transport = open_transport
+
+    @asynccontextmanager
+    async def acquire(self, adapter_index: int) -> AsyncIterator[object]:
+        await self.ensure_available()
+        transport_spec = f"hci-socket:{adapter_index}"
+
+        try:
+            transport = await self._open_transport(transport_spec)
+        except PermissionError as error:
+            raise ControllerPermissionError(
+                "permission denied opening the HCI user channel; "
+                "run the reviewed probe with appropriate privileges"
+            ) from error
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EPERM):
+                raise ControllerPermissionError(
+                    "permission denied opening the HCI user channel; "
+                    "run the reviewed probe with appropriate privileges"
+                ) from error
+            raise TransportAcquisitionError(
+                f"could not open {transport_spec}"
+            ) from error
+        except Exception as error:
+            raise TransportAcquisitionError(
+                f"could not open {transport_spec}"
+            ) from error
+
+        async with transport as active_transport:
+            yield active_transport
