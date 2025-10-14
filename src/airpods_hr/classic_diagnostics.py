@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol
 
 
 class RuntimeNameProfile(StrEnum):
@@ -150,3 +151,132 @@ POWER_ON_NOT_EXPLICITLY_WRITTEN: tuple[str, ...] = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ClassicHostStateSnapshot:
+    """Allowlisted configured and observed Classic controller state."""
+
+    runtime_name_profile: RuntimeNameProfile
+    classic_enabled: bool
+    le_enabled: bool
+    connectable: bool
+    discoverable: bool
+    configured_ssp_enabled: bool
+    configured_sc_enabled: bool
+    configured_io_capability: int
+    observed_local_name_matches_profile: bool | None = None
+    observed_class_of_device: int | None = None
+    observed_authentication_enable: int | None = None
+    observed_simple_pairing_mode: int | None = None
+    observed_secure_connections_host_support: int | None = None
+    observed_scan_enable: int | None = None
+    observed_page_timeout: int | None = None
+    observed_page_scan_type: int | None = None
+    observed_page_scan_interval: int | None = None
+    observed_page_scan_window: int | None = None
+    observed_default_link_policy: int | None = None
+    unavailable_fields: tuple[str, ...] = ()
+
+
+class _ReadableBumbleDevice(Protocol):
+    config: object
+    classic_enabled: bool
+    le_enabled: bool
+    connectable: bool
+    discoverable: bool
+    classic_ssp_enabled: bool
+    classic_sc_enabled: bool
+    host: object
+
+    async def send_sync_command(self, command: object) -> object: ...
+
+
+class ClassicHostStateObserver:
+    """Best-effort read-only HCI snapshot for the temporary Bumble Device."""
+
+    _READS = (
+        ("local_name_matches_profile", "HCI_Read_Local_Name_Command"),
+        ("class_of_device", "HCI_Read_Class_Of_Device_Command"),
+        ("authentication_enable", "HCI_Read_Authentication_Enable_Command"),
+        ("simple_pairing_mode", "HCI_Read_Simple_Pairing_Mode_Command"),
+        (
+            "secure_connections_host_support",
+            "HCI_Read_Secure_Connections_Host_Support_Command",
+        ),
+        ("scan_enable", "HCI_Read_Scan_Enable_Command"),
+        ("page_timeout", "HCI_Read_Page_Timeout_Command"),
+        ("page_scan_type", "HCI_Read_Page_Scan_Type_Command"),
+        ("page_scan_activity", "HCI_Read_Page_Scan_Activity_Command"),
+        (
+            "default_link_policy",
+            "HCI_Read_Default_Link_Policy_Settings_Command",
+        ),
+    )
+
+    async def capture(
+        self,
+        device: _ReadableBumbleDevice,
+        runtime_name_profile: RuntimeNameProfile,
+    ) -> ClassicHostStateSnapshot:
+        """Read supported fields; failures become allowlisted availability flags."""
+
+        from bumble import hci
+
+        values: dict[str, int | bool] = {}
+        unavailable: list[str] = []
+        supports_command = getattr(device.host, "supports_command", None)
+        for field_name, command_name in self._READS:
+            command_type = getattr(hci, command_name, None)
+            if command_type is None:
+                unavailable.append(field_name)
+                continue
+            command = command_type()
+            if callable(supports_command) and not supports_command(command.op_code):
+                unavailable.append(field_name)
+                continue
+            try:
+                response = await device.send_sync_command(command)
+            except Exception:
+                unavailable.append(field_name)
+                continue
+
+            if field_name == "local_name_matches_profile":
+                matches = local_name_matches_profile(
+                    response.local_name,
+                    runtime_name_profile,
+                )
+                if matches is None:
+                    unavailable.append(field_name)
+                else:
+                    values[field_name] = matches
+            elif field_name == "page_scan_activity":
+                values["page_scan_interval"] = int(response.page_scan_interval)
+                values["page_scan_window"] = int(response.page_scan_window)
+            else:
+                values[field_name] = int(getattr(response, field_name))
+
+        return ClassicHostStateSnapshot(
+            runtime_name_profile=RuntimeNameProfile(runtime_name_profile),
+            classic_enabled=bool(device.classic_enabled),
+            le_enabled=bool(device.le_enabled),
+            connectable=bool(device.connectable),
+            discoverable=bool(device.discoverable),
+            configured_ssp_enabled=bool(device.classic_ssp_enabled),
+            configured_sc_enabled=bool(device.classic_sc_enabled),
+            configured_io_capability=int(device.config.io_capability),
+            observed_local_name_matches_profile=values.get(
+                "local_name_matches_profile"
+            ),
+            observed_class_of_device=values.get("class_of_device"),
+            observed_authentication_enable=values.get("authentication_enable"),
+            observed_simple_pairing_mode=values.get("simple_pairing_mode"),
+            observed_secure_connections_host_support=values.get(
+                "secure_connections_host_support"
+            ),
+            observed_scan_enable=values.get("scan_enable"),
+            observed_page_timeout=values.get("page_timeout"),
+            observed_page_scan_type=values.get("page_scan_type"),
+            observed_page_scan_interval=values.get("page_scan_interval"),
+            observed_page_scan_window=values.get("page_scan_window"),
+            observed_default_link_policy=values.get("default_link_policy"),
+            unavailable_fields=tuple(unavailable),
+        )
