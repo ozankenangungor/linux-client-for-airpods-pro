@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-
+import asyncio
 import unittest
-
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from bumble import sdp
@@ -19,7 +19,7 @@ from bumble.core import (
     BT_RFCOMM_PROTOCOL_ID,
 )
 
-
+from airpods_hr.authentication import BumbleClassicRuntime
 from airpods_hr.sdp import (
     AUDIO_SOURCE_HANDLE,
     AVDTP_L2CAP_PSM,
@@ -134,4 +134,53 @@ class SDPRecordTests(unittest.TestCase):
             build_sdp_compatibility_records(self.identity)
         register.assert_not_called()
 
+    def test_records_are_temporary_on_the_bumble_device(self) -> None:
+        original = {7: []}
+        device = SimpleNamespace(sdp_service_records=original)
+        runtime = BumbleClassicRuntime(
+            device,
+            connect_timeout=1,
+            security_timeout=1,
+            disconnect_timeout=1,
+        )
 
+        with runtime.temporary_sdp_records(self.records):
+            self.assertIs(device.sdp_service_records, self.records)
+
+        self.assertIs(device.sdp_service_records, original)
+
+    def test_records_are_restored_after_nested_failure(self) -> None:
+        original = {7: []}
+        device = SimpleNamespace(sdp_service_records=original)
+        runtime = BumbleClassicRuntime(
+            device,
+            connect_timeout=1,
+            security_timeout=1,
+            disconnect_timeout=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            with runtime.temporary_sdp_records(self.records):
+                raise RuntimeError("synthetic")
+
+        self.assertIs(device.sdp_service_records, original)
+
+    def test_records_are_restored_after_cancellation(self) -> None:
+        original = {7: []}
+        device = SimpleNamespace(sdp_service_records=original)
+        runtime = BumbleClassicRuntime(
+            device,
+            connect_timeout=1,
+            security_timeout=1,
+            disconnect_timeout=1,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            with runtime.temporary_sdp_records(self.records):
+                raise asyncio.CancelledError
+
+        self.assertIs(device.sdp_service_records, original)
+
+
+if __name__ == "__main__":
+    unittest.main()
