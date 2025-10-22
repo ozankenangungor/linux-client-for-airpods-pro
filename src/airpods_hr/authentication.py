@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
-
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractContextManager, asynccontextmanager, contextmanager, nullcontext
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import AsyncContextManager, Protocol
 
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluetooth import (
@@ -22,10 +22,32 @@ from airpods_hr.classic_diagnostics import (
     RuntimeNameProfile,
     runtime_name_for_profile,
 )
+from airpods_hr.discovery import (
+    AirPodsCandidate,
+    select_single_candidate,
+)
+from airpods_hr.logging_safety import harden_bumble_logging
+from airpods_hr.pairing import ClassicPairingCredentials
 
 
 class ClassicAuthenticationError(RuntimeError):
     """Base error for an authentication-only session."""
+
+
+class ClassicConnectionError(ClassicAuthenticationError):
+    """Raised when the BR/EDR connection cannot be established."""
+
+
+class ClassicAuthenticationFailedError(ClassicAuthenticationError):
+    """Raised when Classic authentication fails or is not observed."""
+
+
+class ClassicEncryptionFailedError(ClassicAuthenticationError):
+    """Raised when Classic encryption fails or is not observed."""
+
+
+class ClassicDisconnectError(ClassicAuthenticationError):
+    """Raised when an established connection cannot be disconnected."""
 
 
 class BumbleDeviceLifecycleError(ClassicAuthenticationError):
@@ -44,6 +66,46 @@ class AuthenticationProgress(StrEnum):
 
 
 ProgressCallback = Callable[[AuthenticationProgress, str | None], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ClassicAuthenticationResult:
+    """Non-secret result of a completed authentication probe."""
+
+    display_name: str
+    replacement_key_reported: bool
+
+
+@dataclass(slots=True)
+class _ReplacementKeyState:
+    reported: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedClassicContext:
+    """An authenticated and encrypted Classic connection held by its session."""
+
+    display_name: str
+    connection: ClassicConnection
+    _replacement_key_state: _ReplacementKeyState
+    adapter_modalias: str | None = None
+    host_state_snapshot: ClassicHostStateSnapshot | None = None
+
+    @property
+    def replacement_key_reported(self) -> bool:
+        return self._replacement_key_state.reported
+
+
+class CandidateDiscovery(Protocol):
+    async def discover_candidates(self) -> Sequence[AirPodsCandidate]: ...
+
+
+class PairingCredentialSource(Protocol):
+    def load_classic_credentials(
+        self,
+        adapter_address: BluetoothAddress,
+        device_address: BluetoothAddress,
+    ) -> ClassicPairingCredentials: ...
 
 
 class ClassicConnection(Protocol):
@@ -79,6 +141,34 @@ class ClassicRuntime(Protocol):
     def observe_sdp(
         self, observer: SDPDiagnosticsObserver
     ) -> AbstractContextManager[None]: ...
+
+
+class PreparedRuntimeProfile(Protocol):
+    """A candidate-derived profile ready to activate on a Bumble runtime."""
+
+    def activate(
+        self, runtime: ClassicRuntime
+    ) -> AbstractContextManager[None]: ...
+
+
+class PreConnectRuntimeProfile(Protocol):
+    """Prepare profile data before controller handoff begins."""
+
+    def prepare(
+        self, candidate: AirPodsCandidate
+    ) -> PreparedRuntimeProfile: ...
+
+
+class ClassicRuntimeFactory(Protocol):
+    def open(
+        self,
+        active_transport: object,
+        keystore: InMemoryBumbleKeyStore,
+    ) -> AsyncContextManager[ClassicRuntime]: ...
+
+
+class HandoffTransport(Protocol):
+    def acquire(self, adapter_name: str) -> AsyncContextManager[object]: ...
 
 
 class CapturingHCITransportBackend:
@@ -123,6 +213,154 @@ class ControllerHandoffTransport:
     async def acquire(self, adapter_name: str) -> AsyncIterator[object]:
         async with self._controller_handoff.handoff(adapter_name):
             yield self._transport_backend.require_active_transport()
+
+
+class ClassicAuthenticationSession:
+    """Compose discovery, local credentials, handoff, and Classic security."""
+
+    def __init__(
+        self,
+        discovery: CandidateDiscovery,
+        pairing_store: PairingCredentialSource,
+        handoff: HandoffTransport,
+        runtime_factory: ClassicRuntimeFactory,
+        *,
+        progress: ProgressCallback | None = None,
+        logging_hardener: Callable[[], None] = harden_bumble_logging,
+    ) -> None:
+        self._discovery = discovery
+        self._pairing_store = pairing_store
+        self._handoff = handoff
+        self._runtime_factory = runtime_factory
+        self._progress = progress
+        self._logging_hardener = logging_hardener
+
+    async def run(self) -> ClassicAuthenticationResult:
+        authenticated: AuthenticatedClassicContext | None = None
+        async with self.open() as authenticated:
+            pass
+
+        assert authenticated is not None
+        return ClassicAuthenticationResult(
+            display_name=authenticated.display_name,
+            replacement_key_reported=authenticated.replacement_key_reported,
+        )
+
+    @asynccontextmanager
+    async def open(
+        self,
+        *,
+        pre_connect_profile: PreConnectRuntimeProfile | None = None,
+    ) -> AsyncIterator[AuthenticatedClassicContext]:
+        """Hold one authenticated/encrypted connection for a nested operation."""
+
+        candidates = await self._discovery.discover_candidates()
+        candidate = select_single_candidate(candidates)
+        self._emit(AuthenticationProgress.DEVICE_SELECTED, candidate.display_name)
+
+        credentials = self._pairing_store.load_classic_credentials(
+            candidate.adapter_address,
+            candidate.address,
+        )
+        prepared_profile = (
+            pre_connect_profile.prepare(candidate)
+            if pre_connect_profile is not None
+            else None
+        )
+        replacement_key_state = _ReplacementKeyState()
+
+        def on_replacement_key() -> None:
+            replacement_key_state.reported = True
+            self._emit(AuthenticationProgress.REPLACEMENT_KEY_REPORTED)
+
+        keystore = InMemoryBumbleKeyStore(
+            {candidate.address: credentials},
+            replacement_key_observer=on_replacement_key,
+        )
+
+        # This must happen before the Bumble Device is powered on or any
+        # authentication packet can be exchanged.
+        self._logging_hardener()
+
+        async with self._handoff.acquire(candidate.adapter_name) as transport:
+            async with self._runtime_factory.open(transport, keystore) as runtime:
+                connection: ClassicConnection | None = None
+                primary_error: BaseException | None = None
+                try:
+                    profile_context = (
+                        prepared_profile.activate(runtime)
+                        if prepared_profile is not None
+                        else nullcontext()
+                    )
+                    with profile_context:
+                        try:
+                            connection = await runtime.connect(candidate.address)
+                        except Exception:
+                            raise ClassicConnectionError(
+                                "BR/EDR connection failed"
+                            ) from None
+                        self._emit(AuthenticationProgress.CONNECTED)
+
+                        try:
+                            await connection.authenticate()
+                        except Exception:
+                            raise ClassicAuthenticationFailedError(
+                                "Classic authentication failed"
+                            ) from None
+                        if not connection.authenticated:
+                            raise ClassicAuthenticationFailedError(
+                                "Classic authentication was not observed"
+                            )
+                        self._emit(AuthenticationProgress.AUTHENTICATED)
+
+                        try:
+                            await connection.encrypt()
+                        except Exception:
+                            raise ClassicEncryptionFailedError(
+                                "Classic encryption failed"
+                            ) from None
+                        if not connection.encrypted:
+                            raise ClassicEncryptionFailedError(
+                                "Classic encryption was not observed"
+                            )
+                        self._emit(AuthenticationProgress.ENCRYPTED)
+                        yield AuthenticatedClassicContext(
+                            display_name=candidate.display_name,
+                            connection=connection,
+                            _replacement_key_state=replacement_key_state,
+                            adapter_modalias=candidate.adapter_modalias,
+                            host_state_snapshot=getattr(
+                                runtime, "host_state_snapshot", None
+                            ),
+                        )
+                except BaseException as error:
+                    primary_error = error
+                    raise
+                finally:
+                    if connection is not None:
+                        try:
+                            await connection.disconnect()
+                        except BaseException as cleanup_error:
+                            if primary_error is not None:
+                                primary_error.add_note(
+                                    "BR/EDR disconnect also failed during cleanup"
+                                )
+                            elif isinstance(cleanup_error, asyncio.CancelledError):
+                                raise
+                            else:
+                                raise ClassicDisconnectError(
+                                    "BR/EDR disconnect failed"
+                                ) from None
+                        else:
+                            self._emit(AuthenticationProgress.DISCONNECTED)
+
+    def _emit(
+        self,
+        event: AuthenticationProgress,
+        detail: str | None = None,
+    ) -> None:
+        if self._progress is not None:
+            self._progress(event, detail)
 
 
 class BumbleClassicConnection:
