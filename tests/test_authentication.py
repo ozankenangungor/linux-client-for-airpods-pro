@@ -47,6 +47,7 @@ from airpods_hr.pairing import (
     LinkKeySectionMissingError,
 )
 from airpods_hr.sdp import AdapterIdentityError, SDPCompatibilityProfile
+from tools.probe_classic_auth import build_parser, run_probe
 
 
 def synthetic_address(start: int) -> BluetoothAddress:
@@ -680,3 +681,49 @@ class BumbleLoggingSafetyTests(unittest.TestCase):
                 logging.getLogger(name).disabled = disabled
 
 
+class ClassicAuthenticationProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_is_dry_run_by_default(self) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+
+        result = await run_probe(
+            execute=False,
+            output=output.append,
+            live_runner=runner,
+        )
+
+        self.assertEqual(result, 0)
+        runner.assert_not_awaited()
+        self.assertTrue(output[0].startswith("DRY RUN"))
+
+    async def test_execute_is_the_only_live_gate(self) -> None:
+        runner = AsyncMock()
+
+        self.assertFalse(build_parser().parse_args([]).execute)
+        self.assertTrue(build_parser().parse_args(["--execute"]).execute)
+        self.assertEqual(
+            await run_probe(execute=True, live_runner=runner),
+            0,
+        )
+        runner.assert_awaited_once()
+
+    async def test_failure_output_does_not_include_synthetic_key(self) -> None:
+        secret = bytes(reversed(range(16))).hex()
+
+        async def fail(output) -> None:
+            del output
+            raise ClassicConnectionError(secret)
+
+        output: list[str] = []
+        result = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=fail,
+        )
+
+        self.assertEqual(result, 1)
+        self.assertNotIn(secret, "\n".join(output))
+
+
+if __name__ == "__main__":
+    unittest.main()
