@@ -40,6 +40,31 @@ class AAPProgress(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DescriptorEvidence:
+    """Non-sensitive booleans derived from descriptor traffic."""
+
+    sensor_framework: bool = False
+    heart_rate_service: bool = False
+    heart_rate: bool = False
+    heartrate_access: bool = False
+
+    def merged(self, frame: bytes) -> DescriptorEvidence:
+        return DescriptorEvidence(
+            sensor_framework=self.sensor_framework
+            or any(marker in frame for marker in SENSOR_FRAMEWORK_MARKERS),
+            heart_rate_service=self.heart_rate_service
+            or HEART_RATE_SERVICE_MARKER in frame,
+            heart_rate=self.heart_rate or _HEART_RATE_MARKER.search(frame) is not None,
+            heartrate_access=self.heartrate_access
+            or HEART_RATE_ACCESS_MARKER in frame,
+        )
+
+    @property
+    def required(self) -> bool:
+        return self.sensor_framework and self.heart_rate_service
+
+
+@dataclass(frozen=True, slots=True)
 class RecordSuffixSummary:
     """Count one allowlisted pair from an observed 17-byte unit suffix."""
 

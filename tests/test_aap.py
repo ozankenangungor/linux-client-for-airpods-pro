@@ -8,7 +8,7 @@ import unittest
 from dataclasses import fields
 
 
-from airpods_hr.aap import AAPFrameSummary
+from airpods_hr.aap import AAPFrameSummary, DescriptorEvidence
 
 
 ALL_DESCRIPTOR_EVIDENCE = (
@@ -56,6 +56,38 @@ def make_synthetic_type_2b_frame(
     header[6] = 0x05
     header[7:9] = declared_length.to_bytes(2, "little")
     return bytes(header + body)
+
+
+class DescriptorEvidenceTests(unittest.TestCase):
+    def test_heart_rate_service_evidence(self) -> None:
+        evidence = DescriptorEvidence().merged(b"xHeartRateService\x00")
+        self.assertTrue(evidence.heart_rate_service)
+        self.assertFalse(evidence.heart_rate)
+
+    def test_standalone_heart_rate_evidence(self) -> None:
+        evidence = DescriptorEvidence().merged(b"\x09HeartRate\x00")
+        self.assertTrue(evidence.heart_rate)
+        self.assertFalse(evidence.heart_rate_service)
+
+    def test_heartrate_access_evidence(self) -> None:
+        evidence = DescriptorEvidence().merged(
+            b"\x00com.apple.hid.heartrate-access\x00"
+        )
+        self.assertTrue(evidence.heartrate_access)
+
+    def test_sensor_framework_evidence_is_conservative(self) -> None:
+        self.assertTrue(
+            DescriptorEvidence().merged(b"\x00ReportDescriptor\x00").sensor_framework
+        )
+        self.assertFalse(
+            DescriptorEvidence().merged(b"unrelated private device text").sensor_framework
+        )
+
+    def test_result_repr_contains_only_booleans(self) -> None:
+        evidence = DescriptorEvidence().merged(ALL_DESCRIPTOR_EVIDENCE)
+        rendered = repr(evidence)
+        self.assertNotIn("AccessoryService", rendered)
+        self.assertNotIn("com.apple", rendered)
 
 
 class AAPFrameSummaryTests(unittest.TestCase):
