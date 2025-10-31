@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-
+import traceback
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from bumble import l2cap
 
-from airpods_hr.aap_channel import AAPChannelCloseError, AAPChannelOpenError, AAPChannelOpenTimeoutError, AAPChannelSession, AAPChannelStateError
-
-
-from airpods_hr.authentication import BumbleClassicConnection
-
-
+from airpods_hr.aap_channel import (
+    AAPChannelCloseError,
+    AAPChannelOpenError,
+    AAPChannelOpenTimeoutError,
+    AAPChannelSession,
+    AAPChannelStateError,
+    AAPL2CAPProbeSession,
+)
+from airpods_hr.authentication import (
+    AuthenticatedClassicContext,
+    BumbleClassicConnection,
+)
 from airpods_hr.protocol import AAP_PSM
+from tools.probe_aap_l2cap import build_parser, run_probe
 
 
 class CompatibilityRecorder:
@@ -120,6 +127,39 @@ class DeterministicWaitFor:
                 awaitable.close()
             raise self.error
         return await awaitable
+
+
+class FakeSecureSession:
+    def __init__(self, events: list[str], connection: FakeConnection) -> None:
+        self.events = events
+        self.connection = connection
+
+    @asynccontextmanager
+    async def open(self):
+        self.events.extend(
+            [
+                "discovery",
+                "credentials",
+                "logging",
+                "handoff",
+                "transport_acquire",
+                "device_on",
+                "bredr_connect",
+                "authenticate",
+                "encrypt",
+            ]
+        )
+        context = AuthenticatedClassicContext(
+            display_name="Synthetic AirPods",
+            connection=self.connection,
+            _replacement_key_state=SimpleNamespace(reported=False),
+        )
+        try:
+            yield context
+        finally:
+            self.events.extend(
+                ["bredr_disconnect", "device_off", "transport_release", "restore"]
+            )
 
 
 class AAPChannelSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -302,3 +342,182 @@ class AAPChannelSessionTests(unittest.IsolatedAsyncioTestCase):
         raw_connection.create_l2cap_channel.assert_awaited_once_with(spec)
 
 
+class AAPL2CAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    def make_probe_session(self, **channel_options):
+        events: list[str] = []
+        compatibility = CompatibilityRecorder(events)
+        raw_channel = FakeRawChannel(events, compatibility, **channel_options)
+        connection = FakeConnection(
+            events, compatibility, channel=raw_channel
+        )
+        secure = FakeSecureSession(events, connection)
+        channel_session = AAPChannelSession(compatibility=compatibility)
+        return (
+            AAPL2CAPProbeSession(secure, channel_session),
+            raw_channel,
+            connection,
+            events,
+        )
+
+    async def test_channel_close_precedes_bredr_and_controller_cleanup(self) -> None:
+        session, _, _, events = self.make_probe_session()
+
+        result = await session.run()
+
+        self.assertLess(events.index("channel_close"), events.index("compat_exit"))
+        self.assertLess(events.index("compat_exit"), events.index("bredr_disconnect"))
+        self.assertLess(events.index("bredr_disconnect"), events.index("device_off"))
+        self.assertLess(events.index("device_off"), events.index("transport_release"))
+        self.assertLess(events.index("transport_release"), events.index("restore"))
+        self.assertFalse(result.application_payload_sent)
+
+    async def test_l2cap_failure_unwinds_all_outer_resources(self) -> None:
+        events: list[str] = []
+        compatibility = CompatibilityRecorder(events)
+        connection = FakeConnection(
+            events, compatibility, open_error=RuntimeError("negotiation failed")
+        )
+        secure = FakeSecureSession(events, connection)
+        session = AAPL2CAPProbeSession(
+            secure, AAPChannelSession(compatibility=compatibility)
+        )
+
+        with self.assertRaises(AAPChannelOpenError):
+            await session.run()
+
+        self.assertEqual(
+            events[-5:],
+            ["compat_exit", "bredr_disconnect", "device_off", "transport_release", "restore"],
+        )
+
+    async def test_l2cap_timeout_unwinds_all_outer_resources(self) -> None:
+        session, _, connection, events = self.make_probe_session()
+        secure = FakeSecureSession(events, connection)
+        channel_session = AAPChannelSession(
+            compatibility=connection.compatibility,
+            wait_for=DeterministicWaitFor(fail_call=1, error=TimeoutError()),
+        )
+
+        with self.assertRaises(AAPChannelOpenTimeoutError):
+            await AAPL2CAPProbeSession(secure, channel_session).run()
+
+        self.assertEqual(
+            events[-5:],
+            ["compat_exit", "bredr_disconnect", "device_off", "transport_release", "restore"],
+        )
+
+    async def test_cancellation_during_l2cap_open_unwinds_everything(self) -> None:
+        events: list[str] = []
+        compatibility = CompatibilityRecorder(events)
+        connection = FakeConnection(
+            events, compatibility, open_error=asyncio.CancelledError()
+        )
+        secure = FakeSecureSession(events, connection)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await AAPL2CAPProbeSession(
+                secure, AAPChannelSession(compatibility=compatibility)
+            ).run()
+
+        self.assertEqual(
+            events[-5:],
+            ["compat_exit", "bredr_disconnect", "device_off", "transport_release", "restore"],
+        )
+
+    async def test_cancellation_while_channel_held_unwinds_everything(self) -> None:
+        session, _, connection, events = self.make_probe_session()
+
+        class CancellingChannelSession(AAPChannelSession):
+            @asynccontextmanager
+            async def open(self, selected_connection):
+                async with super().open(selected_connection) as channel:
+                    raise asyncio.CancelledError()
+                    yield channel
+
+        secure = FakeSecureSession(events, connection)
+        session = AAPL2CAPProbeSession(
+            secure,
+            CancellingChannelSession(compatibility=connection.compatibility),
+        )
+        with self.assertRaises(asyncio.CancelledError):
+            await session.run()
+
+        self.assertEqual(
+            events[-4:],
+            ["bredr_disconnect", "device_off", "transport_release", "restore"],
+        )
+
+    async def test_channel_close_failure_does_not_leak_outer_resources(self) -> None:
+        session, _, _, events = self.make_probe_session(
+            close_error=RuntimeError("synthetic close failure")
+        )
+
+        with self.assertRaises(AAPChannelCloseError):
+            await session.run()
+
+        self.assertEqual(
+            events[-5:],
+            ["compat_exit", "bredr_disconnect", "device_off", "transport_release", "restore"],
+        )
+
+    async def test_probe_session_never_sends_or_installs_sdp(self) -> None:
+        session, raw_channel, connection, _ = self.make_probe_session(peer_mtu=2582)
+
+        result = await session.run()
+
+        self.assertEqual(raw_channel.application_send_count, 0)
+        self.assertEqual(connection.sdp_install_count, 0)
+        self.assertEqual(result.peer_mtu, 2582)
+
+
+class AAPL2CAPProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dry_run_is_default_and_does_not_create_backend(self) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+
+        result = await run_probe(execute=False, output=output.append, live_runner=runner)
+
+        self.assertEqual(result, 0)
+        runner.assert_not_awaited()
+        self.assertTrue(output[0].startswith("DRY RUN"))
+        self.assertIn("Send no AAP application payload", "\n".join(output))
+
+    async def test_execute_is_the_only_live_gate(self) -> None:
+        runner = AsyncMock()
+
+        self.assertFalse(build_parser().parse_args([]).execute)
+        self.assertTrue(build_parser().parse_args(["--execute"]).execute)
+        self.assertEqual(await run_probe(execute=True, live_runner=runner), 0)
+        runner.assert_awaited_once()
+
+    async def test_probe_failure_output_does_not_expose_synthetic_key(self) -> None:
+        secret = bytes(reversed(range(16))).hex()
+
+        async def fail(output) -> None:
+            del output
+            raise AAPChannelOpenError(secret)
+
+        output: list[str] = []
+        result = await run_probe(execute=True, output=output.append, live_runner=fail)
+
+        self.assertEqual(result, 1)
+        self.assertNotIn(secret, "\n".join(output))
+
+    async def test_channel_exception_traceback_does_not_expose_cause_text(self) -> None:
+        secret = bytes(range(16)).hex()
+        events: list[str] = []
+        compatibility = CompatibilityRecorder(events)
+        connection = FakeConnection(
+            events, compatibility, open_error=RuntimeError(secret)
+        )
+
+        with self.assertRaises(AAPChannelOpenError) as caught:
+            async with AAPChannelSession(compatibility=compatibility).open(connection):
+                pass
+
+        rendered = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn(secret, rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()

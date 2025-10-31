@@ -11,11 +11,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, TypeVar
+from typing import AsyncContextManager, Protocol, TypeVar
 
 from bumble import l2cap
 
-
+from airpods_hr.authentication import AuthenticatedClassicContext
 from airpods_hr.bumble_compat import aap_flush_timeout_compatibility
 from airpods_hr.protocol import AAP_PSM
 
@@ -56,6 +56,10 @@ class AAPClassicConnection(Protocol):
     async def create_l2cap_channel(self, spec: object) -> object: ...
 
 
+class SecureClassicSession(Protocol):
+    def open(self) -> AsyncContextManager[AuthenticatedClassicContext]: ...
+
+
 CompatibilityFactory = Callable[[object], AbstractContextManager[None]]
 WaitFor = Callable[[Awaitable[object], float], Awaitable[object]]
 ProtocolTransport = TypeVar("ProtocolTransport")
@@ -72,6 +76,16 @@ class AAPChannel:
 
 
 AAPProgressCallback = Callable[[AAPChannelProgress, AAPChannel | None], None]
+
+
+@dataclass(frozen=True, slots=True)
+class AAPL2CAPProbeResult:
+    display_name: str
+    local_mtu: int
+    peer_mtu: int
+    mode: str
+    application_payload_sent: bool
+    replacement_key_reported: bool
 
 
 class AAPChannelSession:
@@ -211,3 +225,32 @@ class AAPChannelSession:
             self._progress(event, channel)
 
 
+class AAPL2CAPProbeSession:
+    """Compose the secure Classic session with one signaling-only AAP channel."""
+
+    def __init__(
+        self,
+        secure_session: SecureClassicSession,
+        channel_session: AAPChannelSession,
+    ) -> None:
+        self._secure_session = secure_session
+        self._channel_session = channel_session
+
+    async def run(self) -> AAPL2CAPProbeResult:
+        secure: AuthenticatedClassicContext | None = None
+        channel: AAPChannel | None = None
+        async with self._secure_session.open() as secure:
+            async with self._channel_session.open(secure.connection) as channel:
+                # The probe intentionally performs no operation while the channel
+                # is held. In particular, no application-data method is exposed.
+                pass
+
+        assert secure is not None and channel is not None
+        return AAPL2CAPProbeResult(
+            display_name=secure.display_name,
+            local_mtu=channel.local_mtu,
+            peer_mtu=channel.peer_mtu,
+            mode=channel.mode,
+            application_payload_sent=False,
+            replacement_key_reported=secure.replacement_key_reported,
+        )
