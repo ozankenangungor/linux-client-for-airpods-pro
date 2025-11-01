@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-
+import asyncio
 import re
-from collections.abc import Callable
-
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+
+
+from airpods_hr.aap_channel import AAPChannel
+
+
+from airpods_hr.protocol import HeartRateCommand
 
 
 AAP_HANDSHAKE_REQUEST = bytes.fromhex(
@@ -30,6 +36,14 @@ AAP_FRAME_SUMMARY_LIMIT = 64
 AAP_TYPE_2B_BODY_OFFSET = 17
 AAP_TYPE_2B_UNIT_SIZE = 17
 AAP_TYPE_2B_SUFFIX_HISTOGRAM_LIMIT = 8
+
+
+class AAPHandshakeError(RuntimeError):
+    """Base error for the AAP handshake exchange."""
+
+
+class AAPReceiveStateError(AAPHandshakeError):
+    """Raised when the bounded receive collector is used outside its scope."""
 
 
 class AAPProgress(StrEnum):
@@ -201,5 +215,92 @@ class AAPFrameSummary:
 
 Clock = Callable[[], float]
 AAPProgressCallback = Callable[[AAPProgress], None]
+
+
+class BumbleAAPTransport:
+    """Bounded receive adapter with one deliberately restricted send method."""
+
+    def __init__(
+        self,
+        raw_channel: object,
+        channel: AAPChannel,
+        *,
+        queue_limit: int = 32,
+        frame_size_limit: int = 64 * 1024,
+    ) -> None:
+        if queue_limit <= 0 or frame_size_limit <= 0:
+            raise ValueError("AAP receive limits must be positive")
+        self.channel = channel
+        self._raw_channel = raw_channel
+        self._queue_limit = queue_limit
+        self._frame_size_limit = frame_size_limit
+        self._queue: asyncio.Queue[bytes] | None = None
+        self._application_payloads_sent = 0
+        self.dropped_frames = 0
+
+    @property
+    def application_payloads_sent(self) -> int:
+        return self._application_payloads_sent
+
+    @property
+    def queued_frames(self) -> int:
+        return 0 if self._queue is None else self._queue.qsize()
+
+    @property
+    def pending_receive_frames(self) -> int:
+        """Return only the current bounded receive-queue count."""
+
+        return self.queued_frames
+
+    @asynccontextmanager
+    async def collect(self) -> AsyncIterator[BumbleAAPTransport]:
+        if self._queue is not None:
+            raise AAPReceiveStateError("AAP receive collection is already active")
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=self._queue_limit)
+        previous_sink = self._raw_channel.sink
+
+        def receive_sdu(sdu: bytes) -> None:
+            if not isinstance(sdu, bytes) or len(sdu) > self._frame_size_limit:
+                self.dropped_frames += 1
+                return
+            if queue.full():
+                queue.get_nowait()
+                self.dropped_frames += 1
+            queue.put_nowait(sdu)
+
+        self._queue = queue
+        self._raw_channel.sink = receive_sdu
+        try:
+            yield self
+        finally:
+            self._raw_channel.sink = previous_sink
+            self._queue = None
+
+    def send_handshake_request(self) -> None:
+        if self._queue is None:
+            raise AAPReceiveStateError("AAP receive collection is not active")
+        if self._application_payloads_sent != 0:
+            raise AAPHandshakeError("AAP handshake request was already sent")
+        self._raw_channel.write(AAP_HANDSHAKE_REQUEST)
+        self._application_payloads_sent = 1
+
+    def send_heart_rate_command(self, command: HeartRateCommand) -> None:
+        """Send one member of the verified heart-rate command set."""
+
+        if self._queue is None:
+            raise AAPReceiveStateError("AAP receive collection is not active")
+        if not isinstance(command, HeartRateCommand):
+            raise TypeError("command must be a HeartRateCommand")
+        if self._application_payloads_sent < 1:
+            raise AAPReceiveStateError("AAP handshake has not been sent")
+        self._raw_channel.write(command.payload)
+        self._application_payloads_sent += 1
+
+    async def receive(self, timeout: float) -> bytes:
+        if self._queue is None:
+            raise AAPReceiveStateError("AAP receive collection is not active")
+        if timeout <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
 
 

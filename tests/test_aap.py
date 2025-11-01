@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-
+import asyncio
 import unittest
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 
-from airpods_hr.aap import AAPFrameSummary, DescriptorEvidence
+from bumble import l2cap
+
+from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPFrameSummary, AAPHandshakeError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence
+
+
+from airpods_hr.protocol import AAP_PSM
 
 
 ALL_DESCRIPTOR_EVIDENCE = (
@@ -56,6 +62,24 @@ def make_synthetic_type_2b_frame(
     header[6] = 0x05
     header[7:9] = declared_length.to_bytes(2, "little")
     return bytes(header + body)
+
+
+class FakeRawChannel:
+    def __init__(self) -> None:
+        self.sink = None
+        self.writes: list[bytes] = []
+        self.mtu = 2048
+        self.peer_mtu = 2750
+        self.mode = l2cap.TransmissionMode.BASIC
+        self.state = l2cap.ClassicChannel.State.OPEN
+        self.psm = AAP_PSM
+        self.events: list[str] = []
+
+    def write(self, payload: bytes) -> None:
+        self.writes.append(payload)
+
+    async def disconnect(self) -> None:
+        self.events.append("channel_close")
 
 
 class DescriptorEvidenceTests(unittest.TestCase):
@@ -271,5 +295,75 @@ class AAPType2BFrameSummaryTests(unittest.TestCase):
         assert uniform is not None and differing is not None
         self.assertTrue(uniform.unit_bytes_8_13_uniform)
         self.assertFalse(differing.unit_bytes_8_13_uniform)
+
+
+class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receive_queue_is_bounded_and_drops_oldest(self) -> None:
+        raw = FakeRawChannel()
+        transport = BumbleAAPTransport(raw, SimpleNamespace(), queue_limit=2)
+        async with transport.collect():
+            raw.sink(b"one")
+            raw.sink(b"two")
+            raw.sink(b"three")
+            self.assertEqual(transport.queued_frames, 2)
+            self.assertEqual(transport.dropped_frames, 1)
+            self.assertEqual(await transport.receive(1), b"two")
+            self.assertEqual(await transport.receive(1), b"three")
+
+    async def test_oversized_frame_is_dropped(self) -> None:
+        raw = FakeRawChannel()
+        transport = BumbleAAPTransport(
+            raw, SimpleNamespace(), queue_limit=2, frame_size_limit=3
+        )
+        async with transport.collect():
+            raw.sink(b"four")
+            self.assertEqual(transport.queued_frames, 0)
+            self.assertEqual(transport.dropped_frames, 1)
+
+    async def test_previous_sink_is_restored_on_normal_exit(self) -> None:
+        previous = lambda frame: None
+        raw = FakeRawChannel()
+        raw.sink = previous
+        transport = BumbleAAPTransport(raw, SimpleNamespace())
+        async with transport.collect():
+            self.assertIsNot(raw.sink, previous)
+        self.assertIs(raw.sink, previous)
+
+    async def test_previous_sink_is_restored_on_failure(self) -> None:
+        previous = lambda frame: None
+        raw = FakeRawChannel()
+        raw.sink = previous
+        transport = BumbleAAPTransport(raw, SimpleNamespace())
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            async with transport.collect():
+                raise RuntimeError("synthetic")
+        self.assertIs(raw.sink, previous)
+
+    async def test_previous_sink_is_restored_on_cancellation(self) -> None:
+        previous = lambda frame: None
+        raw = FakeRawChannel()
+        raw.sink = previous
+        transport = BumbleAAPTransport(raw, SimpleNamespace())
+        with self.assertRaises(asyncio.CancelledError):
+            async with transport.collect():
+                raise asyncio.CancelledError
+        self.assertIs(raw.sink, previous)
+
+    async def test_send_is_deliberately_limited_to_one_handshake(self) -> None:
+        raw = FakeRawChannel()
+        transport = BumbleAAPTransport(raw, SimpleNamespace())
+        async with transport.collect():
+            transport.send_handshake_request()
+            with self.assertRaises(AAPHandshakeError):
+                transport.send_handshake_request()
+        self.assertEqual(raw.writes, [AAP_HANDSHAKE_REQUEST])
+        self.assertFalse(hasattr(transport, "write"))
+        self.assertFalse(hasattr(transport, "send"))
+        self.assertFalse(hasattr(transport, "send_pdu"))
+
+    async def test_receive_outside_collection_is_rejected(self) -> None:
+        transport = BumbleAAPTransport(FakeRawChannel(), SimpleNamespace())
+        with self.assertRaises(AAPReceiveStateError):
+            await transport.receive(1)
 
 
