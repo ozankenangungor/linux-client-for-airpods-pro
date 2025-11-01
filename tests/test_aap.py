@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import fields
 from types import SimpleNamespace
 
 
 from bumble import l2cap
 
-from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence
+from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeProbeSession, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
+
+
+from airpods_hr.aap_channel import AAPChannelSession
+from airpods_hr.aap_channel import AAPChannelOpenError
+from airpods_hr.authentication import AuthenticatedClassicContext
 
 
 from airpods_hr.protocol import AAP_PSM
@@ -614,5 +619,228 @@ class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
         transport = BumbleAAPTransport(FakeRawChannel(), SimpleNamespace())
         with self.assertRaises(AAPReceiveStateError):
             await transport.receive(1)
+
+
+class CompatibilityRecorder:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.active = False
+
+    @contextmanager
+    def __call__(self, manager):
+        del manager
+        self.active = True
+        self.events.append("compat_enter")
+        try:
+            yield
+        finally:
+            self.events.append("compat_exit")
+            self.active = False
+
+
+class OrchestrationRawChannel(FakeRawChannel):
+    def __init__(
+        self,
+        events: list[str],
+        compatibility: CompatibilityRecorder,
+        records_active,
+    ) -> None:
+        super().__init__()
+        self.events = events
+        self.compatibility = compatibility
+        self.records_active = records_active
+
+    def write(self, payload: bytes) -> None:
+        if not self.compatibility.active or not self.records_active():
+            raise AssertionError("handshake began outside compatibility lifetime")
+        self.events.append("handshake_send")
+        super().write(payload)
+        self.sink(AAP_HANDSHAKE_ACK)
+        self.sink(ALL_DESCRIPTOR_EVIDENCE)
+
+    async def disconnect(self) -> None:
+        if not self.compatibility.active or not self.records_active():
+            raise AssertionError("channel closed outside compatibility lifetime")
+        self.events.append("channel_close")
+
+
+class OrchestrationConnection:
+    def __init__(
+        self,
+        events: list[str],
+        compatibility: CompatibilityRecorder,
+        records_active,
+    ):
+        self.events = events
+        self.compatibility = compatibility
+        self.l2cap_channel_manager = object()
+        self.open_error = None
+        self.channel = OrchestrationRawChannel(
+            events, compatibility, records_active
+        )
+
+    async def create_l2cap_channel(self, spec):
+        self.assertions = (spec.psm, spec.mode)
+        self.events.append("channel_create")
+        if self.open_error is not None:
+            raise self.open_error
+        return self.channel
+
+
+class OrchestrationRuntime:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.records = None
+
+    @contextmanager
+    def temporary_sdp_records(self, records):
+        self.records = records
+        self.events.append("sdp_enter")
+        try:
+            yield
+        finally:
+            self.events.append("sdp_exit")
+            self.records = None
+
+    @contextmanager
+    def observe_sdp(self, observer):
+        del observer
+        yield
+
+
+class FakeSecureSession:
+    def __init__(
+        self,
+        events: list[str],
+        connection: OrchestrationConnection,
+        runtime: OrchestrationRuntime,
+    ):
+        self.events = events
+        self.connection = connection
+        self.runtime = runtime
+
+    @asynccontextmanager
+    async def open(self, *, pre_connect_profile=None):
+        prepared_profile = pre_connect_profile.prepare(
+            SimpleNamespace(adapter_modalias="usb:v1234p5678d9ABC")
+        )
+        self.events.append("secure_enter")
+        try:
+            with prepared_profile.activate(self.runtime):
+                yield AuthenticatedClassicContext(
+                    "Synthetic AirPods",
+                    self.connection,
+                    SimpleNamespace(reported=False),
+                    "usb:v1234p5678d9ABC",
+                )
+        finally:
+            self.events.append("secure_exit")
+
+
+class AAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    def components(self):
+        events: list[str] = []
+        compatibility = CompatibilityRecorder(events)
+        runtime = OrchestrationRuntime(events)
+        connection = OrchestrationConnection(
+            events, compatibility, lambda: runtime.records is not None
+        )
+        secure = FakeSecureSession(events, connection, runtime)
+        session = AAPHandshakeProbeSession(
+            secure,
+            AAPChannelSession(compatibility=compatibility),
+            AAPHandshakeSession(),
+        )
+        return session, connection, compatibility, events
+
+    async def test_sdp_compatibility_and_handshake_lifetimes(self) -> None:
+        session, connection, compatibility, events = self.components()
+        result = await session.run()
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(connection.channel.writes, [AAP_HANDSHAKE_REQUEST])
+        self.assertEqual(
+            events,
+            [
+                "secure_enter",
+                "sdp_enter",
+                "compat_enter",
+                "channel_create",
+                "handshake_send",
+                "channel_close",
+                "compat_exit",
+                "sdp_exit",
+                "secure_exit",
+            ],
+        )
+        self.assertFalse(compatibility.active)
+        self.assertEqual(connection.assertions[0], AAP_PSM)
+        self.assertEqual(connection.assertions[1], l2cap.TransmissionMode.BASIC)
+
+    async def test_handshake_failure_unwinds_channel_sdp_and_secure_session(self) -> None:
+        session, connection, compatibility, events = self.components()
+
+        class FailingHandshake:
+            async def run(self, transport):
+                async with transport.collect():
+                    transport.send_handshake_request()
+                    raise AAPHandshakeTimeoutError("synthetic timeout")
+
+        session._handshake_session = FailingHandshake()
+        with self.assertRaises(AAPHandshakeTimeoutError):
+            await session.run()
+        self.assertEqual(events[-4:], ["channel_close", "compat_exit", "sdp_exit", "secure_exit"])
+        self.assertFalse(compatibility.active)
+
+    async def test_channel_open_failure_restores_sdp_and_secure_session(self) -> None:
+        session, connection, compatibility, events = self.components()
+        connection.open_error = RuntimeError("synthetic channel failure")
+
+        with self.assertRaises(AAPChannelOpenError):
+            await session.run()
+
+        self.assertEqual(
+            events[-4:],
+            ["channel_create", "compat_exit", "sdp_exit", "secure_exit"],
+        )
+        self.assertFalse(compatibility.active)
+
+    async def test_descriptor_timeout_unwinds_channel_sdp_and_secure_session(self) -> None:
+        session, connection, compatibility, events = self.components()
+
+        class DescriptorTimeoutHandshake:
+            async def run(self, transport):
+                async with transport.collect():
+                    transport.send_handshake_request()
+                    self.assert_ack = await transport.receive(1)
+                    raise AAPDescriptorObservationTimeoutError(
+                        HandshakeObservation(True, DescriptorEvidence())
+                    )
+
+        timeout = DescriptorTimeoutHandshake()
+        session._handshake_session = timeout
+        with self.assertRaises(AAPDescriptorObservationTimeoutError):
+            await session.run()
+        self.assertEqual(timeout.assert_ack, AAP_HANDSHAKE_ACK)
+        self.assertEqual(events[-4:], ["channel_close", "compat_exit", "sdp_exit", "secure_exit"])
+        self.assertFalse(compatibility.active)
+
+    async def test_cancellation_during_descriptor_observation_unwinds(self) -> None:
+        session, connection, compatibility, events = self.components()
+
+        class CancellingDuringDescriptors:
+            async def run(self, transport):
+                async with transport.collect():
+                    transport.send_handshake_request()
+                    self.assert_ack = await transport.receive(1)
+                    raise asyncio.CancelledError
+
+        cancelling = CancellingDuringDescriptors()
+        session._handshake_session = cancelling
+        with self.assertRaises(asyncio.CancelledError):
+            await session.run()
+        self.assertEqual(cancelling.assert_ack, AAP_HANDSHAKE_ACK)
+        self.assertIsNone(connection.channel.sink)
+        self.assertEqual(events[-4:], ["channel_close", "compat_exit", "sdp_exit", "secure_exit"])
+        self.assertFalse(compatibility.active)
 
 

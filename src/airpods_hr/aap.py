@@ -11,12 +11,17 @@ from enum import StrEnum
 from time import monotonic
 from typing import AsyncContextManager, Protocol
 
-from airpods_hr.aap_channel import AAPChannel
-
+from airpods_hr.aap_channel import AAPChannel, AAPChannelSession
+from airpods_hr.authentication import AuthenticatedClassicContext
 from airpods_hr.classic_diagnostics import ClassicHostStateSnapshot
 from airpods_hr.protocol import HeartRateCommand
-
-from airpods_hr.sdp_diagnostics import ProtocolTimelineKind, SafeProtocolTimeline, SDPDiagnosticsSnapshot
+from airpods_hr.sdp import SDPCompatibilityProfile
+from airpods_hr.sdp_diagnostics import (
+    BumbleSDPDiagnostics,
+    ProtocolTimelineKind,
+    SafeProtocolTimeline,
+    SDPDiagnosticsSnapshot,
+)
 
 
 AAP_HANDSHAKE_REQUEST = bytes.fromhex(
@@ -278,6 +283,12 @@ class ReceiveTransport(Protocol):
     async def receive(self, timeout: float) -> bytes: ...
 
 
+class SecureClassicSession(Protocol):
+    def open(
+        self, *, pre_connect_profile: object | None = None
+    ) -> AsyncContextManager[AuthenticatedClassicContext]: ...
+
+
 Clock = Callable[[], float]
 AAPProgressCallback = Callable[[AAPProgress], None]
 
@@ -522,3 +533,85 @@ class AAPHandshakeSession:
             self._progress(event)
 
 
+@dataclass(frozen=True, slots=True)
+class AAPHandshakeProbeResult:
+    display_name: str
+    evidence: DescriptorEvidence
+    application_payloads_sent: int
+    replacement_key_reported: bool
+    sdp_diagnostics: SDPDiagnosticsSnapshot
+    host_state_snapshot: ClassicHostStateSnapshot | None = None
+
+
+class AAPHandshakeProbeSession:
+    """Compose secure Classic, temporary SDP, AAP L2CAP, and handshake."""
+
+    def __init__(
+        self,
+        secure_session: SecureClassicSession,
+        channel_session: AAPChannelSession,
+        handshake_session: AAPHandshakeSession,
+        *,
+        progress: AAPProgressCallback | None = None,
+        queue_limit: int = 32,
+        frame_size_limit: int = 64 * 1024,
+    ) -> None:
+        self._secure_session = secure_session
+        self._channel_session = channel_session
+        self._handshake_session = handshake_session
+        self._progress = progress
+        self._queue_limit = queue_limit
+        self._frame_size_limit = frame_size_limit
+
+    async def run(self) -> AAPHandshakeProbeResult:
+        secure: AuthenticatedClassicContext | None = None
+        handshake: AAPHandshakeResult | None = None
+        timeline = getattr(
+            self._handshake_session, "timeline", SafeProtocolTimeline()
+        )
+        diagnostics = BumbleSDPDiagnostics(timeline=timeline)
+        profile = SDPCompatibilityProfile(
+            installed_callback=lambda: self._emit(AAPProgress.SDP_INSTALLED),
+            diagnostics=diagnostics,
+        )
+        try:
+            async with self._secure_session.open(
+                pre_connect_profile=profile
+            ) as secure:
+
+                def transport_factory(
+                    raw_channel: object, channel: AAPChannel
+                ) -> BumbleAAPTransport:
+                    return BumbleAAPTransport(
+                        raw_channel,
+                        channel,
+                        queue_limit=self._queue_limit,
+                        frame_size_limit=self._frame_size_limit,
+                    )
+
+                async with self._channel_session.open_protocol(
+                    secure.connection, transport_factory
+                ) as transport:
+                    handshake = await self._handshake_session.run(transport)
+        except AAPDescriptorObservationTimeoutError as error:
+            raise AAPDescriptorObservationTimeoutError(
+                error.observation,
+                sdp_diagnostics=diagnostics.snapshot(),
+                host_state_snapshot=(
+                    secure.host_state_snapshot if secure is not None else None
+                ),
+            ) from None
+
+        assert secure is not None and handshake is not None
+        return AAPHandshakeProbeResult(
+            display_name=secure.display_name,
+            evidence=handshake.evidence,
+            application_payloads_sent=handshake.application_payloads_sent,
+            replacement_key_reported=secure.replacement_key_reported,
+            sdp_diagnostics=diagnostics.snapshot(),
+            host_state_snapshot=secure.host_state_snapshot,
+        )
+
+    def _emit(self, event: AAPProgress) -> None:
+        if self._progress is not None:
+            self._progress(event)
