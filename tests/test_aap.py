@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-
+from contextlib import asynccontextmanager
 from dataclasses import fields
 from types import SimpleNamespace
 
 
 from bumble import l2cap
 
-from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPFrameSummary, AAPHandshakeError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence
+from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence
 
 
 from airpods_hr.protocol import AAP_PSM
+from airpods_hr.sdp_diagnostics import ProtocolTimelineKind, SafeProtocolTimeline
 
 
 ALL_DESCRIPTOR_EVIDENCE = (
@@ -64,6 +65,46 @@ def make_synthetic_type_2b_frame(
     return bytes(header + body)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class FakeReceiveTransport:
+    def __init__(self, frames: list[bytes], clock: FakeClock) -> None:
+        self.frames = list(frames)
+        self.clock = clock
+        self.sent: list[bytes] = []
+        self.collect_active = False
+        self.dropped_frames = 0
+
+    @property
+    def application_payloads_sent(self) -> int:
+        return len(self.sent)
+
+    @asynccontextmanager
+    async def collect(self):
+        self.collect_active = True
+        try:
+            yield self
+        finally:
+            self.collect_active = False
+
+    def send_handshake_request(self) -> None:
+        if self.sent:
+            raise AAPHandshakeError("already sent")
+        self.sent.append(AAP_HANDSHAKE_REQUEST)
+
+    async def receive(self, timeout: float) -> bytes:
+        if self.frames:
+            return self.frames.pop(0)
+        self.clock.now += timeout
+        raise TimeoutError
+
+
 class FakeRawChannel:
     def __init__(self) -> None:
         self.sink = None
@@ -80,6 +121,214 @@ class FakeRawChannel:
 
     async def disconnect(self) -> None:
         self.events.append("channel_close")
+
+
+class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def make_session(self, frames: list[bytes]):
+        clock = FakeClock()
+        transport = FakeReceiveTransport(frames, clock)
+        session = AAPHandshakeSession(
+            ack_timeout=4,
+            descriptor_timeout=3,
+            clock=clock,
+        )
+        return session, transport, clock
+
+    def test_exact_handshake_request_bytes(self) -> None:
+        self.assertEqual(
+            AAP_HANDSHAKE_REQUEST,
+            bytes.fromhex("00 00 04 00 01 00 02 00 00 00 00 00 00 00 00 00"),
+        )
+
+    async def test_exact_known_ack_is_accepted(self) -> None:
+        session, transport, _ = self.make_session(
+            [AAP_HANDSHAKE_ACK, ALL_DESCRIPTOR_EVIDENCE]
+        )
+        result = await session.run(transport)
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.application_payloads_sent, 1)
+        self.assertEqual(result.observation.pre_ack_frame_count, 0)
+        self.assertEqual(result.observation.post_ack_frame_count, 1)
+
+    async def test_all_required_descriptor_evidence_before_ack_succeeds(self) -> None:
+        session, transport, _ = self.make_session(
+            [ALL_DESCRIPTOR_EVIDENCE, AAP_HANDSHAKE_ACK]
+        )
+
+        result = await session.run(transport)
+
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.observation.pre_ack_frame_count, 1)
+        self.assertEqual(result.observation.post_ack_frame_count, 0)
+
+    async def test_evidence_split_across_pre_ack_frames_is_retained(self) -> None:
+        session, transport, _ = self.make_session(
+            [
+                b"\x00AccessoryService\x00",
+                b"\x00HeartRateService\x00",
+                AAP_HANDSHAKE_ACK,
+            ]
+        )
+
+        result = await session.run(transport)
+
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.observation.pre_ack_frame_count, 2)
+        self.assertEqual(result.observation.post_ack_frame_count, 0)
+
+    async def test_evidence_split_before_and_after_ack_is_merged(self) -> None:
+        session, transport, _ = self.make_session(
+            [
+                b"\x00ReportDescriptor\x00",
+                AAP_HANDSHAKE_ACK,
+                b"\x00HeartRateService\x00",
+            ]
+        )
+
+        result = await session.run(transport)
+
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.observation.pre_ack_frame_count, 1)
+        self.assertEqual(result.observation.post_ack_frame_count, 1)
+
+    async def test_similar_malformed_ack_is_rejected(self) -> None:
+        malformed = AAP_HANDSHAKE_ACK[:-1] + b"\x01"
+        session, transport, _ = self.make_session([malformed])
+        with self.assertRaises(AAPHandshakeTimeoutError):
+            await session.run(transport)
+
+    async def test_handshake_timeout_uses_one_bounded_deadline(self) -> None:
+        session, transport, clock = self.make_session([])
+        with self.assertRaises(AAPHandshakeTimeoutError):
+            await session.run(transport)
+        self.assertEqual(clock.now, 4)
+
+    async def test_missing_descriptor_is_distinct_from_missing_ack(self) -> None:
+        session, transport, clock = self.make_session([AAP_HANDSHAKE_ACK])
+        with self.assertRaises(AAPDescriptorObservationTimeoutError) as caught:
+            await session.run(transport)
+        self.assertFalse(caught.exception.evidence.required)
+        self.assertEqual(caught.exception.observation.pre_ack_frame_count, 0)
+        self.assertEqual(caught.exception.observation.post_ack_frame_count, 0)
+        self.assertEqual(clock.now, 3)
+
+    async def test_unexpected_frames_do_not_crash_ack_wait(self) -> None:
+        session, transport, _ = self.make_session(
+            [b"unrelated", AAP_HANDSHAKE_ACK, ALL_DESCRIPTOR_EVIDENCE]
+        )
+        result = await session.run(transport)
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.observation.pre_ack_frame_count, 1)
+
+    async def test_ack_like_marker_frame_is_evidence_but_not_ack(self) -> None:
+        ack_like = (
+            AAP_HANDSHAKE_ACK
+            + b"\x00AccessoryService\x00HeartRateService\x00"
+        )
+        session, transport, _ = self.make_session(
+            [ack_like, AAP_HANDSHAKE_ACK]
+        )
+
+        result = await session.run(transport)
+
+        self.assertTrue(result.evidence.required)
+        self.assertEqual(result.observation.pre_ack_frame_count, 1)
+
+    async def test_descriptor_evidence_without_exact_ack_still_times_out(self) -> None:
+        session, transport, _ = self.make_session([ALL_DESCRIPTOR_EVIDENCE])
+
+        with self.assertRaises(AAPHandshakeTimeoutError):
+            await session.run(transport)
+
+    async def test_pre_ack_evidence_survives_post_ack_descriptor_timeout(self) -> None:
+        session, transport, _ = self.make_session(
+            [b"\x00AccessoryService\x00", AAP_HANDSHAKE_ACK, b"unrelated"]
+        )
+        transport.dropped_frames = 2
+
+        with self.assertRaises(AAPDescriptorObservationTimeoutError) as caught:
+            await session.run(transport)
+
+        observation = caught.exception.observation
+        self.assertTrue(observation.evidence.sensor_framework)
+        self.assertFalse(observation.evidence.heart_rate_service)
+        self.assertEqual(observation.pre_ack_frame_count, 1)
+        self.assertEqual(observation.post_ack_frame_count, 1)
+        self.assertEqual(observation.receive_frames_dropped, 2)
+
+    async def test_only_handshake_payload_is_sent(self) -> None:
+        session, transport, _ = self.make_session(
+            [AAP_HANDSHAKE_ACK, ALL_DESCRIPTOR_EVIDENCE]
+        )
+        await session.run(transport)
+        self.assertEqual(transport.sent, [AAP_HANDSHAKE_REQUEST])
+        self.assertNotIn(0x44, transport.sent[0])
+
+    async def test_frame_summary_history_is_bounded_across_both_phases(self) -> None:
+        clock = FakeClock()
+        transport = FakeReceiveTransport(
+            [
+                b"pre-one",
+                b"pre-two",
+                AAP_HANDSHAKE_ACK,
+                b"post-one",
+                b"post-two",
+                ALL_DESCRIPTOR_EVIDENCE,
+            ],
+            clock,
+        )
+        session = AAPHandshakeSession(
+            ack_timeout=4,
+            descriptor_timeout=3,
+            frame_summary_limit=3,
+            clock=clock,
+        )
+
+        result = await session.run(transport)
+
+        observation = result.observation
+        self.assertEqual(observation.pre_ack_frame_count, 2)
+        self.assertEqual(observation.post_ack_frame_count, 3)
+        self.assertEqual(len(observation.pre_ack_frame_summaries), 2)
+        self.assertEqual(len(observation.post_ack_frame_summaries), 1)
+
+    async def test_timeline_orders_handshake_ack_and_first_357_byte_frame(self) -> None:
+        clock = FakeClock()
+        timeline = SafeProtocolTimeline(clock=clock)
+        transport = FakeReceiveTransport(
+            [AAP_HANDSHAKE_ACK, bytes(357), ALL_DESCRIPTOR_EVIDENCE], clock
+        )
+        session = AAPHandshakeSession(clock=clock, timeline=timeline)
+
+        result = await session.run(transport)
+
+        self.assertEqual(result.application_payloads_sent, 1)
+        self.assertEqual(
+            [event.kind for event in timeline.snapshot().events],
+            [
+                ProtocolTimelineKind.HANDSHAKE_SENT,
+                ProtocolTimelineKind.ACK_OBSERVED,
+                ProtocolTimelineKind.FIRST_POST_ACK_FRAME,
+                ProtocolTimelineKind.FIRST_357_BYTE_FRAME,
+            ],
+        )
+
+    async def test_first_post_ack_timeline_records_an_85_byte_frame(self) -> None:
+        clock = FakeClock()
+        timeline = SafeProtocolTimeline(clock=clock)
+        transport = FakeReceiveTransport(
+            [AAP_HANDSHAKE_ACK, bytes(85), ALL_DESCRIPTOR_EVIDENCE], clock
+        )
+
+        await AAPHandshakeSession(clock=clock, timeline=timeline).run(transport)
+
+        snapshot = timeline.snapshot()
+        self.assertIsNotNone(
+            snapshot.first(ProtocolTimelineKind.FIRST_POST_ACK_FRAME)
+        )
+        self.assertIsNone(
+            snapshot.first(ProtocolTimelineKind.FIRST_357_BYTE_FRAME)
+        )
 
 
 class DescriptorEvidenceTests(unittest.TestCase):

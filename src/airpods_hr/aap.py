@@ -8,12 +8,15 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-
+from time import monotonic
+from typing import AsyncContextManager, Protocol
 
 from airpods_hr.aap_channel import AAPChannel
 
-
+from airpods_hr.classic_diagnostics import ClassicHostStateSnapshot
 from airpods_hr.protocol import HeartRateCommand
+
+from airpods_hr.sdp_diagnostics import ProtocolTimelineKind, SafeProtocolTimeline, SDPDiagnosticsSnapshot
 
 
 AAP_HANDSHAKE_REQUEST = bytes.fromhex(
@@ -40,6 +43,28 @@ AAP_TYPE_2B_SUFFIX_HISTOGRAM_LIMIT = 8
 
 class AAPHandshakeError(RuntimeError):
     """Base error for the AAP handshake exchange."""
+
+
+class AAPHandshakeTimeoutError(AAPHandshakeError):
+    """Raised when the exact known ACK is not observed before its deadline."""
+
+
+class AAPDescriptorObservationTimeoutError(AAPHandshakeError):
+    """Raised when required descriptor evidence is absent after a valid ACK."""
+
+    def __init__(
+        self,
+        observation: HandshakeObservation,
+        sdp_diagnostics: SDPDiagnosticsSnapshot | None = None,
+        host_state_snapshot: ClassicHostStateSnapshot | None = None,
+    ) -> None:
+        self.observation = observation
+        self.evidence = observation.evidence
+        self.sdp_diagnostics = sdp_diagnostics
+        self.host_state_snapshot = host_state_snapshot
+        super().__init__(
+            "AAP handshake succeeded, but required descriptor evidence was not observed"
+        )
 
 
 class AAPReceiveStateError(AAPHandshakeError):
@@ -213,6 +238,46 @@ class AAPFrameSummary:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class HandshakeObservation:
+    """Safe, immutable state accumulated around exact ACK recognition."""
+
+    ack_observed: bool
+    evidence: DescriptorEvidence
+    pre_ack_frame_count: int = 0
+    post_ack_frame_count: int = 0
+    receive_frames_dropped: int = 0
+    pre_ack_frame_summaries: tuple[AAPFrameSummary, ...] = ()
+    post_ack_frame_summaries: tuple[AAPFrameSummary, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AAPHandshakeResult:
+    observation: HandshakeObservation
+    application_payloads_sent: int
+    handshake_sent_at: float
+
+    @property
+    def evidence(self) -> DescriptorEvidence:
+        return self.observation.evidence
+
+
+class ReceiveTransport(Protocol):
+    @property
+    def application_payloads_sent(self) -> int: ...
+
+    @property
+    def dropped_frames(self) -> int: ...
+
+    def collect(self) -> AsyncContextManager[ReceiveTransport]: ...
+
+    def send_handshake_request(self) -> None: ...
+
+    def send_heart_rate_command(self, command: HeartRateCommand) -> None: ...
+
+    async def receive(self, timeout: float) -> bytes: ...
+
+
 Clock = Callable[[], float]
 AAPProgressCallback = Callable[[AAPProgress], None]
 
@@ -302,5 +367,158 @@ class BumbleAAPTransport:
         if timeout <= 0:
             raise TimeoutError
         return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+
+
+class AAPHandshakeSession:
+    """Send one known request and observe ACK/descriptor evidence."""
+
+    def __init__(
+        self,
+        *,
+        ack_timeout: float = 5.0,
+        descriptor_timeout: float = 3.0,
+        frame_summary_limit: int = AAP_FRAME_SUMMARY_LIMIT,
+        clock: Clock = monotonic,
+        progress: AAPProgressCallback | None = None,
+        timeline: SafeProtocolTimeline | None = None,
+    ) -> None:
+        if ack_timeout <= 0 or descriptor_timeout <= 0:
+            raise ValueError("AAP handshake timeouts must be positive")
+        if frame_summary_limit <= 0:
+            raise ValueError("AAP frame summary limit must be positive")
+        self._ack_timeout = ack_timeout
+        self._descriptor_timeout = descriptor_timeout
+        self._frame_summary_limit = frame_summary_limit
+        self._clock = clock
+        self._progress = progress
+        self.timeline = timeline or SafeProtocolTimeline(clock=clock)
+        self._first_post_ack_frame_observed = False
+        self._first_357_byte_frame_observed = False
+
+    async def run(self, transport: ReceiveTransport) -> AAPHandshakeResult:
+        """Run the AAP handshake exchange while owning its receive collector."""
+
+        async with transport.collect():
+            return await self.run_collected(transport)
+
+    async def run_collected(
+        self, transport: ReceiveTransport
+    ) -> AAPHandshakeResult:
+        """Run while a caller-owned receive collector remains active."""
+
+        self._first_post_ack_frame_observed = False
+        self._first_357_byte_frame_observed = False
+        transport.send_handshake_request()
+        handshake_sent_at = self._clock()
+        self.timeline.record(ProtocolTimelineKind.HANDSHAKE_SENT)
+        self._emit(AAPProgress.HANDSHAKE_SENT)
+        observation = await self._wait_for_ack(transport)
+        self._emit(AAPProgress.ACK_OBSERVED)
+        observation = await self._observe_descriptors(transport, observation)
+        self._emit(AAPProgress.DESCRIPTORS_OBSERVED)
+
+        if transport.application_payloads_sent != 1:
+            raise AAPHandshakeError("unexpected AAP application payload count")
+        return AAPHandshakeResult(
+            observation,
+            transport.application_payloads_sent,
+            handshake_sent_at,
+        )
+
+    async def _wait_for_ack(
+        self, transport: ReceiveTransport
+    ) -> HandshakeObservation:
+        deadline = self._clock() + self._ack_timeout
+        evidence = DescriptorEvidence()
+        pre_ack_frame_count = 0
+        summaries: tuple[AAPFrameSummary, ...] = ()
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            try:
+                frame = await transport.receive(remaining)
+            except TimeoutError:
+                break
+            if frame == AAP_HANDSHAKE_ACK:
+                self.timeline.record(ProtocolTimelineKind.ACK_OBSERVED)
+                return HandshakeObservation(
+                    ack_observed=True,
+                    evidence=evidence,
+                    pre_ack_frame_count=pre_ack_frame_count,
+                    receive_frames_dropped=transport.dropped_frames,
+                    pre_ack_frame_summaries=summaries,
+                )
+            pre_ack_frame_count += 1
+            self._record_frame_timeline(frame, post_ack=False)
+            if len(summaries) < self._frame_summary_limit:
+                summaries += (AAPFrameSummary.from_frame(frame),)
+            evidence = evidence.merged(frame)
+        raise AAPHandshakeTimeoutError("AAP handshake ACK was not observed")
+
+    async def _observe_descriptors(
+        self,
+        transport: ReceiveTransport,
+        observation: HandshakeObservation,
+    ) -> HandshakeObservation:
+        if observation.evidence.required:
+            return observation
+
+        deadline = self._clock() + self._descriptor_timeout
+        evidence = observation.evidence
+        post_ack_frame_count = observation.post_ack_frame_count
+        summaries = observation.post_ack_frame_summaries
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            try:
+                frame = await transport.receive(remaining)
+            except TimeoutError:
+                break
+            post_ack_frame_count += 1
+            self._record_frame_timeline(frame, post_ack=True)
+            if (
+                len(observation.pre_ack_frame_summaries) + len(summaries)
+                < self._frame_summary_limit
+            ):
+                summaries += (AAPFrameSummary.from_frame(frame),)
+            evidence = evidence.merged(frame)
+            if evidence.required:
+                return HandshakeObservation(
+                    ack_observed=True,
+                    evidence=evidence,
+                    pre_ack_frame_count=observation.pre_ack_frame_count,
+                    post_ack_frame_count=post_ack_frame_count,
+                    receive_frames_dropped=transport.dropped_frames,
+                    pre_ack_frame_summaries=(
+                        observation.pre_ack_frame_summaries
+                    ),
+                    post_ack_frame_summaries=summaries,
+                )
+        final_observation = HandshakeObservation(
+            ack_observed=True,
+            evidence=evidence,
+            pre_ack_frame_count=observation.pre_ack_frame_count,
+            post_ack_frame_count=post_ack_frame_count,
+            receive_frames_dropped=transport.dropped_frames,
+            pre_ack_frame_summaries=observation.pre_ack_frame_summaries,
+            post_ack_frame_summaries=summaries,
+        )
+        if not evidence.required:
+            raise AAPDescriptorObservationTimeoutError(final_observation)
+        return final_observation
+
+    def _record_frame_timeline(self, frame: bytes, *, post_ack: bool) -> None:
+        if post_ack and not self._first_post_ack_frame_observed:
+            self._first_post_ack_frame_observed = True
+            self.timeline.record(ProtocolTimelineKind.FIRST_POST_ACK_FRAME)
+        if len(frame) == 357 and not self._first_357_byte_frame_observed:
+            self._first_357_byte_frame_observed = True
+            self.timeline.record(ProtocolTimelineKind.FIRST_357_BYTE_FRAME)
+
+    def _emit(self, event: AAPProgress) -> None:
+        if self._progress is not None:
+            self._progress(event)
 
 
