@@ -7,18 +7,11 @@ import unittest
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import fields
 from types import SimpleNamespace
-
-
 from bumble import l2cap
-
 from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeProbeSession, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
-
-
 from airpods_hr.aap_channel import AAPChannelSession
 from airpods_hr.aap_channel import AAPChannelOpenError
 from airpods_hr.authentication import AuthenticatedClassicContext
-
-
 from airpods_hr.protocol import AAP_PSM
 from airpods_hr.sdp_diagnostics import ProtocolTimelineKind, SafeProtocolTimeline
 
@@ -27,6 +20,7 @@ ALL_DESCRIPTOR_EVIDENCE = (
     b"\x00AccessoryService\x00HeartRateService\x00HeartRate\x00"
     b"com.apple.hid.heartrate-access\x00"
 )
+
 
 
 def make_synthetic_type_2b_frame(
@@ -70,12 +64,14 @@ def make_synthetic_type_2b_frame(
     return bytes(header + body)
 
 
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
 
     def __call__(self) -> float:
         return self.now
+
 
 
 class FakeReceiveTransport:
@@ -110,6 +106,7 @@ class FakeReceiveTransport:
         raise TimeoutError
 
 
+
 class FakeRawChannel:
     def __init__(self) -> None:
         self.sink = None
@@ -126,6 +123,7 @@ class FakeRawChannel:
 
     async def disconnect(self) -> None:
         self.events.append("channel_close")
+
 
 
 class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -336,6 +334,7 @@ class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+
 class DescriptorEvidenceTests(unittest.TestCase):
     def test_heart_rate_service_evidence(self) -> None:
         evidence = DescriptorEvidence().merged(b"xHeartRateService\x00")
@@ -368,6 +367,7 @@ class DescriptorEvidenceTests(unittest.TestCase):
         self.assertNotIn("com.apple", rendered)
 
 
+
 class AAPFrameSummaryTests(unittest.TestCase):
     def test_summary_exposes_only_length_and_neutral_header_fields(self) -> None:
         synthetic_payload = bytes.fromhex("04 00 04 00 2B 00") + bytes(351)
@@ -391,6 +391,7 @@ class AAPFrameSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary.header_u16_2_3, 0x1234)
         self.assertIsNone(summary.header_u16_4_5)
+
 
 
 class AAPType2BFrameSummaryTests(unittest.TestCase):
@@ -551,6 +552,7 @@ class AAPType2BFrameSummaryTests(unittest.TestCase):
         self.assertFalse(differing.unit_bytes_8_13_uniform)
 
 
+
 class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_receive_queue_is_bounded_and_drops_oldest(self) -> None:
         raw = FakeRawChannel()
@@ -621,6 +623,7 @@ class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
             await transport.receive(1)
 
 
+
 class CompatibilityRecorder:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -636,6 +639,7 @@ class CompatibilityRecorder:
         finally:
             self.events.append("compat_exit")
             self.active = False
+
 
 
 class OrchestrationRawChannel(FakeRawChannel):
@@ -664,6 +668,7 @@ class OrchestrationRawChannel(FakeRawChannel):
         self.events.append("channel_close")
 
 
+
 class OrchestrationConnection:
     def __init__(
         self,
@@ -687,6 +692,7 @@ class OrchestrationConnection:
         return self.channel
 
 
+
 class OrchestrationRuntime:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -706,6 +712,7 @@ class OrchestrationRuntime:
     def observe_sdp(self, observer):
         del observer
         yield
+
 
 
 class FakeSecureSession:
@@ -735,6 +742,7 @@ class FakeSecureSession:
                 )
         finally:
             self.events.append("secure_exit")
+
 
 
 class AAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
@@ -842,5 +850,4 @@ class AAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(connection.channel.sink)
         self.assertEqual(events[-4:], ["channel_close", "compat_exit", "sdp_exit", "secure_exit"])
         self.assertFalse(compatibility.active)
-
 
