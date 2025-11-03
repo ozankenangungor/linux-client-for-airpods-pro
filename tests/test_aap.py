@@ -7,20 +7,48 @@ import unittest
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
 from bumble import l2cap
-from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeProbeSession, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPReceiveStateError, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
+
+from airpods_hr.aap import (
+    AAP_HANDSHAKE_ACK,
+    AAP_HANDSHAKE_REQUEST,
+    AAPDescriptorObservationTimeoutError,
+    AAPFrameSummary,
+    AAPHandshakeError,
+    AAPHandshakeProbeSession,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+    AAPReceiveStateError,
+    AAPType2BFrameSummary,
+    BumbleAAPTransport,
+    DescriptorEvidence,
+    HandshakeObservation,
+)
 from airpods_hr.aap_channel import AAPChannelSession
 from airpods_hr.aap_channel import AAPChannelOpenError
 from airpods_hr.authentication import AuthenticatedClassicContext
+from airpods_hr.classic_diagnostics import (
+    ClassicHostStateSnapshot,
+    RuntimeNameProfile,
+)
 from airpods_hr.protocol import AAP_PSM
-from airpods_hr.sdp_diagnostics import ProtocolTimelineKind, SafeProtocolTimeline
+from airpods_hr.sdp_diagnostics import (
+    ProtocolTimelineKind,
+    ProtocolTimelineEvent,
+    ProtocolTimelineSnapshot,
+    SafeProtocolTimeline,
+    SDPDiagnosticsSnapshot,
+)
+from tools import probe_aap_handshake
+from tools.probe_aap_handshake import build_parser, run_probe
 
 
 ALL_DESCRIPTOR_EVIDENCE = (
     b"\x00AccessoryService\x00HeartRateService\x00HeartRate\x00"
     b"com.apple.hid.heartrate-access\x00"
 )
-
 
 
 def make_synthetic_type_2b_frame(
@@ -64,14 +92,12 @@ def make_synthetic_type_2b_frame(
     return bytes(header + body)
 
 
-
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
 
     def __call__(self) -> float:
         return self.now
-
 
 
 class FakeReceiveTransport:
@@ -106,7 +132,6 @@ class FakeReceiveTransport:
         raise TimeoutError
 
 
-
 class FakeRawChannel:
     def __init__(self) -> None:
         self.sink = None
@@ -123,7 +148,6 @@ class FakeRawChannel:
 
     async def disconnect(self) -> None:
         self.events.append("channel_close")
-
 
 
 class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -334,7 +358,6 @@ class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-
 class DescriptorEvidenceTests(unittest.TestCase):
     def test_heart_rate_service_evidence(self) -> None:
         evidence = DescriptorEvidence().merged(b"xHeartRateService\x00")
@@ -367,7 +390,6 @@ class DescriptorEvidenceTests(unittest.TestCase):
         self.assertNotIn("com.apple", rendered)
 
 
-
 class AAPFrameSummaryTests(unittest.TestCase):
     def test_summary_exposes_only_length_and_neutral_header_fields(self) -> None:
         synthetic_payload = bytes.fromhex("04 00 04 00 2B 00") + bytes(351)
@@ -391,7 +413,6 @@ class AAPFrameSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary.header_u16_2_3, 0x1234)
         self.assertIsNone(summary.header_u16_4_5)
-
 
 
 class AAPType2BFrameSummaryTests(unittest.TestCase):
@@ -552,7 +573,6 @@ class AAPType2BFrameSummaryTests(unittest.TestCase):
         self.assertFalse(differing.unit_bytes_8_13_uniform)
 
 
-
 class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_receive_queue_is_bounded_and_drops_oldest(self) -> None:
         raw = FakeRawChannel()
@@ -623,7 +643,6 @@ class BumbleAAPTransportTests(unittest.IsolatedAsyncioTestCase):
             await transport.receive(1)
 
 
-
 class CompatibilityRecorder:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -639,7 +658,6 @@ class CompatibilityRecorder:
         finally:
             self.events.append("compat_exit")
             self.active = False
-
 
 
 class OrchestrationRawChannel(FakeRawChannel):
@@ -668,7 +686,6 @@ class OrchestrationRawChannel(FakeRawChannel):
         self.events.append("channel_close")
 
 
-
 class OrchestrationConnection:
     def __init__(
         self,
@@ -692,7 +709,6 @@ class OrchestrationConnection:
         return self.channel
 
 
-
 class OrchestrationRuntime:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -712,7 +728,6 @@ class OrchestrationRuntime:
     def observe_sdp(self, observer):
         del observer
         yield
-
 
 
 class FakeSecureSession:
@@ -742,7 +757,6 @@ class FakeSecureSession:
                 )
         finally:
             self.events.append("secure_exit")
-
 
 
 class AAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
@@ -851,3 +865,261 @@ class AAPOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-4:], ["channel_close", "compat_exit", "sdp_exit", "secure_exit"])
         self.assertFalse(compatibility.active)
 
+
+class AAPHandshakeProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dry_run_is_default_and_creates_no_backend(self) -> None:
+        output: list[str] = []
+        live_runner = AsyncMock()
+        result = await run_probe(
+            execute=False,
+            output=output.append,
+            live_runner=live_runner,
+        )
+        self.assertEqual(result, 0)
+        live_runner.assert_not_awaited()
+        self.assertTrue(output[0].startswith("DRY RUN"))
+        self.assertIn("Send no HR commands", "\n".join(output))
+        rendered = "\n".join(output)
+        self.assertLess(rendered.index("install four SDP"), rendered.index("Connect"))
+
+    async def test_execute_is_the_only_live_gate(self) -> None:
+        runner = AsyncMock(return_value=None)
+        self.assertEqual(await run_probe(execute=True, live_runner=runner), 0)
+        runner.assert_awaited_once_with(
+            print, RuntimeNameProfile.PROJECT_DEFAULT, False
+        )
+        self.assertTrue(build_parser().parse_args(["--execute"]).execute)
+
+    async def test_probe_error_does_not_print_raw_descriptor_or_secret(self) -> None:
+        synthetic_secret = bytes(range(16)).hex().upper()
+
+        async def fail(output, runtime_name_profile, classic_host_snapshot):
+            del output, runtime_name_profile, classic_host_snapshot
+            raise RuntimeError(synthetic_secret + " private descriptor")
+
+        output: list[str] = []
+        result = await run_probe(execute=True, output=output.append, live_runner=fail)
+        rendered = "\n".join(output)
+        self.assertEqual(result, 1)
+        self.assertNotIn(synthetic_secret, rendered)
+        self.assertNotIn("private descriptor", rendered)
+
+    async def test_descriptor_timeout_prints_only_safe_summary(self) -> None:
+        observation = HandshakeObservation(
+            ack_observed=True,
+            evidence=DescriptorEvidence(sensor_framework=True),
+            pre_ack_frame_count=3,
+            post_ack_frame_count=1,
+            receive_frames_dropped=2,
+            pre_ack_frame_summaries=(AAPFrameSummary(7),),
+            post_ack_frame_summaries=(AAPFrameSummary(357, 0x0004, 0x002B),),
+        )
+        diagnostics = SDPDiagnosticsSnapshot(
+            sdp_connection_observed=True,
+            sdp_requests_observed=2,
+            pnp_information_queries=1,
+            other_queries=1,
+            pnp_information_match_served=True,
+            psm_1_requests=1,
+            psm_25_requests=1,
+            timeline=ProtocolTimelineSnapshot(
+                events=(
+                    ProtocolTimelineEvent(
+                        ProtocolTimelineKind.HANDSHAKE_SENT, 0.25
+                    ),
+                    ProtocolTimelineEvent(
+                        ProtocolTimelineKind.ACK_OBSERVED, 0.5
+                    ),
+                    ProtocolTimelineEvent(
+                        ProtocolTimelineKind.FIRST_POST_ACK_FRAME, 0.625
+                    ),
+                    ProtocolTimelineEvent(
+                        ProtocolTimelineKind.FIRST_357_BYTE_FRAME, 0.75
+                    ),
+                ),
+                total_events=4,
+            ),
+        )
+        host_state = ClassicHostStateSnapshot(
+            runtime_name_profile=RuntimeNameProfile.PROJECT_DEFAULT,
+            classic_enabled=True,
+            le_enabled=False,
+            connectable=True,
+            discoverable=True,
+            configured_ssp_enabled=True,
+            configured_sc_enabled=True,
+            configured_io_capability=3,
+            observed_class_of_device=0,
+        )
+
+        async def fail(output, runtime_name_profile, classic_host_snapshot):
+            del output, runtime_name_profile, classic_host_snapshot
+            raise AAPDescriptorObservationTimeoutError(
+                observation,
+                sdp_diagnostics=diagnostics,
+                host_state_snapshot=host_state,
+            )
+
+        output: list[str] = []
+        result = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=fail,
+            classic_host_snapshot=True,
+        )
+
+        rendered = "\n".join(output)
+        self.assertEqual(result, 1)
+        self.assertIn("Sensor framework marker: yes", rendered)
+        self.assertIn("HeartRateService marker: no", rendered)
+        self.assertIn("Frames before ACK: 3", rendered)
+        self.assertIn("Frames after ACK: 1", rendered)
+        self.assertIn("Receive frames dropped: 2", rendered)
+        self.assertIn("Pre-ACK frame 1: length=7", rendered)
+        self.assertNotIn("Pre-ACK frame 1: length=7, header_", rendered)
+        self.assertIn(
+            "Post-ACK frame 1: length=357, "
+            "header_u16_2_3=0x0004, header_u16_4_5=0x002B",
+            rendered,
+        )
+        self.assertIn("SDP connection observed: yes", rendered)
+        self.assertIn("SDP requests observed: 2", rendered)
+        self.assertIn("PnPInformation queries: 1", rendered)
+        self.assertIn("Other SDP queries: 1", rendered)
+        self.assertIn("PnPInformation match served: yes", rendered)
+        self.assertIn("PSM1=1, PSM3=0, PSM23=0, PSM25=1, other=0", rendered)
+        self.assertIn("Handshake sent: +0.250s", rendered)
+        self.assertIn("ACK observed: +0.500s", rendered)
+        self.assertIn("First post-ACK frame: +0.625s", rendered)
+        self.assertIn("First 357-byte frame: +0.750s", rendered)
+        self.assertIn("PSM3 request: not observed", rendered)
+        self.assertIn("Classic host-state snapshot: available", rendered)
+        self.assertIn("Runtime name profile: project-default", rendered)
+        self.assertNotIn("AccessoryService", rendered)
+
+    async def test_type_2b_probe_output_exposes_only_structural_metadata(self) -> None:
+        hidden_marker = b"QZ9mK!"
+        frame = make_synthetic_type_2b_frame(
+            [(0x10, 0x2200), (0x10, 0x2200)],
+            hidden_fields=[hidden_marker, hidden_marker],
+        )
+        observation = HandshakeObservation(
+            ack_observed=True,
+            evidence=DescriptorEvidence(),
+            post_ack_frame_count=1,
+            post_ack_frame_summaries=(AAPFrameSummary.from_frame(frame),),
+        )
+
+        async def fail(output, runtime_name_profile, classic_host_snapshot):
+            del output, runtime_name_profile, classic_host_snapshot
+            raise AAPDescriptorObservationTimeoutError(observation)
+
+        output: list[str] = []
+        result = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=fail,
+        )
+
+        rendered = "\n".join(output)
+        self.assertEqual(result, 1)
+        self.assertIn("Type-0x002B structural summary:", rendered)
+        self.assertIn("frame length=51", rendered)
+        self.assertIn("declared body length u16@7=34", rendered)
+        self.assertIn("actual body length after offset 17=34", rendered)
+        self.assertIn("declared/actual length consistent=yes", rendered)
+        self.assertIn("body 17-byte aligned=yes", rendered)
+        self.assertIn("observed 17-byte record count=2", rendered)
+        self.assertIn("distinct suffix pairs=1", rendered)
+        self.assertIn(
+            "suffix pair 1: field_u8=0x10 field_u16=0x2200 count=2",
+            rendered,
+        )
+        self.assertIn("unit bytes 8..13 uniform=yes", rendered)
+        self.assertNotIn(hidden_marker.decode(), rendered)
+        self.assertNotIn(hidden_marker.hex(), rendered.lower())
+        self.assertNotIn(frame.hex(), rendered.lower())
+
+    def test_runtime_name_profile_is_explicit_and_defaults_to_project(self) -> None:
+        self.assertEqual(
+            build_parser().parse_args([]).runtime_name_profile,
+            RuntimeNameProfile.PROJECT_DEFAULT.value,
+        )
+        self.assertEqual(
+            build_parser()
+            .parse_args(["--runtime-name-profile", "legacy-poc"])
+            .runtime_name_profile,
+            RuntimeNameProfile.LEGACY_POC.value,
+        )
+        self.assertFalse(build_parser().parse_args([]).classic_host_snapshot)
+        self.assertTrue(
+            build_parser()
+            .parse_args(["--classic-host-snapshot"])
+            .classic_host_snapshot
+        )
+
+    async def test_dry_run_reports_opt_in_name_profile_without_live_runner(self) -> None:
+        output: list[str] = []
+        runner = AsyncMock()
+        result = await run_probe(
+            execute=False,
+            output=output.append,
+            live_runner=runner,
+            runtime_name_profile=RuntimeNameProfile.LEGACY_POC,
+        )
+        self.assertEqual(result, 0)
+        runner.assert_not_awaited()
+        self.assertIn("Runtime name profile: legacy-poc", output)
+        self.assertIn("Classic host-state snapshot: disabled", output)
+
+    async def test_dry_run_reports_explicit_snapshot_opt_in(self) -> None:
+        output: list[str] = []
+        runner = AsyncMock()
+
+        result = await run_probe(
+            execute=False,
+            output=output.append,
+            live_runner=runner,
+            classic_host_snapshot=True,
+        )
+
+        self.assertEqual(result, 0)
+        runner.assert_not_awaited()
+        self.assertIn(
+            "Classic host-state snapshot: enabled (not captured in dry run)",
+            output,
+        )
+
+    def test_default_probe_does_not_construct_host_state_observer(self) -> None:
+        with patch.object(
+            probe_aap_handshake, "ClassicHostStateObserver"
+        ) as observer_type:
+            self.assertIsNone(
+                probe_aap_handshake._create_host_state_observer(False)
+            )
+            observer_type.assert_not_called()
+
+            self.assertIs(
+                probe_aap_handshake._create_host_state_observer(True),
+                observer_type.return_value,
+            )
+            observer_type.assert_called_once_with()
+
+    async def test_execute_forwards_profile_and_snapshot_without_closure(self) -> None:
+        runner = AsyncMock(return_value=None)
+
+        result = await run_probe(
+            execute=True,
+            live_runner=runner,
+            runtime_name_profile=RuntimeNameProfile.LEGACY_POC,
+            classic_host_snapshot=True,
+        )
+
+        self.assertEqual(result, 0)
+        runner.assert_awaited_once_with(
+            print, RuntimeNameProfile.LEGACY_POC, True
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
