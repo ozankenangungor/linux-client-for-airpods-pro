@@ -10,13 +10,13 @@ from dataclasses import fields
 from types import SimpleNamespace
 
 
-from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, BumbleAAPTransport
+from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPHandshakeResult, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
 
 
-from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, is_connect4_ack, is_observed_service_ack
+from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateNoSamplesError, HeartRateProgress, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
 
 
-from airpods_hr.heartrate import parse_heart_rate_packet
+from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
 from airpods_hr.protocol import HEART_RATE_MARKER, HeartRateCommand
 
 
@@ -96,6 +96,113 @@ def heart_rate_packet(
     )
     prefix_size = outer_length - len(HEART_RATE_MARKER) - len(report)
     return bytes((0xA0,)) * prefix_size + HEART_RATE_MARKER + report
+
+
+def completed_handshake(sent_at: float = 0.0) -> AAPHandshakeResult:
+    return AAPHandshakeResult(
+        observation=HandshakeObservation(
+            ack_observed=True,
+            evidence=DescriptorEvidence(
+                sensor_framework=True,
+                heart_rate_service=True,
+            ),
+        ),
+        application_payloads_sent=1,
+        handshake_sent_at=sent_at,
+    )
+
+
+class FakeClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+class FakeCollectedTransport:
+    def __init__(
+        self,
+        frames: list[bytes | BaseException],
+        clock: FakeClock,
+        *,
+        fail_send: set[HeartRateCommand] | None = None,
+        pending_receive_frames: int = 0,
+    ) -> None:
+        self.frames = list(frames)
+        self.clock = clock
+        self.commands: list[HeartRateCommand] = []
+        self.application_payloads_sent = 1
+        self.fail_send = fail_send or set()
+        self.send_times: list[float] = []
+        self._pending_receive_frames = pending_receive_frames
+
+    @property
+    def pending_receive_frames(self) -> int:
+        return self._pending_receive_frames
+
+    def send_heart_rate_command(self, command: HeartRateCommand) -> None:
+        if command in self.fail_send:
+            raise RuntimeError("synthetic send failure")
+        self.commands.append(command)
+        self.send_times.append(self.clock())
+        self.application_payloads_sent += 1
+
+    async def receive(self, timeout: float) -> bytes:
+        if self.frames:
+            item = self.frames.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        self.clock.now += timeout
+        raise TimeoutError
+
+
+class TimedFakeCollectedTransport(FakeCollectedTransport):
+    def __init__(
+        self,
+        frames: list[tuple[float, bytes]],
+        clock: FakeClock,
+        *,
+        pending_receive_frames: int = 0,
+    ) -> None:
+        super().__init__(
+            [],
+            clock,
+            pending_receive_frames=pending_receive_frames,
+        )
+        self.timed_frames = list(frames)
+
+    async def receive(self, timeout: float) -> bytes:
+        if self.timed_frames:
+            arrival, frame = self.timed_frames.pop(0)
+            if arrival - self.clock.now > timeout:
+                self.clock.now += timeout
+                raise TimeoutError
+            self.clock.now = arrival
+            return frame
+        self.clock.now += timeout
+        raise TimeoutError
+
+
+def successful_frames(sample_count: int = 5, *, include_stop_ack: bool = True):
+    frames = [
+        service_ack(0x0E),
+        CONNECT4_ACK,
+        service_ack(0x13, b"\x80\x01"),
+    ]
+    frames.extend(
+        heart_rate_packet(70 + index, index + 1)
+        for index in range(sample_count)
+    )
+    if include_stop_ack:
+        frames.append(service_ack(0x13, b"\x81\x01"))
+    return frames
 
 
 class CommandPayloadTests(unittest.TestCase):
@@ -787,6 +894,422 @@ class ControlFrameSummaryTests(unittest.TestCase):
         self.assertFalse(truncated.remainder_is_ack_13_shape)
         self.assertFalse(truncated.remainder_is_bootstrap_10_shape)
         self.assertFalse(truncated.remainder_is_bootstrap_11_12_13_shape)
+
+
+class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
+    def make_session(
+        self,
+        clock: FakeClock,
+        *,
+        sample_target: int = 5,
+        control_summary_limit: int = 8,
+        progress=None,
+    ) -> HeartRateActivationSession:
+        return HeartRateActivationSession(
+            sample_target=sample_target,
+            stream_timeout=12,
+            control_ack_timeout=3,
+            stop_ack_timeout=2,
+            control_summary_limit=control_summary_limit,
+            clock=clock,
+            sleep=clock.sleep,
+            progress=progress,
+        )
+
+    async def test_normal_order_and_total_payload_count(self) -> None:
+        clock = FakeClock()
+        transport = FakeCollectedTransport(successful_frames(), clock)
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(
+            transport.commands,
+            [
+                HeartRateCommand.STOP_HEAD,
+                HeartRateCommand.CONNECT0,
+                HeartRateCommand.CAPS0,
+                HeartRateCommand.CONNECT4,
+                HeartRateCommand.CAPS4,
+                HeartRateCommand.HR_ON,
+                HeartRateCommand.START_HR,
+                HeartRateCommand.STOP_HR,
+                HeartRateCommand.HR_OFF,
+            ],
+        )
+        self.assertEqual(result.application_payloads_sent, 10)
+        self.assertEqual(result.completion, HeartRateCompletion.TARGET_REACHED)
+        self.assertTrue(result.stop_acknowledged)
+
+    async def test_real_literal_acknowledgements_drive_full_session(self) -> None:
+        clock = FakeClock(now=2)
+        frames = [
+            REAL_STOP_ACK_ONE_BYTE_ID,
+            CONNECT4_ACK,
+            REAL_START_ACK_TWO_BYTE_ID,
+            *(heart_rate_packet(70 + index, index + 1) for index in range(5)),
+            REAL_START_ACK_ONE_BYTE_ID,
+        ]
+        transport = FakeCollectedTransport(frames, clock)
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(
+            [report.bpm for report in result.samples],
+            [70, 71, 72, 73, 74],
+        )
+        self.assertEqual(
+            transport.commands,
+            [
+                HeartRateCommand.STOP_HEAD,
+                HeartRateCommand.CONNECT0,
+                HeartRateCommand.CAPS0,
+                HeartRateCommand.CONNECT4,
+                HeartRateCommand.CAPS4,
+                HeartRateCommand.HR_ON,
+                HeartRateCommand.START_HR,
+                HeartRateCommand.STOP_HR,
+                HeartRateCommand.HR_OFF,
+            ],
+        )
+        self.assertTrue(result.stop_acknowledged)
+        self.assertEqual(result.application_payloads_sent, 10)
+
+    async def test_current_prefix_drives_complete_activation_without_retry(
+        self,
+    ) -> None:
+        clock = FakeClock(now=2)
+        frames = [
+            observed_envelope(
+                b"\x25", bytes.fromhex("10 03 62 02 08 10")
+            ),
+            observed_envelope(
+                b"\x26", b"\x10\x03" + BOOTSTRAP_TAIL_11_12_13[2:]
+            ),
+            service_ack(0x0E, b"\x27", b"\x10\x03"),
+            CONNECT4_ACK,
+            service_ack(0x13, b"\x28", b"\x10\x03"),
+            *(heart_rate_packet(70 + index, index + 1) for index in range(5)),
+            service_ack(0x13, b"\x29", b"\x10\x03"),
+        ]
+        transport = FakeCollectedTransport(frames, clock)
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(
+            [report.bpm for report in result.samples],
+            [70, 71, 72, 73, 74],
+        )
+        self.assertEqual(
+            transport.commands,
+            [
+                HeartRateCommand.STOP_HEAD,
+                HeartRateCommand.CONNECT0,
+                HeartRateCommand.CAPS0,
+                HeartRateCommand.CONNECT4,
+                HeartRateCommand.CAPS4,
+                HeartRateCommand.HR_ON,
+                HeartRateCommand.START_HR,
+                HeartRateCommand.STOP_HR,
+                HeartRateCommand.HR_OFF,
+            ],
+        )
+        self.assertTrue(result.stop_acknowledged)
+        self.assertEqual(result.application_payloads_sent, 10)
+
+    async def test_observed_control_prefixes_may_mix_per_frame(self) -> None:
+        clock = FakeClock(now=2)
+        frames = [
+            service_ack(0x0E, b"\x27", b"\x10\x03"),
+            CONNECT4_ACK,
+            service_ack(0x13, b"\x28", b"\x10\x01"),
+            *(heart_rate_packet(70 + index, index + 1) for index in range(5)),
+            service_ack(0x13, b"\x29", b"\x10\x03"),
+        ]
+        transport = FakeCollectedTransport(frames, clock)
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(len(result.samples), 5)
+        self.assertTrue(result.stop_acknowledged)
+        self.assertEqual(result.application_payloads_sent, 10)
+        self.assertEqual(len(transport.commands), 9)
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_minimum_bootstrap_window_is_measured_from_handshake_send(self) -> None:
+        clock = FakeClock(now=0.25)
+        transport = FakeCollectedTransport(successful_frames(), clock)
+
+        await self.make_session(clock).run_collected(
+            transport, completed_handshake(sent_at=0.0)
+        )
+
+        self.assertEqual(clock.sleeps, [1.25])
+        self.assertGreaterEqual(transport.send_times[0], 1.5)
+
+    async def test_late_descriptors_add_no_fixed_bootstrap_delay(self) -> None:
+        clock = FakeClock(now=2.0)
+        transport = FakeCollectedTransport(successful_frames(), clock)
+
+        await self.make_session(clock).run_collected(
+            transport, completed_handshake(sent_at=0.0)
+        )
+
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(transport.send_times[0], 2.0)
+
+    async def test_five_reports_emit_five_existing_models(self) -> None:
+        clock = FakeClock(now=2)
+        emitted: list[HeartRateReport] = []
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE:
+                emitted.append(report)
+
+        transport = FakeCollectedTransport(successful_frames(), clock)
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(len(result.samples), 5)
+        self.assertEqual(result.samples, tuple(emitted))
+        self.assertTrue(all(isinstance(item, HeartRateReport) for item in emitted))
+        self.assertEqual([item.bpm for item in emitted], [70, 71, 72, 73, 74])
+
+    async def test_non_hr_and_malformed_hr_frames_do_not_count(self) -> None:
+        clock = FakeClock(now=2)
+        malformed = b"prefix" + HEART_RATE_MARKER + b"\x01\x48"
+        frames = [
+            service_ack(0x0E),
+            CONNECT4_ACK,
+            service_ack(0x13),
+            b"unrelated AAP frame",
+            malformed,
+            heart_rate_packet(72, 1),
+            service_ack(0x13),
+        ]
+        transport = FakeCollectedTransport(frames, clock)
+
+        result = await self.make_session(clock, sample_target=1).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(len(result.samples), 1)
+        self.assertEqual(result.non_hr_frames, 1)
+        self.assertEqual(result.malformed_hr_frames, 1)
+
+    async def test_zero_samples_is_a_typed_bounded_failure(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)], clock
+        )
+
+        with self.assertRaises(HeartRateNoSamplesError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+        self.assertGreaterEqual(clock.now, 14)
+
+    async def test_partial_result_is_distinct_from_target(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(successful_frames(2), clock)
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertEqual(len(result.samples), 2)
+        self.assertEqual(result.completion, HeartRateCompletion.PARTIAL)
+
+    async def test_failure_before_hr_on_sends_no_hr_cleanup(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport([], clock)
+
+        with self.assertRaises(HeartRateBootstrapAckTimeoutError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(transport.commands, [HeartRateCommand.STOP_HEAD])
+
+    async def test_stop_timeout_carries_bounded_safe_relative_diagnostics(
+        self,
+    ) -> None:
+        clock = FakeClock(now=2)
+        three_byte_identifier = service_ack(0x0E, b"\x81\x81\x01")
+        transport = TimedFakeCollectedTransport(
+            [
+                (2.125, REAL_BOOTSTRAP_TAIL_10_ONE_BYTE_ID),
+                (2.500, three_byte_identifier),
+                (2.750, b"unrelated-private-body"),
+            ],
+            clock,
+            pending_receive_frames=4,
+        )
+
+        with self.assertRaises(HeartRateBootstrapAckTimeoutError) as raised:
+            await self.make_session(
+                clock, control_summary_limit=2
+            ).run_collected(transport, completed_handshake())
+
+        error = raised.exception
+        self.assertEqual(error.frames_observed, 3)
+        self.assertEqual(error.frames_queued_before_stop_head, 4)
+        self.assertEqual(error.application_payloads_sent, 2)
+        self.assertEqual(len(error.summaries), 2)
+        self.assertEqual(
+            [summary.relative_to_stop_head_seconds for summary in error.summaries],
+            [0.125, 0.5],
+        )
+        self.assertTrue(error.summaries[0].bootstrap_tail_10)
+        self.assertEqual(error.summaries[1].candidate_identifier_octets, 3)
+        self.assertFalse(
+            error.summaries[1].identifier_is_current_canonical_1_or_2
+        )
+        self.assertEqual(transport.commands, [HeartRateCommand.STOP_HEAD])
+        self.assertEqual(transport.send_times, [2])
+        self.assertNotIn("unrelated-private-body", repr(error))
+
+    async def test_connect_control_ack_timeout_is_typed_and_bounded(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport([service_ack(0x0E)], clock)
+
+        with self.assertRaises(HeartRateConnectAckTimeoutError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(clock.now, 5)
+        self.assertNotIn(HeartRateCommand.HR_ON, transport.commands)
+
+    async def test_failure_after_hr_on_before_start_sends_only_hr_off(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            [service_ack(0x0E), CONNECT4_ACK],
+            clock,
+            fail_send={HeartRateCommand.START_HR},
+        )
+
+        with self.assertRaises(RuntimeError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.HR_ON, HeartRateCommand.HR_OFF],
+        )
+        self.assertNotIn(HeartRateCommand.STOP_HR, transport.commands)
+
+    async def test_start_timeout_attempts_stop_then_hr_off(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            [service_ack(0x0E), CONNECT4_ACK], clock
+        )
+
+        with self.assertRaises(HeartRateStartAckTimeoutError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_stop_ack_timeout_still_sends_hr_off(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            successful_frames(include_stop_ack=False), clock
+        )
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake()
+        )
+
+        self.assertFalse(result.stop_acknowledged)
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_primary_failure_is_not_masked_by_cleanup_failure(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)],
+            clock,
+            fail_send={HeartRateCommand.HR_OFF},
+        )
+
+        with self.assertRaises(HeartRateNoSamplesError) as raised:
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertTrue(any("cleanup" in note for note in raised.exception.__notes__))
+
+    async def test_stop_send_failure_still_attempts_hr_off(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            successful_frames(),
+            clock,
+            fail_send={HeartRateCommand.STOP_HR},
+        )
+
+        with self.assertRaises(HeartRateCleanupError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertIn(HeartRateCommand.HR_OFF, transport.commands)
+
+    async def test_cancellation_after_start_attempts_both_cleanup_commands(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport(
+            [
+                service_ack(0x0E),
+                CONNECT4_ACK,
+                service_ack(0x13),
+                asyncio.CancelledError(),
+            ],
+            clock,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_ack_wait_is_bounded(self) -> None:
+        clock = FakeClock(now=2)
+        transport = FakeCollectedTransport([], clock)
+
+        with self.assertRaises(HeartRateBootstrapAckTimeoutError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake()
+            )
+
+        self.assertEqual(clock.now, 5)
 
 
 class ParserReuseTests(unittest.TestCase):
