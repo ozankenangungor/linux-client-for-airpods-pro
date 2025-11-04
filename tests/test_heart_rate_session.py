@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-
+from contextlib import asynccontextmanager
 from dataclasses import fields
 
 from types import SimpleNamespace
 
 
-from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPHandshakeResult, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
-
-
-from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateMonitorActivationSession, HeartRateMonitorSessionResult, HeartRateNoSamplesError, HeartRateProgress, HeartRateStateError, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
+from airpods_hr.aap import (
+    AAP_HANDSHAKE_REQUEST,
+    AAPHandshakeResult,
+    AAPHandshakeSession,
+    BumbleAAPTransport,
+    DescriptorEvidence,
+    HandshakeObservation,
+)
+from airpods_hr.authentication import AuthenticatedClassicContext
+from airpods_hr.bluetooth import AdapterRestoreError
+from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateMonitorActivationSession, HeartRateMonitorResult, HeartRateMonitorSession, HeartRateMonitorSessionResult, HeartRateNoSamplesError, HeartRateProbeSession, HeartRateProgress, HeartRateSessionResult, HeartRateStateError, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
 
 
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
@@ -1723,5 +1730,364 @@ class ParserReuseTests(unittest.TestCase):
 
         self.assertEqual((first.bpm, second.bpm), (68, 69))
         self.assertEqual((first.sequence, second.sequence), (1, 2))
+
+
+class CollectorTransport:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.collect_active = False
+        self.collect_enters = 0
+        self.collect_exits = 0
+
+    @asynccontextmanager
+    async def collect(self):
+        self.collect_enters += 1
+        self.collect_active = True
+        self.events.append("collect_enter")
+        try:
+            yield self
+        finally:
+            self.events.append("collect_exit")
+            self.collect_active = False
+            self.collect_exits += 1
+
+
+class FakeSecureSession:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.connection = object()
+
+    @asynccontextmanager
+    async def open(self, *, pre_connect_profile=None):
+        del pre_connect_profile
+        self.events.append("secure_enter")
+        try:
+            yield AuthenticatedClassicContext(
+                "Synthetic AirPods",
+                self.connection,
+                SimpleNamespace(reported=False),
+            )
+        finally:
+            self.events.append("secure_exit")
+
+
+class FakeChannelSession:
+    def __init__(self, events: list[str], transport: CollectorTransport) -> None:
+        self.events = events
+        self.transport = transport
+
+    @asynccontextmanager
+    async def open_protocol(self, connection, transport_factory):
+        del connection, transport_factory
+        self.events.append("channel_enter")
+        try:
+            yield self.transport
+        finally:
+            self.events.append("channel_exit")
+
+
+class FakeCollectedHandshake:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def run_collected(self, transport):
+        self.events.append("handshake")
+        assert transport.collect_active
+        return completed_handshake()
+
+
+class FakeCollectedHeartRate:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def run_collected(self, transport, handshake):
+        del handshake
+        self.events.append("heart_rate")
+        assert transport.collect_active
+        self.events.append("hr_cleanup")
+        report = HeartRateReport(72, 0, 1, 0, 1, 0)
+        return HeartRateSessionResult(
+            samples=(report,),
+            completion=HeartRateCompletion.TARGET_REACHED,
+            requested_samples=1,
+            stop_acknowledged=True,
+            application_payloads_sent=10,
+            control_frames_observed=4,
+            non_hr_frames=0,
+            malformed_hr_frames=0,
+        )
+
+
+class FakeCollectedMonitor:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def run_collected(self, transport, handshake, stop_event):
+        del handshake, stop_event
+        self.events.append("heart_rate")
+        assert transport.collect_active
+        self.events.append("hr_cleanup")
+        return HeartRateMonitorSessionResult(
+            samples_observed=3,
+            stop_acknowledged=True,
+            application_payloads_sent=10,
+            control_frames_observed=4,
+            non_hr_frames=0,
+            malformed_hr_frames=0,
+        )
+
+
+class FakeBlockingCollectedMonitor:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.started = asyncio.Event()
+
+    async def run_collected(self, transport, handshake, stop_event):
+        del handshake, stop_event
+        assert transport.collect_active
+        self.events.append("heart_rate")
+        self.started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            self.events.append("hr_cleanup")
+
+
+class FakeFailingHeartRate:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def run_collected(self, transport, handshake):
+        del handshake
+        assert transport.collect_active
+        self.events.append("heart_rate_failure")
+        raise HeartRateBootstrapAckTimeoutError(
+            1,
+            frames_queued_before_stop_head=0,
+            application_payloads_sent=2,
+        )
+
+
+class ContinuousCollectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_collector_covers_handshake_activation_and_cleanup(self) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+        session = HeartRateProbeSession(
+            FakeSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            FakeCollectedHeartRate(events),
+        )
+
+        result = await session.run()
+
+        self.assertEqual(result.heart_rate.samples[0].bpm, 72)
+        self.assertEqual(transport.collect_enters, 1)
+        self.assertEqual(transport.collect_exits, 1)
+        self.assertEqual(
+            events,
+            [
+                "secure_enter",
+                "channel_enter",
+                "collect_enter",
+                "handshake",
+                "heart_rate",
+                "hr_cleanup",
+                "collect_exit",
+                "channel_exit",
+                "secure_exit",
+            ],
+        )
+
+    async def test_restoration_is_reported_after_protocol_failure_cleanup(
+        self,
+    ) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+        session = HeartRateProbeSession(
+            FakeSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            FakeFailingHeartRate(events),
+            bluez_restored=lambda: events.append("bluez_restored"),
+        )
+
+        with self.assertRaises(HeartRateBootstrapAckTimeoutError):
+            await session.run()
+
+        self.assertEqual(
+            events[-4:],
+            ["collect_exit", "channel_exit", "secure_exit", "bluez_restored"],
+        )
+
+    async def test_adapter_restore_error_remains_authoritative(self) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+
+        class RestoreFailingSecureSession(FakeSecureSession):
+            @asynccontextmanager
+            async def open(self, *, pre_connect_profile=None):
+                del pre_connect_profile
+                self.events.append("secure_enter")
+                try:
+                    yield AuthenticatedClassicContext(
+                        "Synthetic AirPods",
+                        self.connection,
+                        SimpleNamespace(reported=False),
+                    )
+                finally:
+                    self.events.append("secure_exit")
+                    raise AdapterRestoreError("synthetic restoration failure")
+
+        session = HeartRateProbeSession(
+            RestoreFailingSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            FakeFailingHeartRate(events),
+            bluez_restored=lambda: events.append("bluez_restored"),
+        )
+
+        with self.assertRaises(AdapterRestoreError):
+            await session.run()
+
+        self.assertNotIn("bluez_restored", events)
+
+
+class HeartRateMonitorCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_collector_and_outer_unwind_order(self) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+        session = HeartRateMonitorSession(
+            FakeSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            FakeCollectedMonitor(events),
+            bluez_restored=lambda: events.append("bluez_restored"),
+        )
+
+        result = await session.run(asyncio.Event())
+
+        self.assertIsInstance(result, HeartRateMonitorResult)
+        self.assertEqual(result.heart_rate.samples_observed, 3)
+        self.assertEqual(transport.collect_enters, 1)
+        self.assertEqual(transport.collect_exits, 1)
+        self.assertEqual(
+            events,
+            [
+                "secure_enter",
+                "channel_enter",
+                "collect_enter",
+                "handshake",
+                "heart_rate",
+                "hr_cleanup",
+                "collect_exit",
+                "channel_exit",
+                "secure_exit",
+                "bluez_restored",
+            ],
+        )
+
+    async def test_cancellation_unwinds_composed_session_and_propagates(
+        self,
+    ) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+        monitor = FakeBlockingCollectedMonitor(events)
+        session = HeartRateMonitorSession(
+            FakeSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            monitor,
+            bluez_restored=lambda: events.append("bluez_restored"),
+        )
+        task = asyncio.create_task(session.run(asyncio.Event()))
+        await monitor.started.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(
+            events[-5:],
+            [
+                "hr_cleanup",
+                "collect_exit",
+                "channel_exit",
+                "secure_exit",
+                "bluez_restored",
+            ],
+        )
+        self.assertEqual(events.count("bluez_restored"), 1)
+
+    async def test_adapter_restore_error_is_authoritative(self) -> None:
+        events: list[str] = []
+        transport = CollectorTransport(events)
+
+        class RestoreFailingSecureSession(FakeSecureSession):
+            @asynccontextmanager
+            async def open(self, *, pre_connect_profile=None):
+                del pre_connect_profile
+                self.events.append("secure_enter")
+                try:
+                    yield AuthenticatedClassicContext(
+                        "Synthetic AirPods",
+                        self.connection,
+                        SimpleNamespace(reported=False),
+                    )
+                finally:
+                    self.events.append("secure_exit")
+                    raise AdapterRestoreError("synthetic restoration failure")
+
+        session = HeartRateMonitorSession(
+            RestoreFailingSecureSession(events),
+            FakeChannelSession(events, transport),
+            FakeCollectedHandshake(events),
+            FakeCollectedMonitor(events),
+            bluez_restored=lambda: events.append("bluez_restored"),
+        )
+
+        with self.assertRaises(AdapterRestoreError):
+            await session.run(asyncio.Event())
+
+        self.assertNotIn("bluez_restored", events)
+
+
+class Task7RegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standalone_task7_handshake_still_owns_one_collector(self) -> None:
+        class Transport:
+            def __init__(self):
+                self.application_payloads_sent = 0
+                self.dropped_frames = 0
+                self.collect_enters = 0
+                self.frames = [
+                    bytes.fromhex(
+                        "01 00 04 00 00 00 01 00 03 00 00 00 00 00 00 00 00 00"
+                    ),
+                    b"AccessoryService HeartRateService",
+                ]
+
+            @asynccontextmanager
+            async def collect(self):
+                self.collect_enters += 1
+                yield self
+
+            def send_handshake_request(self):
+                self.application_payloads_sent += 1
+
+            async def receive(self, timeout):
+                del timeout
+                return self.frames.pop(0)
+
+        transport = Transport()
+        result = await AAPHandshakeSession().run(transport)
+
+        self.assertEqual(transport.collect_enters, 1)
+        self.assertEqual(result.application_payloads_sent, 1)
+        self.assertEqual(
+            AAP_HANDSHAKE_REQUEST,
+            bytes.fromhex(
+                "00 00 04 00 01 00 02 00 00 00 00 00 00 00 00 00"
+            ),
+        )
 
 

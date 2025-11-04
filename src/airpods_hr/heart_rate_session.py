@@ -9,9 +9,15 @@ from enum import IntEnum, StrEnum
 from time import monotonic
 from typing import Protocol
 
-from airpods_hr.aap import AAPHandshakeResult
-
-
+from airpods_hr.aap import (
+    AAPHandshakeResult,
+    AAPHandshakeSession,
+    BumbleAAPTransport,
+    SecureClassicSession,
+)
+from airpods_hr.aap_channel import AAPChannel, AAPChannelSession
+from airpods_hr.authentication import AuthenticatedClassicContext
+from airpods_hr.bluetooth import AdapterRestoreError
 from airpods_hr.heartrate import (
     HeartRateMarkerNotFoundError,
     HeartRateParseError,
@@ -22,6 +28,12 @@ from airpods_hr.protocol import (
     HEART_RATE_MARKER,
     HEART_RATE_SERVICE_ID,
     HeartRateCommand,
+)
+from airpods_hr.sdp import SDPCompatibilityProfile
+from airpods_hr.sdp_diagnostics import (
+    BumbleSDPDiagnostics,
+    SafeProtocolTimeline,
+    SDPDiagnosticsSnapshot,
 )
 
 
@@ -422,6 +434,24 @@ class HeartRateMonitorSessionResult:
     control_frames_observed: int
     non_hr_frames: int
     malformed_hr_frames: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeartRateProbeResult:
+    display_name: str
+    heart_rate: HeartRateSessionResult
+    replacement_key_reported: bool
+    sdp_diagnostics: SDPDiagnosticsSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class HeartRateMonitorResult:
+    """Complete continuous-monitor outcome after outer-session cleanup."""
+
+    display_name: str
+    heart_rate: HeartRateMonitorSessionResult
+    replacement_key_reported: bool
+    sdp_diagnostics: SDPDiagnosticsSnapshot
 
 
 class CollectedHeartRateTransport(Protocol):
@@ -1067,3 +1097,179 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
         )
 
 
+class HeartRateProbeSession:
+    """Compose AAP handshake bootstrap with Heart-rate session under one receive collector."""
+
+    def __init__(
+        self,
+        secure_session: SecureClassicSession,
+        channel_session: AAPChannelSession,
+        handshake_session: AAPHandshakeSession,
+        heart_rate_session: HeartRateActivationSession,
+        *,
+        sdp_installed: Callable[[], None] | None = None,
+        bluez_restored: Callable[[], None] | None = None,
+        queue_limit: int = 32,
+        frame_size_limit: int = 64 * 1024,
+    ) -> None:
+        self._secure_session = secure_session
+        self._channel_session = channel_session
+        self._handshake_session = handshake_session
+        self._heart_rate_session = heart_rate_session
+        self._sdp_installed = sdp_installed
+        self._bluez_restored = bluez_restored
+        self._queue_limit = queue_limit
+        self._frame_size_limit = frame_size_limit
+
+    async def run(self) -> HeartRateProbeResult:
+        secure: AuthenticatedClassicContext | None = None
+        result: HeartRateSessionResult | None = None
+        secure_entered = False
+        timeline = getattr(
+            self._handshake_session, "timeline", SafeProtocolTimeline()
+        )
+        diagnostics = BumbleSDPDiagnostics(timeline=timeline)
+        profile = SDPCompatibilityProfile(
+            installed_callback=self._sdp_installed,
+            diagnostics=diagnostics,
+        )
+        try:
+            async with self._secure_session.open(
+                pre_connect_profile=profile
+            ) as secure:
+                secure_entered = True
+
+                def transport_factory(
+                    raw_channel: object, channel: AAPChannel
+                ) -> BumbleAAPTransport:
+                    return BumbleAAPTransport(
+                        raw_channel,
+                        channel,
+                        queue_limit=self._queue_limit,
+                        frame_size_limit=self._frame_size_limit,
+                    )
+
+                async with self._channel_session.open_protocol(
+                    secure.connection, transport_factory
+                ) as transport:
+                    async with transport.collect():
+                        handshake = await self._handshake_session.run_collected(
+                            transport
+                        )
+                        result = await self._heart_rate_session.run_collected(
+                            transport, handshake
+                        )
+        except AdapterRestoreError:
+            raise
+        except BaseException:
+            if secure_entered:
+                self._emit_bluez_restored()
+            raise
+        else:
+            if secure_entered:
+                self._emit_bluez_restored()
+        assert secure is not None and result is not None
+        return HeartRateProbeResult(
+            display_name=secure.display_name,
+            heart_rate=result,
+            replacement_key_reported=secure.replacement_key_reported,
+            sdp_diagnostics=diagnostics.snapshot(),
+        )
+
+    def _emit_bluez_restored(self) -> None:
+        if self._bluez_restored is not None:
+            try:
+                self._bluez_restored()
+            except Exception:
+                # A diagnostic output failure must not replace protocol or
+                # restoration outcomes.
+                pass
+
+
+class HeartRateMonitorSession:
+    """Compose continuous HR monitoring under one receive collector."""
+
+    def __init__(
+        self,
+        secure_session: SecureClassicSession,
+        channel_session: AAPChannelSession,
+        handshake_session: AAPHandshakeSession,
+        heart_rate_session: HeartRateMonitorActivationSession,
+        *,
+        sdp_installed: Callable[[], None] | None = None,
+        bluez_restored: Callable[[], None] | None = None,
+        queue_limit: int = 32,
+        frame_size_limit: int = 64 * 1024,
+    ) -> None:
+        self._secure_session = secure_session
+        self._channel_session = channel_session
+        self._handshake_session = handshake_session
+        self._heart_rate_session = heart_rate_session
+        self._sdp_installed = sdp_installed
+        self._bluez_restored = bluez_restored
+        self._queue_limit = queue_limit
+        self._frame_size_limit = frame_size_limit
+
+    async def run(self, stop_event: asyncio.Event) -> HeartRateMonitorResult:
+        secure: AuthenticatedClassicContext | None = None
+        result: HeartRateMonitorSessionResult | None = None
+        secure_entered = False
+        timeline = getattr(
+            self._handshake_session, "timeline", SafeProtocolTimeline()
+        )
+        diagnostics = BumbleSDPDiagnostics(timeline=timeline)
+        profile = SDPCompatibilityProfile(
+            installed_callback=self._sdp_installed,
+            diagnostics=diagnostics,
+        )
+        try:
+            async with self._secure_session.open(
+                pre_connect_profile=profile
+            ) as secure:
+                secure_entered = True
+
+                def transport_factory(
+                    raw_channel: object, channel: AAPChannel
+                ) -> BumbleAAPTransport:
+                    return BumbleAAPTransport(
+                        raw_channel,
+                        channel,
+                        queue_limit=self._queue_limit,
+                        frame_size_limit=self._frame_size_limit,
+                    )
+
+                async with self._channel_session.open_protocol(
+                    secure.connection, transport_factory
+                ) as transport:
+                    async with transport.collect():
+                        handshake = await self._handshake_session.run_collected(
+                            transport
+                        )
+                        result = await self._heart_rate_session.run_collected(
+                            transport, handshake, stop_event
+                        )
+        except AdapterRestoreError:
+            raise
+        except BaseException:
+            if secure_entered:
+                self._emit_bluez_restored()
+            raise
+        else:
+            if secure_entered:
+                self._emit_bluez_restored()
+        assert secure is not None and result is not None
+        return HeartRateMonitorResult(
+            display_name=secure.display_name,
+            heart_rate=result,
+            replacement_key_reported=secure.replacement_key_reported,
+            sdp_diagnostics=diagnostics.snapshot(),
+        )
+
+    def _emit_bluez_restored(self) -> None:
+        if self._bluez_restored is not None:
+            try:
+                self._bluez_restored()
+            except Exception:
+                # A diagnostic output failure must not replace protocol or
+                # restoration outcomes.
+                pass
