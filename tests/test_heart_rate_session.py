@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPHandshakeResult, BumbleAAPTransport, DescriptorEvidence, HandshakeObservation
 
 
-from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateNoSamplesError, HeartRateProgress, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
+from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateMonitorActivationSession, HeartRateMonitorSessionResult, HeartRateNoSamplesError, HeartRateProgress, HeartRateStateError, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
 
 
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
@@ -1310,6 +1310,410 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(clock.now, 5)
+
+
+class HeartRateMonitorActivationTests(unittest.IsolatedAsyncioTestCase):
+    def make_session(
+        self,
+        clock: FakeClock,
+        *,
+        progress=None,
+        receive_poll_interval: float = 0.5,
+    ) -> HeartRateMonitorActivationSession:
+        return HeartRateMonitorActivationSession(
+            receive_poll_interval=receive_poll_interval,
+            control_ack_timeout=3,
+            stop_ack_timeout=2,
+            clock=clock,
+            sleep=clock.sleep,
+            progress=progress,
+        )
+
+    async def test_normal_continuous_flow_stops_from_sample_callback(self) -> None:
+        clock = FakeClock()
+        stop_event = asyncio.Event()
+        reports: list[HeartRateReport] = []
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                reports.append(report)
+                if len(reports) == 3:
+                    stop_event.set()
+
+        transport = FakeCollectedTransport(successful_frames(3), clock)
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertEqual(result.samples_observed, 3)
+        self.assertEqual([report.bpm for report in reports], [70, 71, 72])
+        self.assertEqual(result.application_payloads_sent, 10)
+        self.assertTrue(result.stop_acknowledged)
+        self.assertEqual(
+            transport.commands,
+            [
+                HeartRateCommand.STOP_HEAD,
+                HeartRateCommand.CONNECT0,
+                HeartRateCommand.CAPS0,
+                HeartRateCommand.CONNECT4,
+                HeartRateCommand.CAPS4,
+                HeartRateCommand.HR_ON,
+                HeartRateCommand.START_HR,
+                HeartRateCommand.STOP_HR,
+                HeartRateCommand.HR_OFF,
+            ],
+        )
+
+    async def test_result_has_only_bounded_status_fields(self) -> None:
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+        observed = 0
+
+        def progress(event, report):
+            nonlocal observed
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                observed += 1
+                if observed == 256:
+                    stop_event.set()
+
+        frames = [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)]
+        frames.extend(
+            heart_rate_packet(60 + (index % 100), index + 1)
+            for index in range(256)
+        )
+        frames.append(service_ack(0x13))
+        transport = FakeCollectedTransport(frames, clock)
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertEqual(result.samples_observed, 256)
+        self.assertEqual(
+            {field.name for field in fields(HeartRateMonitorSessionResult)},
+            {
+                "samples_observed",
+                "stop_acknowledged",
+                "application_payloads_sent",
+                "control_frames_observed",
+                "non_hr_frames",
+                "malformed_hr_frames",
+            },
+        )
+        self.assertFalse(
+            any(
+                isinstance(value, (HeartRateReport, list, tuple))
+                for value in (
+                    getattr(result, field.name)
+                    for field in fields(HeartRateMonitorSessionResult)
+                )
+            )
+        )
+
+    async def test_idle_receive_timeouts_do_not_end_monitor(self) -> None:
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                stop_event.set()
+
+        frames = [
+            service_ack(0x0E),
+            CONNECT4_ACK,
+            service_ack(0x13),
+            TimeoutError(),
+            TimeoutError(),
+            heart_rate_packet(74, 1),
+            service_ack(0x13),
+        ]
+        transport = FakeCollectedTransport(frames, clock)
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertEqual(result.samples_observed, 1)
+        self.assertTrue(result.stop_acknowledged)
+
+    async def test_pre_set_stop_skips_observation_and_cleans_up(self) -> None:
+        class TimeoutRecordingTransport(FakeCollectedTransport):
+            def __init__(self, frames, clock):
+                super().__init__(frames, clock)
+                self.receive_timeouts: list[float] = []
+
+            async def receive(self, timeout: float) -> bytes:
+                self.receive_timeouts.append(timeout)
+                return await super().receive(timeout)
+
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+        stop_event.set()
+        transport = TimeoutRecordingTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13), service_ack(0x13)],
+            clock,
+        )
+
+        result = await self.make_session(clock).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertEqual(result.samples_observed, 0)
+        self.assertEqual(transport.receive_timeouts, [3, 3, 3, 2])
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_non_hr_and_malformed_frames_are_counted(self) -> None:
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+        malformed = b"prefix" + HEART_RATE_MARKER + b"\x01\x48"
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                stop_event.set()
+
+        transport = FakeCollectedTransport(
+            [
+                service_ack(0x0E),
+                CONNECT4_ACK,
+                service_ack(0x13),
+                b"unrelated AAP frame",
+                malformed,
+                heart_rate_packet(72, 1),
+                service_ack(0x13),
+            ],
+            clock,
+        )
+
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertEqual(result.non_hr_frames, 1)
+        self.assertEqual(result.malformed_hr_frames, 1)
+        self.assertEqual(result.samples_observed, 1)
+
+    async def test_missing_stop_ack_is_a_successful_false_result(self) -> None:
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                stop_event.set()
+
+        transport = FakeCollectedTransport(
+            successful_frames(1, include_stop_ack=False), clock
+        )
+        result = await self.make_session(clock, progress=progress).run_collected(
+            transport, completed_handshake(), stop_event
+        )
+
+        self.assertFalse(result.stop_acknowledged)
+        self.assertEqual(result.application_payloads_sent, 10)
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_stop_send_failure_still_attempts_hr_off(self) -> None:
+        class AttemptTrackingTransport(FakeCollectedTransport):
+            def __init__(self, frames, clock):
+                super().__init__(
+                    frames,
+                    clock,
+                    fail_send={HeartRateCommand.STOP_HR},
+                )
+                self.attempts: list[HeartRateCommand] = []
+
+            def send_heart_rate_command(self, command):
+                self.attempts.append(command)
+                super().send_heart_rate_command(command)
+
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+        stop_event.set()
+        transport = AttemptTrackingTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)], clock
+        )
+
+        with self.assertRaises(HeartRateCleanupError):
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake(), stop_event
+            )
+
+        self.assertEqual(transport.attempts.count(HeartRateCommand.STOP_HR), 1)
+        self.assertEqual(transport.attempts.count(HeartRateCommand.HR_OFF), 1)
+
+    async def test_receive_failure_preserves_primary_after_cleanup(self) -> None:
+        class MonitorReceiveError(RuntimeError):
+            pass
+
+        class AttemptTrackingTransport(FakeCollectedTransport):
+            def __init__(self, frames, clock):
+                super().__init__(
+                    frames,
+                    clock,
+                    fail_send={HeartRateCommand.HR_OFF},
+                )
+                self.attempts: list[HeartRateCommand] = []
+
+            def send_heart_rate_command(self, command):
+                self.attempts.append(command)
+                super().send_heart_rate_command(command)
+
+        clock = FakeClock(now=2)
+        transport = AttemptTrackingTransport(
+            [
+                service_ack(0x0E),
+                CONNECT4_ACK,
+                service_ack(0x13),
+                MonitorReceiveError("synthetic monitor receive failure"),
+                service_ack(0x13),
+            ],
+            clock,
+        )
+
+        with self.assertRaises(MonitorReceiveError) as raised:
+            await self.make_session(clock).run_collected(
+                transport, completed_handshake(), asyncio.Event()
+            )
+
+        self.assertEqual(transport.attempts.count(HeartRateCommand.STOP_HR), 1)
+        self.assertEqual(transport.attempts.count(HeartRateCommand.HR_OFF), 1)
+        self.assertTrue(any("cleanup" in note for note in raised.exception.__notes__))
+
+    async def test_progress_callback_failure_preserves_primary(self) -> None:
+        class ProgressError(RuntimeError):
+            pass
+
+        clock = FakeClock(now=2)
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                raise ProgressError("synthetic progress failure")
+
+        transport = FakeCollectedTransport(successful_frames(1), clock)
+        with self.assertRaises(ProgressError):
+            await self.make_session(clock, progress=progress).run_collected(
+                transport, completed_handshake(), asyncio.Event()
+            )
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+
+    async def test_cancellation_during_receive_cleans_up_and_propagates(self) -> None:
+        class BlockingMonitorTransport(FakeCollectedTransport):
+            def __init__(self, frames, clock):
+                super().__init__(frames, clock)
+                self.monitor_receive_entered = asyncio.Event()
+                self.monitor_receive_cancelled = False
+
+            async def receive(self, timeout: float) -> bytes:
+                if self.frames:
+                    return await super().receive(timeout)
+                if not self.monitor_receive_cancelled:
+                    self.monitor_receive_entered.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        self.monitor_receive_cancelled = True
+                        raise
+                return service_ack(0x13)
+
+        clock = FakeClock(now=2)
+        transport = BlockingMonitorTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)], clock
+        )
+        task = asyncio.create_task(
+            self.make_session(clock).run_collected(
+                transport, completed_handshake(), asyncio.Event()
+            )
+        )
+        await transport.monitor_receive_entered.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+        self.assertEqual(transport.commands.count(HeartRateCommand.STOP_HR), 1)
+        self.assertEqual(transport.commands.count(HeartRateCommand.HR_OFF), 1)
+
+    async def test_cancellation_during_stop_ack_still_attempts_hr_off(self) -> None:
+        class BlockingStopAckTransport(FakeCollectedTransport):
+            def __init__(self, frames, clock):
+                super().__init__(frames, clock)
+                self.stop_ack_wait_entered = asyncio.Event()
+
+            async def receive(self, timeout: float) -> bytes:
+                if self.frames:
+                    return await super().receive(timeout)
+                self.stop_ack_wait_entered.set()
+                await asyncio.Future()
+                raise AssertionError("unreachable")
+
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+
+        def progress(event, report):
+            if event is HeartRateProgress.SAMPLE and report is not None:
+                stop_event.set()
+
+        transport = BlockingStopAckTransport(
+            [
+                service_ack(0x0E),
+                CONNECT4_ACK,
+                service_ack(0x13),
+                heart_rate_packet(72, 1),
+            ],
+            clock,
+        )
+        task = asyncio.create_task(
+            self.make_session(clock, progress=progress).run_collected(
+                transport, completed_handshake(), stop_event
+            )
+        )
+        await transport.stop_ack_wait_entered.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(transport.commands.count(HeartRateCommand.STOP_HR), 1)
+        self.assertEqual(transport.commands.count(HeartRateCommand.HR_OFF), 1)
+        self.assertEqual(transport.commands[-1], HeartRateCommand.HR_OFF)
+
+    async def test_monitor_activation_is_single_use(self) -> None:
+        clock = FakeClock(now=2)
+        stop_event = asyncio.Event()
+        stop_event.set()
+        session = self.make_session(clock)
+        transport = FakeCollectedTransport(
+            [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13), service_ack(0x13)],
+            clock,
+        )
+        await session.run_collected(transport, completed_handshake(), stop_event)
+        second_transport = FakeCollectedTransport([], clock)
+
+        with self.assertRaises(HeartRateStateError):
+            await session.run_collected(
+                second_transport, completed_handshake(), stop_event
+            )
+
+    def test_receive_poll_interval_validation(self) -> None:
+        clock = FakeClock()
+        for value in (0, -0.1, 5.01):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.make_session(clock, receive_poll_interval=value)
+        for value in (0.001, 0.5, 5.0):
+            with self.subTest(value=value):
+                self.make_session(clock, receive_poll_interval=value)
 
 
 class ParserReuseTests(unittest.TestCase):

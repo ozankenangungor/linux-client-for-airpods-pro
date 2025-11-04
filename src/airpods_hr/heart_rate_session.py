@@ -412,6 +412,18 @@ class HeartRateSessionResult:
     malformed_hr_frames: int
 
 
+@dataclass(frozen=True, slots=True)
+class HeartRateMonitorSessionResult:
+    """Bounded-memory outcome of an explicitly stopped continuous stream."""
+
+    samples_observed: int
+    stop_acknowledged: bool
+    application_payloads_sent: int
+    control_frames_observed: int
+    non_hr_frames: int
+    malformed_hr_frames: int
+
+
 class CollectedHeartRateTransport(Protocol):
     @property
     def application_payloads_sent(self) -> int: ...
@@ -834,5 +846,224 @@ class HeartRateActivationSession:
     ) -> None:
         if self._progress is not None:
             self._progress(event, report)
+
+
+class HeartRateMonitorActivationSession(HeartRateActivationSession):
+    """Continuously observe HR reports until a caller-owned event is set."""
+
+    def __init__(
+        self,
+        *,
+        receive_poll_interval: float = 0.5,
+        control_ack_timeout: float = DEFAULT_CONTROL_ACK_TIMEOUT,
+        stop_ack_timeout: float = DEFAULT_STOP_ACK_TIMEOUT,
+        minimum_bootstrap_seconds: float = MINIMUM_BOOTSTRAP_SECONDS,
+        control_summary_limit: int = DEFAULT_CONTROL_SUMMARY_LIMIT,
+        clock: Clock = monotonic,
+        sleep: Sleeper = asyncio.sleep,
+        progress: HeartRateProgressCallback | None = None,
+    ) -> None:
+        if not 0 < receive_poll_interval <= 5.0:
+            raise ValueError(
+                "receive poll interval must be greater than zero and at most 5 seconds"
+            )
+        # The bounded observation settings are unused by this subclass. Calling
+        # the proven initializer preserves its state machine, validation, ACK
+        # handling, diagnostics, and closed-command cleanup implementation.
+        super().__init__(
+            sample_target=1,
+            stream_timeout=receive_poll_interval,
+            control_ack_timeout=control_ack_timeout,
+            stop_ack_timeout=stop_ack_timeout,
+            minimum_bootstrap_seconds=minimum_bootstrap_seconds,
+            control_summary_limit=control_summary_limit,
+            clock=clock,
+            sleep=sleep,
+            progress=progress,
+        )
+        self._receive_poll_interval = receive_poll_interval
+
+    async def run_collected(
+        self,
+        transport: CollectedHeartRateTransport,
+        handshake: AAPHandshakeResult,
+        stop_event: asyncio.Event,
+    ) -> HeartRateMonitorSessionResult:
+        """Activate once, stream without retaining reports, and clean up."""
+
+        if not isinstance(stop_event, asyncio.Event):
+            raise TypeError("stop_event must be an asyncio.Event")
+        if not handshake.evidence.required:
+            raise HeartRateStateError("required descriptor evidence is absent")
+        if transport.application_payloads_sent != 1:
+            raise HeartRateStateError("heart-rate activation requires one handshake")
+        if self._sent or self.state is not HeartRateActivationState.DESCRIPTORS_READY:
+            raise HeartRateStateError("heart-rate activation session is single-use")
+
+        samples_observed = 0
+        non_hr_frames = 0
+        malformed_hr_frames = 0
+        stop_acknowledged = False
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        cleanup_cancellation: asyncio.CancelledError | None = None
+        try:
+            remaining = (
+                handshake.handshake_sent_at
+                + self._minimum_bootstrap_seconds
+                - self._clock()
+            )
+            if remaining > 0:
+                await self._sleep(remaining)
+            self._emit(HeartRateProgress.BOOTSTRAP_COMPLETE)
+
+            frames_queued_before_stop_head = transport.pending_receive_frames
+            self._send_activation(
+                transport,
+                HeartRateCommand.STOP_HEAD,
+                HeartRateActivationState.DESCRIPTORS_READY,
+                HeartRateActivationState.STOP_HEAD_SENT,
+            )
+            stop_head_sent_at = self._clock()
+            await self._wait_required_ack(
+                transport,
+                lambda frame: is_observed_service_ack(frame, 0x0E),
+                HeartRateBootstrapAckTimeoutError,
+                stop_head_sent_at=stop_head_sent_at,
+                frames_queued_before_stop_head=frames_queued_before_stop_head,
+            )
+            self.state = HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED
+            self._emit(HeartRateProgress.STOP_HEAD_ACKNOWLEDGED)
+
+            self._send_activation(
+                transport,
+                HeartRateCommand.CONNECT0,
+                HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED,
+                HeartRateActivationState.CONNECT0_SENT,
+            )
+            self._send_activation(
+                transport,
+                HeartRateCommand.CAPS0,
+                HeartRateActivationState.CONNECT0_SENT,
+                HeartRateActivationState.CAPS0_SENT,
+            )
+            self._send_activation(
+                transport,
+                HeartRateCommand.CONNECT4,
+                HeartRateActivationState.CAPS0_SENT,
+                HeartRateActivationState.CONNECT4_SENT,
+            )
+            await self._wait_required_ack(
+                transport,
+                is_connect4_ack,
+                HeartRateConnectAckTimeoutError,
+            )
+            self.state = HeartRateActivationState.CONNECT4_ACKNOWLEDGED
+            self._emit(HeartRateProgress.CONTROL_CHANNELS_READY)
+
+            self._send_activation(
+                transport,
+                HeartRateCommand.CAPS4,
+                HeartRateActivationState.CONNECT4_ACKNOWLEDGED,
+                HeartRateActivationState.CAPS4_SENT,
+            )
+            self._send_activation(
+                transport,
+                HeartRateCommand.HR_ON,
+                HeartRateActivationState.CAPS4_SENT,
+                HeartRateActivationState.HR_ON_SENT,
+            )
+            self._send_activation(
+                transport,
+                HeartRateCommand.START_HR,
+                HeartRateActivationState.HR_ON_SENT,
+                HeartRateActivationState.START_HR_SENT,
+            )
+            await self._wait_required_ack(
+                transport,
+                lambda frame: is_observed_service_ack(
+                    frame, HEART_RATE_SERVICE_ID
+                ),
+                HeartRateStartAckTimeoutError,
+            )
+            self.state = HeartRateActivationState.START_ACKNOWLEDGED
+            self._emit(HeartRateProgress.START_ACKNOWLEDGED)
+
+            while not stop_event.is_set():
+                try:
+                    frame = await transport.receive(self._receive_poll_interval)
+                except TimeoutError:
+                    continue
+                try:
+                    report = parse_heart_rate_packet(frame)
+                except HeartRateMarkerNotFoundError:
+                    non_hr_frames += 1
+                    continue
+                except HeartRateParseError:
+                    malformed_hr_frames += 1
+                    continue
+                samples_observed += 1
+                self._emit(HeartRateProgress.SAMPLE, report)
+            self.state = HeartRateActivationState.STREAM_COMPLETE
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if HeartRateCommand.START_HR in self._sent:
+                try:
+                    self._send_cleanup(transport, HeartRateCommand.STOP_HR)
+                    self.state = HeartRateActivationState.STOP_HR_SENT
+                    stop_acknowledged = await self._wait_optional_stop_ack(
+                        transport
+                    )
+                    if stop_acknowledged:
+                        self.state = HeartRateActivationState.STOP_HR_ACKNOWLEDGED
+                        self._emit(HeartRateProgress.STOP_ACKNOWLEDGED)
+                    else:
+                        self._emit(HeartRateProgress.STOP_ACK_MISSING)
+                except asyncio.CancelledError as error:
+                    cleanup_cancellation = error
+                except BaseException as error:
+                    cleanup_errors.append(error)
+
+            if HeartRateCommand.HR_ON in self._sent:
+                try:
+                    self._send_cleanup(transport, HeartRateCommand.HR_OFF)
+                    self.state = HeartRateActivationState.HR_OFF_SENT
+                    self._emit(HeartRateProgress.HR_OFF_SENT)
+                except asyncio.CancelledError as error:
+                    cleanup_cancellation = error
+                except BaseException as error:
+                    cleanup_errors.append(error)
+
+            if cleanup_cancellation is not None:
+                if cleanup_errors:
+                    cleanup_cancellation.add_note(
+                        "heart-rate stop cleanup also reported an error"
+                    )
+                raise cleanup_cancellation
+            if cleanup_errors:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "heart-rate stop cleanup also reported an error"
+                    )
+                else:
+                    raise HeartRateCleanupError(
+                        "heart-rate stop cleanup failed"
+                    ) from cleanup_errors[-1]
+
+        self.state = HeartRateActivationState.COMPLETE
+        if transport.application_payloads_sent != 10:
+            raise HeartRateStateError(
+                "successful heart-rate monitor sent an unexpected payload count"
+            )
+        return HeartRateMonitorSessionResult(
+            samples_observed=samples_observed,
+            stop_acknowledged=stop_acknowledged,
+            application_payloads_sent=transport.application_payloads_sent,
+            control_frames_observed=self._control_frames_observed,
+            non_hr_frames=non_hr_frames,
+            malformed_hr_frames=malformed_hr_frames,
+        )
 
 
