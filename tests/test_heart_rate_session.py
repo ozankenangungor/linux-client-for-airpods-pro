@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr
 from dataclasses import fields
-
+from io import StringIO
 from types import SimpleNamespace
-
+from unittest.mock import AsyncMock
 
 from airpods_hr.aap import (
     AAP_HANDSHAKE_REQUEST,
@@ -20,11 +20,33 @@ from airpods_hr.aap import (
 )
 from airpods_hr.authentication import AuthenticatedClassicContext
 from airpods_hr.bluetooth import AdapterRestoreError
-from airpods_hr.heart_rate_session import CONNECT4_ACK, ControlFrameSummary, HeartRateActivationSession, HeartRateBootstrapAckTimeoutError, HeartRateCleanupError, HeartRateCompletion, HeartRateConnectAckTimeoutError, HeartRateMonitorActivationSession, HeartRateMonitorResult, HeartRateMonitorSession, HeartRateMonitorSessionResult, HeartRateNoSamplesError, HeartRateProbeSession, HeartRateProgress, HeartRateSessionResult, HeartRateStateError, HeartRateStartAckTimeoutError, is_connect4_ack, is_observed_service_ack
-
-
+from airpods_hr.heart_rate_session import (
+    CONNECT4_ACK,
+    ControlFrameSummary,
+    DEFAULT_SAMPLE_TARGET,
+    DEFAULT_STREAM_TIMEOUT,
+    HeartRateActivationSession,
+    HeartRateBootstrapAckTimeoutError,
+    HeartRateCleanupError,
+    HeartRateCompletion,
+    HeartRateConnectAckTimeoutError,
+    HeartRateMonitorActivationSession,
+    HeartRateMonitorResult,
+    HeartRateMonitorSession,
+    HeartRateMonitorSessionResult,
+    HeartRateNoSamplesError,
+    HeartRateProbeResult,
+    HeartRateProbeSession,
+    HeartRateProgress,
+    HeartRateSessionResult,
+    HeartRateStateError,
+    HeartRateStartAckTimeoutError,
+    is_connect4_ack,
+    is_observed_service_ack,
+)
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
 from airpods_hr.protocol import HEART_RATE_MARKER, HeartRateCommand
+from tools.probe_heart_rate import build_parser, run_probe
 
 
 REAL_STOP_ACK_ONE_BYTE_ID = bytes.fromhex(
@@ -2052,6 +2074,115 @@ class HeartRateMonitorCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bluez_restored", events)
 
 
+class HeartRateProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dry_run_is_default_and_creates_no_live_backend(self) -> None:
+        output: list[str] = []
+        runner = AsyncMock()
+
+        result = await run_probe(
+            execute=False,
+            output=output.append,
+            live_runner=runner,
+        )
+
+        self.assertEqual(result, 0)
+        runner.assert_not_awaited()
+        self.assertIn("Classic host-state snapshot: disabled", output)
+        self.assertIn("Valid heart-rate sample target: 5", output)
+        self.assertIn("Maximum stream observation: 12 seconds", output)
+
+    async def test_execute_is_the_only_live_gate_and_forwards_bounds(self) -> None:
+        report = HeartRateReport(72, 0, 1, 0, 1, 0)
+        result = HeartRateProbeResult(
+            display_name="Synthetic AirPods",
+            heart_rate=HeartRateSessionResult(
+                samples=(report,),
+                completion=HeartRateCompletion.TARGET_REACHED,
+                requested_samples=1,
+                stop_acknowledged=True,
+                application_payloads_sent=10,
+                control_frames_observed=4,
+                non_hr_frames=0,
+                malformed_hr_frames=0,
+            ),
+            replacement_key_reported=False,
+            sdp_diagnostics=SimpleNamespace(),
+        )
+        runner = AsyncMock(return_value=result)
+
+        status = await run_probe(
+            execute=True,
+            sample_target=1,
+            stream_timeout=4,
+            live_runner=runner,
+            output=lambda _message: None,
+        )
+
+        self.assertEqual(status, 0)
+        called_output, called_target, called_timeout = runner.call_args.args
+        self.assertTrue(callable(called_output))
+        self.assertEqual((called_target, called_timeout), (1, 4))
+
+    async def test_stop_timeout_output_contains_only_safe_summary(self) -> None:
+        raw = service_ack(0x0E, b"\x81\x81\x01")
+        summary = ControlFrameSummary.from_frame(
+            raw, relative_to_stop_head_seconds=0.125
+        )
+        error = HeartRateBootstrapAckTimeoutError(
+            3,
+            frames_queued_before_stop_head=2,
+            summaries=(summary,),
+            application_payloads_sent=2,
+        )
+        output: list[str] = []
+        runner = AsyncMock(side_effect=error)
+
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=runner,
+        )
+
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIn("Application payloads sent: 2", rendered)
+        self.assertIn("Frames queued before STOP_HEAD: 2", rendered)
+        self.assertIn("Control frames observed: 3", rendered)
+        self.assertIn("candidate identifier terminated=yes", rendered)
+        self.assertIn("candidate identifier octets=3", rendered)
+        self.assertIn("candidate identifier canonical=yes", rendered)
+        self.assertIn("current 1/2-byte canonical identifier=no", rendered)
+        self.assertIn("post-identifier length=6", rendered)
+        self.assertIn("post-identifier prefix octets=(0x10, 0x01)", rendered)
+        self.assertIn("post-identifier starts 10 01=yes", rendered)
+        self.assertIn("post-identifier prefix is observed=yes", rendered)
+        self.assertIn("post-identifier field tag=0x4a", rendered)
+        self.assertIn("post-identifier field parameter=0x02", rendered)
+        self.assertIn("terminal tag 0x08=yes", rendered)
+        self.assertIn("terminal value=0x0e", rendered)
+        self.assertIn("observed 62-02-08 group count=0", rendered)
+        self.assertIn("observed 62-02-08 terminal values=()", rendered)
+        self.assertIn("observed 62-02-08 group offsets=()", rendered)
+        self.assertIn("remainder ACK-0x0e shape=yes", rendered)
+        self.assertIn("remainder ACK-0x13 shape=no", rendered)
+        self.assertIn("remainder bootstrap-0x10 shape=no", rendered)
+        self.assertIn("bootstrap tail 0x10 suffix present=no", rendered)
+        self.assertIn("after STOP_HEAD=+0.125s", rendered)
+        self.assertNotIn(raw.hex(), rendered)
+        self.assertNotIn(raw.hex(" "), rendered)
+
+    def test_cli_defaults_and_conservative_bounds(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertFalse(args.execute)
+        self.assertEqual(args.samples, DEFAULT_SAMPLE_TARGET)
+        self.assertEqual(args.stream_timeout, DEFAULT_STREAM_TIMEOUT)
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["--samples", "11"])
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["--stream-timeout", "31"])
+
+
 class Task7RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_standalone_task7_handshake_still_owns_one_collector(self) -> None:
         class Transport:
@@ -2091,3 +2222,5 @@ class Task7RegressionTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+if __name__ == "__main__":
+    unittest.main()
