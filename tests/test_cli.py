@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import signal
 import unittest
-
+from io import StringIO
 from unittest.mock import AsyncMock
 
 from airpods_hr.aap import AAPHandshakeError
 from airpods_hr.aap_channel import AAPChannelError
 from airpods_hr.authentication import ClassicAuthenticationError
 from airpods_hr.bluetooth import AdapterRestoreError, HandoffError
-
+from airpods_hr.cli import main
 from airpods_hr.discovery import (
     MultipleAirPodsCandidatesError,
     NoAirPodsCandidatesError,
@@ -70,6 +70,61 @@ def report(bpm: int = 72) -> HeartRateReport:
         timestamp_ticks=0,
         flags=0,
     )
+
+
+class PackagedCommandTests(unittest.TestCase):
+    def test_no_command_prints_help_without_live_access(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        live_runner = AsyncMock()
+
+        status = main(
+            [], stdout=stdout, stderr=stderr, live_runner=live_runner
+        )
+
+        self.assertEqual(status, 0)
+        self.assertIn("monitor", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+        live_runner.assert_not_awaited()
+
+    def test_top_level_help_has_no_live_access(self) -> None:
+        stdout = StringIO()
+        live_runner = AsyncMock()
+
+        status = main(["--help"], stdout=stdout, live_runner=live_runner)
+
+        self.assertEqual(status, 0)
+        self.assertIn("usage: airpods-hr", stdout.getvalue())
+        live_runner.assert_not_awaited()
+
+    def test_monitor_help_has_no_live_access(self) -> None:
+        stdout = StringIO()
+        live_runner = AsyncMock()
+
+        status = main(
+            ["monitor", "--help"], stdout=stdout, live_runner=live_runner
+        )
+
+        self.assertEqual(status, 0)
+        self.assertIn("--dry-run", stdout.getvalue())
+        live_runner.assert_not_awaited()
+
+    def test_monitor_dry_run_has_no_live_access(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        live_runner = AsyncMock()
+
+        status = main(
+            ["monitor", "--dry-run"],
+            stdout=stdout,
+            stderr=stderr,
+            live_runner=live_runner,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("DRY RUN: no Bluetooth state will be changed.", stderr.getvalue())
+        live_runner.assert_not_awaited()
 
 
 class ProductProgressTests(unittest.TestCase):
@@ -593,3 +648,5 @@ class SafeErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DRY RUN: no Bluetooth state will be changed.", stderr)
 
 
+if __name__ == "__main__":
+    unittest.main()

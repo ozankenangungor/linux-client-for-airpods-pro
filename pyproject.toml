@@ -30,5 +30,8 @@ handoff-probe = [
     "dbus-next>=0.2.3",
 ]
 
+[project.scripts]
+airpods-hr = "airpods_hr.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
