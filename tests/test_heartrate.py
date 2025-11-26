@@ -28,7 +28,9 @@ def make_report(*, report_id: int = 0x01) -> bytes:
 
 class ParseHeartRatePacketTests(unittest.TestCase):
     def assert_decoded_fields(self, parsed: HeartRateReport) -> None:
+        self.assertEqual(parsed.raw_report, make_report())
         self.assertEqual(parsed.bpm, 72)
+        self.assertEqual(parsed.bpm, parsed.raw_report[1])
         self.assertEqual(parsed.aux, 0xA5)
         self.assertEqual(parsed.sequence, 0x1234)
         self.assertEqual(parsed.field_5, 0x5A)
@@ -48,6 +50,20 @@ class ParseHeartRatePacketTests(unittest.TestCase):
         parsed = parse_heart_rate_packet(packet)
 
         self.assert_decoded_fields(parsed)
+
+    def test_raw_report_is_exact_validated_18_byte_slice(self) -> None:
+        original_report = make_report()
+        packet = (
+            b"\x08\x7f\x12\x01\x00"
+            + HEART_RATE_MARKER
+            + original_report
+            + b"ignored trailing frame data"
+        )
+
+        parsed = parse_heart_rate_packet(packet)
+
+        self.assertEqual(parsed.raw_report, original_report)
+        self.assertEqual(len(parsed.raw_report), 18)
 
     def test_missing_marker_is_rejected(self) -> None:
         with self.assertRaises(HeartRateMarkerNotFoundError):

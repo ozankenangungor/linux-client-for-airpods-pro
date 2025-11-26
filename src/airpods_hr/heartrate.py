@@ -1,6 +1,6 @@
 """Hardware-independent parsing for observed AAP heart-rate reports."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from airpods_hr.protocol import (
     HEART_RATE_MARKER,
@@ -32,7 +32,8 @@ class HeartRateReport:
     ``aux`` and ``field_5`` have unknown semantics. ``timestamp_ticks`` is a
     monotonically increasing 64-bit value in observed traffic; its official
     unit is unconfirmed. The meanings of individual ``flags`` bits are also
-    unknown.
+    unknown. ``raw_report`` preserves the exact validated 18-byte report when
+    the model is produced by :func:`parse_heart_rate_packet`.
     """
 
     bpm: int
@@ -41,6 +42,7 @@ class HeartRateReport:
     field_5: int
     timestamp_ticks: int
     flags: int
+    raw_report: bytes = field(default=b"", repr=False)
 
 
 def parse_heart_rate_packet(packet: bytes) -> HeartRateReport:
@@ -83,4 +85,5 @@ def parse_heart_rate_packet(packet: bytes) -> HeartRateReport:
         field_5=report[5],
         timestamp_ticks=int.from_bytes(report[6:14], "little"),
         flags=int.from_bytes(report[14:18], "little"),
+        raw_report=report,
     )
