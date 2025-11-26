@@ -6,6 +6,7 @@ import asyncio
 import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from airpods_hr.aap import AAPHandshakeError, AAPHandshakeSession
@@ -33,6 +34,12 @@ from airpods_hr.heart_rate_session import (
     HeartRateMonitorSession,
     HeartRateProgress,
     HeartRateSessionError,
+)
+from airpods_hr.heart_rate_diagnostics import (
+    DiagnosticOutputOpenError,
+    HeartRateDiagnosticError,
+    HeartRateDiagnosticRecorder,
+    create_diagnostic_recorder,
 )
 from airpods_hr.heartrate import HeartRateReport
 from airpods_hr.pairing import BlueZPairingStore, PairingStoreError
@@ -69,7 +76,17 @@ SessionFactory = Callable[
     Awaitable[MonitorSession],
 ]
 OperationFactory = Callable[["MonitorLifecycle", Output, Output], Awaitable[None]]
-LiveRunner = Callable[[Output, Output], Awaitable[int]]
+RecorderFactory = Callable[[str | Path | None], HeartRateDiagnosticRecorder]
+
+
+class LiveRunner(Protocol):
+    async def __call__(
+        self,
+        stdout: Output,
+        stderr: Output,
+        *,
+        diagnostic_recorder: HeartRateDiagnosticRecorder | None = None,
+    ) -> int: ...
 
 
 class MonitorBackendCleanupError(RuntimeError):
@@ -99,6 +116,7 @@ class MonitorLifecycle:
     first_signal: signal.Signals | None = None
     active_task: asyncio.Task[None] | None = None
     bluez_restored: bool = False
+    diagnostic_recorder: HeartRateDiagnosticRecorder | None = None
 
     def mark_start_acknowledged(self) -> None:
         self.start_acknowledged = True
@@ -142,7 +160,11 @@ def create_heart_rate_progress(
             stderr("Heart-rate monitoring started.")
             stderr("Press Ctrl+C to stop.")
         elif event is HeartRateProgress.SAMPLE and report is not None:
-            stdout(f"Heart rate: {report.bpm} bpm")
+            if lifecycle.diagnostic_recorder is None:
+                stdout(f"Heart rate: {report.bpm} bpm")
+            else:
+                sample = lifecycle.diagnostic_recorder.record_sample(report)
+                stdout(sample.format_human())
 
     return emit
 
@@ -268,12 +290,13 @@ async def run_live_monitor(
     stdout: Output,
     stderr: Output,
     *,
+    diagnostic_recorder: HeartRateDiagnosticRecorder | None = None,
     registrar: SignalRegistrar | None = None,
     operation_factory: OperationFactory | None = None,
 ) -> int:
     """Run the product monitor under its complete signal lifecycle."""
 
-    lifecycle = MonitorLifecycle()
+    lifecycle = MonitorLifecycle(diagnostic_recorder=diagnostic_recorder)
     signal_registrar = registrar or AsyncioSignalRegistrar(
         asyncio.get_running_loop()
     )
@@ -296,12 +319,71 @@ async def run_live_monitor(
     return exit_code
 
 
+def _termination_reason(exit_code: int) -> str:
+    if exit_code == 0:
+        return "completed"
+    if exit_code == 130:
+        return "sigint"
+    if exit_code == 143:
+        return "sigterm"
+    return "failure"
+
+
+def _exception_termination_reason(error: BaseException) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, HeartRateDiagnosticError):
+        return "diagnostic_error"
+    return "failure"
+
+
+async def _run_diagnostic_monitor(
+    stdout: Output,
+    stderr: Output,
+    output_path: str | Path | None,
+    live_runner: LiveRunner,
+    recorder_factory: RecorderFactory,
+) -> int:
+    recorder = recorder_factory(output_path)
+    primary_error: BaseException | None = None
+    try:
+        recorder.start_session()
+        try:
+            exit_code = await live_runner(
+                stdout,
+                stderr,
+                diagnostic_recorder=recorder,
+            )
+        except BaseException as error:
+            try:
+                recorder.stop_session(_exception_termination_reason(error))
+            except HeartRateDiagnosticError:
+                error.add_note("diagnostic session finalization also failed")
+            raise
+        recorder.stop_session(_termination_reason(exit_code))
+        return exit_code
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            recorder.close()
+        except HeartRateDiagnosticError:
+            if primary_error is not None:
+                primary_error.add_note("diagnostic output closure also failed")
+            else:
+                raise
+
+
 async def run_monitor_command(
     *,
     dry_run: bool,
+    diagnostic: bool = False,
+    output_path: str | Path | None = None,
     stdout: Output,
     stderr: Output,
     live_runner: LiveRunner = run_live_monitor,
+    recorder_factory: RecorderFactory = create_diagnostic_recorder,
 ) -> int:
     """Run a dry plan or map one live monitor outcome to a safe exit code."""
 
@@ -313,11 +395,28 @@ async def run_monitor_command(
         stderr("  3. Hand the controller from BlueZ to Bumble temporarily.")
         stderr("  4. Connect securely and start continuous heart-rate monitoring.")
         stderr("  5. Stop on SIGINT or SIGTERM and restore BlueZ ownership.")
+        if diagnostic:
+            destination = (
+                "JSONL file" if output_path is not None else "standard output"
+            )
+            stderr(f"Diagnostic evidence destination: {destination}.")
         stderr("No reconnect, retry, or arbitrary protocol command is used.")
         return 0
 
     try:
+        if diagnostic:
+            return await _run_diagnostic_monitor(
+                stdout,
+                stderr,
+                output_path,
+                live_runner,
+                recorder_factory,
+            )
         return await live_runner(stdout, stderr)
+    except DiagnosticOutputOpenError:
+        stderr("Error: the diagnostic output file could not be opened.")
+    except HeartRateDiagnosticError:
+        stderr("Error: diagnostic capture failed; cleanup was attempted.")
     except NoAirPodsCandidatesError:
         stderr("Error: no paired AirPods candidate was found.")
     except MultipleAirPodsCandidatesError:
