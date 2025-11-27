@@ -38,30 +38,39 @@ The observed 18-byte report layout is:
 | `6:14` | Little-endian 64-bit increasing value | Official unit unknown |
 | `14:18` | Little-endian 32-bit field | Flag meanings unknown |
 
+The parser retains the exact validated 18-byte report in `raw_report` in
+addition to these decoded fields. It does not reconstruct the bytes from the
+decoded values.
+
 ## Observed but semantics unknown
 
 - `report[2]` is retained as a neutral auxiliary byte. No confidence, quality,
   or signal interpretation has been established.
 - `report[5]` is retained as an unknown 8-bit field.
+- `report[3:5]` is exposed as the raw observed sequence/counter value. Its wrap
+  behavior has not been established, so continuity classifications are not
+  emitted.
 - `report[6:14]` increases by approximately 1,000,000,000 per one-second sample,
   but its official unit has not been independently proven.
 - `report[14:18]` is retained as a flags/status value, but the meanings of its
   bits have not been established.
 
-## Known integration limitations
+## Integration status and limitations
 
-- With BlueZ, the same observed start-heart-rate sequence receives an
-  acknowledgement but no periodic heart-rate samples.
-- With Bumble, the stream succeeds on the tested setup.
+- Direct BlueZ experiments historically received a start acknowledgement but
+  no periodic samples. The current supported path temporarily hands the
+  controller to Bumble and has streamed reports on the tested setup.
 - Bumble 0.0.234 requires compatibility behavior for an incoming L2CAP
   Configure Request containing `FLUSH_TIMEOUT`. The option is accepted and
   echoed in the reply rather than rejected as unsupported. The project now
   provides a version-guarded, manager-scoped negotiation adapter without
-  modifying Bumble. It has hardware-independent coverage; composing it with an
-  AAP connection remains future work.
-- The reviewed controller handoff and local pairing-credential preparation are
-  not yet composed with an AirPods connection. Reconnect/recovery and a
-  user-friendly installation flow remain unimplemented.
+  modifying Bumble. This compatibility path is composed with the live-validated
+  AAP and heart-rate monitor path.
+- Controller handoff, local pairing-credential preparation, Classic security,
+  AAP setup, and continuous heart-rate monitoring are composed in the packaged
+  command and have completed a controlled AirPods Pro 3 run. Reconnect,
+  suspend/resume recovery, and a user-friendly installation flow remain
+  unimplemented.
 - This stage does not implement server behavior for additional Bluetooth PSMs.
 - Post-handshake traffic has contained the strings `AccessoryService`,
   `devmotion6`, `MaxReportSize`, `ReportDescriptor`, `HeartRateService`,

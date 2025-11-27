@@ -103,9 +103,13 @@ offset. Marker-free frames are counted as non-heart-rate traffic. A frame that
 contains the marker but has a malformed report is counted separately and does
 not terminate the bounded observation window.
 
-Only BPM is displayed by the probe. The report's auxiliary byte, byte 5, and
-flags retain unknown semantics. The 64-bit increasing value is exposed as
-`timestamp_ticks`; its official unit has not been independently established.
+Only BPM is displayed by the bounded probe. The report ID and BPM mapping are
+known. `aux`, `field_5`, and `flags` retain unresolved semantics. `sequence` is
+the raw observed little-endian sequence/counter field; its wrap behavior is not
+established. The 64-bit increasing value is exposed as `timestamp_ticks`; its
+official tick period has not been independently established. The parser also
+retains `raw_report`, the exact validated 18 bytes following the verified
+heart-rate marker.
 
 ## Continuous monitor core
 
@@ -184,8 +188,60 @@ directly exit the process or create another cleanup operation.
 Signal handlers are installed only around a live monitor invocation and are
 removed after its task completes. Help and dry-run paths install none. Iteration 9.2
 adds no retry, reconnect, suspend/resume hook, daemon behavior, or
-machine-readable output. Its CLI and signal handling have hardware-independent
-coverage but were not live-tested during implementation.
+machine-readable output. The packaged command later completed one controlled
+AirPods Pro 3 run using
+`sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor`. It produced
+continuous samples and, after Ctrl+C, reported that monitoring stopped and
+Bluetooth ownership and BlueZ state were restored. This is evidence for the
+tested setup only.
+
+## Measurement-integrity diagnostics
+
+CLI diagnostics adds `airpods-hr monitor --diagnostic` at the existing product CLI
+boundary. `HeartRateMonitorActivationSession` remains the sole producer of
+parsed `HeartRateReport` objects. The ordinary BPM display and diagnostic
+capture branch only after `parse_heart_rate_packet()` has validated and decoded
+the report. There is no second parser, receive loop, Bluetooth session, or
+protocol state machine.
+
+Diagnostic terminal output contains the host monotonic observation time,
+elapsed session milliseconds, BPM, `aux`, `sequence`, `field_5`,
+`timestamp_ticks`, `flags`, and lowercase hexadecimal for the exact original
+18-byte report. It does not reinterpret the unresolved fields or convert the
+device timestamp to a guessed unit. No filtering, smoothing, startup
+suppression, or outlier rejection is applied.
+
+`--diagnostic --output PATH` writes UTF-8 JSON Lines using `schema_version` 1.
+The file contains one `session_start` event, one `heart_rate_sample` event for
+every successfully emitted parsed report, and one `session_stop` event when it
+can be finalized safely. Each sample includes `host_monotonic_ns`, elapsed
+milliseconds, the six decoded fields, and `raw_report_hex`. Session-stop data
+includes duration, emitted-report count, and only a termination reason the CLI
+can distinguish. The path is created exclusively and is never overwritten.
+Running through `sudo` follows ordinary Unix ownership rules, so a newly
+created capture is normally root-owned.
+
+The event keys are deliberately allowlisted:
+
+- `session_start`: `schema_version`, `event`,
+  `host_monotonic_reference_ns`, and `wall_clock_utc`.
+- `heart_rate_sample`: `schema_version`, `event`, `host_monotonic_ns`,
+  `elapsed_ms`, `bpm`, `aux`, `sequence`, `field_5`, `timestamp_ticks`,
+  `flags`, and `raw_report_hex`.
+- `session_stop`: `schema_version`, `event`, `host_monotonic_ns`,
+  `elapsed_ms`, `heart_rate_samples_emitted`, and `termination_reason`.
+
+Numeric fields remain JSON numbers. `raw_report_hex` uses deterministic
+lowercase hexadecimal with two characters per report byte. `--output` without
+`--diagnostic` is rejected as an invalid argument combination.
+
+The recorder opens the requested output and writes `session_start` before live
+Bluetooth composition begins. A write failure raised from the existing sample
+callback follows the monitor core's state-aware HR cleanup, AAP/Classic/HCI
+unwind, BlueZ restoration, and close-once D-Bus backend ownership. JSONL
+finalization then occurs after the composed monitor has unwound. A protocol or
+adapter-restoration failure remains authoritative if diagnostic finalization
+also fails.
 
 ## Safety scope
 

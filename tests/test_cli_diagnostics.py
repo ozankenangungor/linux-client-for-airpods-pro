@@ -2,25 +2,32 @@
 
 from __future__ import annotations
 
-
+import asyncio
+import json
 import signal
-
+import tempfile
 import unittest
-
-
+from io import StringIO
+from pathlib import Path
 from typing import Any, Mapping
-
+from unittest.mock import AsyncMock
 
 from airpods_hr.bluetooth import AdapterRestoreError
-
-from airpods_hr.heart_rate_diagnostics import DiagnosticWriteError, HeartRateDiagnosticRecorder
-
-
+from airpods_hr.cli import main
+from airpods_hr.heart_rate_diagnostics import (
+    DiagnosticSample,
+    DiagnosticWriteError,
+    HeartRateDiagnosticRecorder,
+)
 from airpods_hr.heart_rate_session import HeartRateProgress
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
-from airpods_hr.monitor_cli import create_heart_rate_progress, run_composed_monitor, run_live_monitor, run_monitor_command
-
-
+from airpods_hr.monitor_cli import (
+    MonitorLifecycle,
+    create_heart_rate_progress,
+    run_composed_monitor,
+    run_live_monitor,
+    run_monitor_command,
+)
 from airpods_hr.protocol import HEART_RATE_MARKER
 
 
@@ -69,6 +76,175 @@ class FailingSink:
 
     def close(self) -> None:
         self.close_count += 1
+
+
+class CliDiagnosticGrammarTests(unittest.TestCase):
+    def test_monitor_command_preserves_normal_live_runner_contract(self) -> None:
+        calls: list[tuple[object, object]] = []
+
+        async def live_runner(sample_output, status_output):
+            calls.append((sample_output, status_output))
+            sample_output("Heart rate: 72 bpm")
+            return 0
+
+        stdout = StringIO()
+        status = main(
+            ["monitor"],
+            stdout=stdout,
+            stderr=StringIO(),
+            live_runner=live_runner,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(stdout.getvalue(), "Heart rate: 72 bpm\n")
+
+    def test_monitor_normal_mode_keeps_simple_bpm_output(self) -> None:
+        stdout: list[str] = []
+        lifecycle = MonitorLifecycle()
+        progress = create_heart_rate_progress(
+            lifecycle,
+            stdout.append,
+            lambda message: None,
+        )
+
+        progress(HeartRateProgress.SAMPLE, parsed_report())
+
+        self.assertEqual(stdout, ["Heart rate: 72 bpm"])
+
+    def test_monitor_diagnostic_uses_same_canonical_report_object(self) -> None:
+        canonical_report = parsed_report()
+        observed: list[HeartRateReport] = []
+
+        class Recorder:
+            def record_sample(self, report: HeartRateReport) -> DiagnosticSample:
+                observed.append(report)
+                return DiagnosticSample(100, 0, report)
+
+        lifecycle = MonitorLifecycle(
+            diagnostic_recorder=Recorder()  # type: ignore[arg-type]
+        )
+        stdout: list[str] = []
+        progress = create_heart_rate_progress(
+            lifecycle,
+            stdout.append,
+            lambda message: None,
+        )
+
+        progress(HeartRateProgress.SAMPLE, canonical_report)
+
+        self.assertIs(observed[0], canonical_report)
+        self.assertEqual(canonical_report.bpm, canonical_report.raw_report[1])
+        self.assertIn("bpm=72", stdout[0])
+        self.assertIn(f"raw_report_hex={RAW_REPORT.hex()}", stdout[0])
+
+    def test_monitor_diagnostic_command_runs_without_output_file(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+
+        async def live_runner(sample_output, status_output, *, diagnostic_recorder):
+            del status_output
+            lifecycle = MonitorLifecycle(diagnostic_recorder=diagnostic_recorder)
+            create_heart_rate_progress(
+                lifecycle, sample_output, lambda message: None
+            )(HeartRateProgress.SAMPLE, parsed_report())
+            return 0
+
+        status = main(
+            ["monitor", "--diagnostic"],
+            stdout=stdout,
+            stderr=stderr,
+            live_runner=live_runner,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertIn("bpm=72", stdout.getvalue())
+
+    def test_monitor_diagnostic_output_writes_complete_jsonl_session(self) -> None:
+        async def live_runner(sample_output, status_output, *, diagnostic_recorder):
+            del sample_output, status_output
+            lifecycle = MonitorLifecycle(diagnostic_recorder=diagnostic_recorder)
+            create_heart_rate_progress(
+                lifecycle, lambda message: None, lambda message: None
+            )(HeartRateProgress.SAMPLE, parsed_report())
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capture.jsonl"
+            status = main(
+                ["monitor", "--diagnostic", "--output", str(output)],
+                stdout=StringIO(),
+                stderr=StringIO(),
+                live_runner=live_runner,
+            )
+            events = [
+                json.loads(line)
+                for line in output.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["session_start", "heart_rate_sample", "session_stop"],
+        )
+        self.assertEqual(events[1]["raw_report_hex"], RAW_REPORT.hex())
+        self.assertEqual(events[2]["termination_reason"], "completed")
+
+    def test_output_without_diagnostic_is_rejected_before_live_access(self) -> None:
+        stderr = StringIO()
+        live_runner = AsyncMock()
+
+        status = main(
+            ["monitor", "--output", "/tmp/unused-taskl-output.jsonl"],
+            stderr=stderr,
+            live_runner=live_runner,
+        )
+
+        self.assertEqual(status, 2)
+        self.assertIn("--output requires --diagnostic", stderr.getvalue())
+        live_runner.assert_not_awaited()
+
+    def test_initial_output_open_failure_precedes_live_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capture.jsonl"
+            output.write_text("existing\n", encoding="utf-8")
+            stderr = StringIO()
+            live_runner = AsyncMock()
+
+            status = main(
+                ["monitor", "--diagnostic", "--output", str(output)],
+                stderr=stderr,
+                live_runner=live_runner,
+            )
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "Error: the diagnostic output file could not be opened.",
+            stderr.getvalue(),
+        )
+        live_runner.assert_not_awaited()
+
+    def test_diagnostic_dry_run_does_not_open_output_or_run_live(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capture.jsonl"
+            live_runner = AsyncMock()
+
+            status = main(
+                [
+                    "monitor",
+                    "--dry-run",
+                    "--diagnostic",
+                    "--output",
+                    str(output),
+                ],
+                stdout=StringIO(),
+                stderr=StringIO(),
+                live_runner=live_runner,
+            )
+
+            self.assertEqual(status, 0)
+            self.assertFalse(output.exists())
+            live_runner.assert_not_awaited()
 
 
 class DiagnosticFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -201,3 +377,5 @@ class DiagnosticFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sink.close_count, 1)
 
 
+if __name__ == "__main__":
+    unittest.main()

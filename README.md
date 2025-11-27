@@ -42,18 +42,16 @@ Working:
 - A separate continuous-monitor core emits samples without retaining an
   unbounded history and has passed one controlled AirPods Pro 3 run.
 - The packaged `airpods-hr monitor` command provides continuous terminal output
-  and scoped SIGINT/SIGTERM handling.
+  and scoped SIGINT/SIGTERM handling. It has passed one controlled live run on
+  the tested AirPods Pro 3 setup, including graceful Ctrl+C cleanup and BlueZ
+  restoration.
 
 Not yet implemented:
 
 - Reconnect and recovery handling.
 - Suspend and resume recovery.
-- Machine-readable output, daemon operation, and API/SDK integration.
+- Daemon operation and API/SDK integration.
 - A user-friendly installer.
-
-The Iteration 9.2 command and signal integration is covered by hardware-independent
-tests but was not exercised against live Bluetooth hardware during its
-implementation.
 
 ## Continuous monitor command
 
@@ -73,7 +71,7 @@ airpods-hr monitor --dry-run
 Start continuous monitoring with:
 
 ```console
-airpods-hr monitor
+sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor
 ```
 
 Press `Ctrl+C` to request graceful shutdown. Once heart-rate activation has
@@ -82,6 +80,35 @@ the existing cleanup commands, disconnects, and restores BlueZ ownership. A
 signal received earlier cancels the active session so its existing state-aware
 cleanup can unwind. A second signal escalates an in-progress shutdown to task
 cancellation.
+
+This packaged command has completed one controlled AirPods Pro 3 run. It
+produced continuous BPM output and, after Ctrl+C, reported:
+
+```text
+Heart-rate monitoring stopped.
+Bluetooth ownership and BlueZ state restored.
+```
+
+This is interoperability evidence for the tested setup, not a production or
+broad compatibility claim.
+
+To display the unresolved fields and exact validated 18-byte report alongside
+each BPM sample, enable diagnostic mode:
+
+```console
+sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor --diagnostic
+```
+
+Diagnostic events can also be preserved as UTF-8 JSON Lines:
+
+```console
+sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor --diagnostic --output /tmp/airpods-hr-task9.3.jsonl
+```
+
+The output path must not already exist; this avoids overwriting evidence.
+When the monitor runs under `sudo`, normal Unix behavior usually makes the new
+file root-owned. Diagnostic capture preserves received values without
+filtering, smoothing, startup suppression, or outlier rejection.
 
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program

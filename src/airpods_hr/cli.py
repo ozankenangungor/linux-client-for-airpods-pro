@@ -28,6 +28,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the monitor plan without accessing Bluetooth",
     )
+    monitor.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="display evidence-preserving fields for every parsed sample",
+    )
+    monitor.add_argument(
+        "--output",
+        metavar="PATH",
+        help="write diagnostic session events as UTF-8 JSON Lines",
+    )
     return parser
 
 
@@ -46,6 +56,12 @@ def main(
     try:
         with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
             args = parser.parse_args(argv)
+            if (
+                args.command == "monitor"
+                and args.output is not None
+                and not args.diagnostic
+            ):
+                parser.error("--output requires --diagnostic")
     except SystemExit as error:
         return int(error.code)
 
@@ -59,6 +75,8 @@ def main(
         return asyncio.run(
             run_monitor_command(
                 dry_run=args.dry_run,
+                diagnostic=args.diagnostic,
+                output_path=args.output,
                 stdout=sample_output,
                 stderr=status_output,
                 live_runner=live_runner,
