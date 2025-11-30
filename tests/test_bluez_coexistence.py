@@ -8,10 +8,11 @@ import unittest
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from xml.etree import ElementTree
 
 
 from airpods_hr.address import BluetoothAddress
-from airpods_hr.bluez_coexistence import CoexistenceCategory, CoexistenceFailure, DBusNextBlueZCoexistenceClient
+from airpods_hr.bluez_coexistence import BlueZCompatibilityRegistration, BlueZCoexistenceState, CoexistenceCategory, CoexistenceFailure, DBusNextBlueZCoexistenceClient
 
 
 from airpods_hr.discovery import AirPodsCandidate
@@ -45,6 +46,12 @@ def candidate(
         address=BluetoothAddress.parse(REMOTE_AIRPODS_ADDRESS),
         object_path="/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
         adapter_modalias=adapter_modalias,
+    )
+
+
+def state(*, connected: bool = True, powered: bool = True):
+    return BlueZCoexistenceState(
+        candidate(), powered, connected, ALL_COMPATIBILITY_UUIDS
     )
 
 
@@ -115,5 +122,89 @@ class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             raised.exception.category, CoexistenceCategory.PREFLIGHT_FAILED
         )
+
+
+class ProfileLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_records_register_and_unregister_once_each(self) -> None:
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(), unregister_profile=AsyncMock()
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        missing_state = BlueZCoexistenceState(candidate(), True, True, frozenset())
+        await registration.register(missing_state)
+        self.assertEqual(profile_client.register_profile.await_count, 4)
+        self.assertEqual(registration.registered_count, 4)
+        first_profile = profile_client.register_profile.await_args_list[0].args[1]
+        first_profile.Release()
+        first_profile.Release()
+        self.assertTrue(first_profile.released)
+        await registration.unregister()
+        self.assertEqual(profile_client.unregister_profile.await_count, 4)
+        await registration.unregister()
+        self.assertEqual(profile_client.unregister_profile.await_count, 4)
+
+    async def test_existing_adapter_identity_needs_no_duplicate_profile(self) -> None:
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(), unregister_profile=AsyncMock()
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        await registration.register(state())
+        profile_client.register_profile.assert_not_awaited()
+        await registration.unregister()
+        profile_client.unregister_profile.assert_not_awaited()
+
+    async def test_complete_uuid_set_does_not_require_adapter_modalias(self) -> None:
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(), unregister_profile=AsyncMock()
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        no_identity_state = BlueZCoexistenceState(
+            candidate(adapter_modalias=None),
+            True,
+            True,
+            ALL_COMPATIBILITY_UUIDS,
+        )
+        await registration.register(no_identity_state)
+        self.assertEqual(registration.registered_count, 0)
+        profile_client.register_profile.assert_not_awaited()
+        await registration.unregister()
+        profile_client.unregister_profile.assert_not_awaited()
+
+    async def test_partial_registration_failure_cleans_prior_profile(self) -> None:
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(
+                side_effect=[None, PermissionError(13, "private path")]
+            ),
+            unregister_profile=AsyncMock(),
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        missing_state = BlueZCoexistenceState(candidate(), True, True, frozenset())
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await registration.register(missing_state)
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+        )
+        profile_client.unregister_profile.assert_awaited_once()
+
+    def test_bluez_xml_records_are_well_formed_and_canonical(self) -> None:
+        records = build_bluez_sdp_service_records(
+            USBAdapterIdentity(0x1234, 0x5678, 0x9ABC)
+        )
+        self.assertEqual(len(records), 4)
+        roots = [ElementTree.fromstring(record.service_record) for record in records]
+        self.assertTrue(all(root.tag == "record" for root in roots))
+        joined = "".join(record.service_record for record in records)
+        values = (
+            "0x1234",
+            "0x5678",
+            "0x9abc",
+            "0x0d",
+            "0x0019",
+            "0x0103",
+            "0x0106",
+        )
+        for value in values:
+            self.assertIn(value, joined)
 
 

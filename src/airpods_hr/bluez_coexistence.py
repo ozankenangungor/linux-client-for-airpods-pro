@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-
+import asyncio
 import ctypes
 import errno
 import os
@@ -31,7 +31,12 @@ from airpods_hr.discovery import (
 from airpods_hr.heart_rate_session import ControlFrameSummary
 
 
-from airpods_hr.sdp import BlueZSDPServiceRecord
+from airpods_hr.sdp import (
+    REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS,
+    BlueZSDPServiceRecord,
+    USBAdapterIdentity,
+    build_bluez_sdp_service_records,
+)
 
 
 DEFAULT_DBUS_TIMEOUT = 5.0
@@ -407,5 +412,83 @@ class _BlueZProfileObject(ServiceInterface):
     @method()
     def Cancel(self) -> "":
         pass
+
+
+class BlueZCompatibilityRegistration:
+    """Register only compatibility service classes absent from Adapter1."""
+
+    OBJECT_PATH_PREFIX = "/org/airpods_hr/coexistence/profile"
+
+    def __init__(
+        self,
+        client: DBusNextBlueZCoexistenceClient,
+        *,
+        operation_timeout: float = DEFAULT_DBUS_TIMEOUT,
+    ) -> None:
+        self._client = client
+        self._operation_timeout = operation_timeout
+        self._registered: list[tuple[str, _BlueZProfileObject]] = []
+        self._registered_total = 0
+        self._registration_attempted = False
+
+    @property
+    def registered_count(self) -> int:
+        return self._registered_total
+
+    async def register(self, state: BlueZCoexistenceState) -> None:
+        if self._registration_attempted:
+            raise RuntimeError("compatibility registration is single-use")
+        self._registration_attempted = True
+        if REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS.issubset(
+            state.adapter_uuids
+        ):
+            return
+        identity = USBAdapterIdentity.from_bluez_modalias(
+            state.candidate.adapter_modalias
+        )
+        records = build_bluez_sdp_service_records(identity)
+        missing = [
+            record
+            for record in records
+            if record.uuid.lower() not in state.adapter_uuids
+        ]
+        try:
+            for index, record in enumerate(missing):
+                object_path = f"{self.OBJECT_PATH_PREFIX}_{index}"
+                profile = _BlueZProfileObject()
+                await asyncio.wait_for(
+                    self._client.register_profile(object_path, profile, record),
+                    timeout=self._operation_timeout,
+                )
+                self._registered.append((object_path, profile))
+                self._registered_total += 1
+        except BaseException as error:
+            try:
+                await self.unregister()
+            except BaseException:
+                pass
+            raise CoexistenceFailure(
+                CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+                CoexistencePhase.PROFILE_REGISTRATION,
+                _safe_error_detail(error),
+            ) from error
+
+    async def unregister(self) -> None:
+        errors: list[BaseException] = []
+        while self._registered:
+            object_path, profile = self._registered.pop()
+            try:
+                await asyncio.wait_for(
+                    self._client.unregister_profile(object_path, profile),
+                    timeout=self._operation_timeout,
+                )
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise CoexistenceFailure(
+                CoexistenceCategory.CLEANUP_FAILED,
+                CoexistencePhase.CLEANUP,
+                _safe_error_detail(errors[-1]),
+            )
 
 
