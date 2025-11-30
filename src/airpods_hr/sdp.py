@@ -44,6 +44,16 @@ PNP_PRODUCT_ID_ATTRIBUTE_ID = 0x0202
 PNP_VERSION_ATTRIBUTE_ID = 0x0203
 PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID = 0x0205
 
+
+@dataclass(frozen=True, slots=True)
+class BlueZSDPServiceRecord:
+    """One BlueZ ProfileManager registration derived from the known profile."""
+
+    name: str
+    uuid: str
+    service_record: str
+
+
 _USB_MODALIAS = re.compile(
     r"usb:v(?P<vendor>[0-9A-Fa-f]{4})"
     r"p(?P<product>[0-9A-Fa-f]{4})"
@@ -216,6 +226,103 @@ def build_sdp_compatibility_records(
         AUDIO_SOURCE_HANDLE: audio_source,
         AVRCP_TARGET_HANDLE: avrcp_target,
     }
+
+
+def _uuid16(value: int) -> str:
+    return f"0000{value:04x}-0000-1000-8000-00805f9b34fb"
+
+
+REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS = frozenset(
+    _uuid16(value) for value in (0x1200, 0x111F, 0x110A, 0x110C)
+)
+
+
+def _xml_record(*attributes: str) -> str:
+    body = "\n".join(f"  {attribute}" for attribute in attributes)
+    return f"<record>\n{body}\n</record>"
+
+
+def _xml_service_class(uuid16: int) -> str:
+    return (
+        '<attribute id="0x0001">'
+        f'<sequence><uuid value="0x{uuid16:04x}"/></sequence>'
+        "</attribute>"
+    )
+
+
+def build_bluez_sdp_service_records(
+    identity: USBAdapterIdentity,
+) -> tuple[BlueZSDPServiceRecord, ...]:
+    """Render the accepted four-record identity for BlueZ ProfileManager1.
+
+    BlueZ assigns service-record handles, so the fixed Bumble-local handles are
+    deliberately omitted. Every interoperability attribute otherwise mirrors
+    :func:`build_sdp_compatibility_records` and uses the same constants.
+    """
+
+    pnp = _xml_record(
+        _xml_service_class(0x1200),
+        (
+            '<attribute id="0x0201">'
+            f'<uint16 value="0x{identity.vendor_id:04x}"/>'
+            "</attribute>"
+        ),
+        (
+            '<attribute id="0x0202">'
+            f'<uint16 value="0x{identity.product_id:04x}"/>'
+            "</attribute>"
+        ),
+        (
+            '<attribute id="0x0203">'
+            f'<uint16 value="0x{identity.version:04x}"/>'
+            "</attribute>"
+        ),
+        (
+            '<attribute id="0x0205">'
+            f'<uint16 value="0x{PNP_VENDOR_ID_SOURCE_USB:04x}"/>'
+            "</attribute>"
+        ),
+    )
+    hands_free = _xml_record(
+        _xml_service_class(0x111F),
+        (
+            '<attribute id="0x0004"><sequence>'
+            '<sequence><uuid value="0x0100"/></sequence>'
+            '<sequence><uuid value="0x0003"/>'
+            f'<uint8 value="0x{HANDS_FREE_RFCOMM_CHANNEL:02x}"/></sequence>'
+            "</sequence></attribute>"
+        ),
+    )
+    audio_source = _xml_record(
+        _xml_service_class(0x110A),
+        (
+            '<attribute id="0x0004"><sequence>'
+            '<sequence><uuid value="0x0100"/>'
+            f'<uint16 value="0x{AVDTP_L2CAP_PSM:04x}"/></sequence>'
+            '<sequence><uuid value="0x0019"/>'
+            f'<uint16 value="0x{AVDTP_VERSION:04x}"/></sequence>'
+            "</sequence></attribute>"
+        ),
+    )
+    avrcp_target = _xml_record(
+        _xml_service_class(0x110C),
+        (
+            '<attribute id="0x0009"><sequence><sequence>'
+            '<uuid value="0x110e"/>'
+            f'<uint16 value="0x{AVRCP_VERSION:04x}"/>'
+            "</sequence></sequence></attribute>"
+        ),
+    )
+    return (
+        BlueZSDPServiceRecord("PnPInformation", _uuid16(0x1200), pnp),
+        BlueZSDPServiceRecord(
+            "HandsfreeAudioGateway", _uuid16(0x111F), hands_free
+        ),
+        BlueZSDPServiceRecord("AudioSource", _uuid16(0x110A), audio_source),
+        BlueZSDPServiceRecord(
+            "A/V RemoteControlTarget", _uuid16(0x110C), avrcp_target
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
