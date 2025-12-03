@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 
+import asyncio
 import ctypes
 import socket
 import struct
 import unittest
-
+from contextlib import asynccontextmanager
 from dataclasses import fields
 
 
@@ -15,15 +16,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from xml.etree import ElementTree
 
+from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPProgress, DescriptorEvidence, HandshakeObservation
+
 
 from airpods_hr.address import BluetoothAddress
-from airpods_hr.bluez_coexistence import BlueZCompatibilityRegistration, BlueZCoexistenceState, CoexistenceCategory, CoexistenceFailure, CoexistenceHRStreamObservation, CoexistencePhase, DBusNextBlueZCoexistenceClient, KernelL2CAPLocalRXObservation, KernelL2CAPTransport, _AAP_LOCAL_RX_IMTU, _L2CAP_IMTU_OFFSET, _L2CAP_OPTIONS_SIZE, _LINUX_L2CAP_OPTIONS, _LINUX_SOL_L2CAP, _NativeL2CAPOptions
+from airpods_hr.bluez_coexistence import BlueZCompatibilityRegistration, BlueZCoexistenceSession, BlueZCoexistenceState, CoexistenceCategory, CoexistenceFailure, CoexistenceHRStreamObservation, CoexistencePhase, DBusNextBlueZCoexistenceClient, KernelL2CAPLocalRXObservation, KernelL2CAPTransport, _AAP_LOCAL_RX_IMTU, _L2CAP_IMTU_OFFSET, _L2CAP_OPTIONS_SIZE, _LINUX_L2CAP_OPTIONS, _LINUX_SOL_L2CAP, _NativeL2CAPOptions
 
 
 from airpods_hr.discovery import AirPodsCandidate
-from airpods_hr.heart_rate_session import DEFAULT_CONTROL_SUMMARY_LIMIT
+from airpods_hr.heart_rate_session import CONNECT4_ACK, DEFAULT_CONTROL_SUMMARY_LIMIT, HeartRateActivationSession, HeartRateProgress
 
 
+from airpods_hr.heartrate import HeartRateReport
 from airpods_hr.protocol import AAP_PSM, HEART_RATE_MARKER, HeartRateCommand
 from airpods_hr.sdp import (
     USBAdapterIdentity,
@@ -85,6 +89,68 @@ def service_ack(service_id: int) -> bytes:
         + len(payload).to_bytes(2, "little")
         + payload
     )
+
+
+def heart_rate_packet(bpm: int, sequence: int) -> bytes:
+    report = (
+        bytes((1, bpm, 9))
+        + sequence.to_bytes(2, "little")
+        + bytes((7,))
+        + (1_000_000_000 * sequence).to_bytes(8, "little")
+        + (3).to_bytes(4, "little")
+    )
+    return b"prefix" + HEART_RATE_MARKER + report
+
+
+def successful_frames(sample_count: int = 5) -> list[bytes]:
+    return [
+        AAP_HANDSHAKE_ACK,
+        b"AccessoryService HeartRateService",
+        service_ack(0x0E),
+        CONNECT4_ACK,
+        service_ack(0x13),
+        *(heart_rate_packet(index * 10, index) for index in range(sample_count)),
+        service_ack(0x13),
+    ]
+
+
+def descriptor_timeout_observation(
+    *, ack_observed: bool = True, receive_frames_dropped: int = 1
+) -> HandshakeObservation:
+    private_frame = b"\x00\x00\x04\x00\x10\x00PRIVATE_DESCRIPTOR_STRING"
+    type_2b_frame = bytearray(51)
+    type_2b_frame[2:4] = (4).to_bytes(2, "little")
+    type_2b_frame[4:6] = (0x002B).to_bytes(2, "little")
+    type_2b_frame[6] = 3
+    type_2b_frame[7:9] = (34).to_bytes(2, "little")
+    type_2b_frame[31:34] = bytes((7, 0x34, 0x12))
+    type_2b_frame[48:51] = bytes((7, 0x34, 0x12))
+    return HandshakeObservation(
+        ack_observed=ack_observed,
+        evidence=DescriptorEvidence(
+            sensor_framework=True,
+            heart_rate_service=False,
+            heart_rate=True,
+            heartrate_access=False,
+        ),
+        pre_ack_frame_count=2,
+        post_ack_frame_count=3,
+        receive_frames_dropped=receive_frames_dropped,
+        pre_ack_frame_summaries=(AAPFrameSummary.from_frame(private_frame),),
+        post_ack_frame_summaries=(
+            AAPFrameSummary.from_frame(bytes(type_2b_frame)),
+        ),
+    )
+
+
+def activation_frames(sample_count: int = 5) -> list[bytes]:
+    return [
+        service_ack(0x0E),
+        CONNECT4_ACK,
+        service_ack(0x13),
+        *(heart_rate_packet(index * 10, index) for index in range(sample_count)),
+        service_ack(0x13),
+    ]
 
 
 class FakeSocket:
@@ -176,6 +242,98 @@ class FakeSocketModule:
     BT_SECURITY_MEDIUM = socket.BT_SECURITY_MEDIUM
     SOL_L2CAP = _LINUX_SOL_L2CAP
     L2CAP_OPTIONS = _LINUX_L2CAP_OPTIONS
+
+
+class FakeClient:
+    def __init__(
+        self,
+        preflight_state: BlueZCoexistenceState | None = None,
+        snapshots: list[BlueZCoexistenceState | BaseException] | None = None,
+    ) -> None:
+        self.preflight_state = preflight_state or state()
+        self.snapshots = list(snapshots or [state()] * 6)
+        self.connect_calls = 0
+        self.close_calls = 0
+        self.snapshot_calls = 0
+        self.preflight_require_connected: bool | None = None
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    async def preflight(
+        self, *, require_connected: bool = True
+    ) -> BlueZCoexistenceState:
+        self.preflight_require_connected = require_connected
+        if require_connected and not self.preflight_state.device_connected:
+            raise CoexistenceFailure(
+                CoexistenceCategory.AIRPODS_NOT_CONNECTED,
+                CoexistencePhase.PREFLIGHT,
+            )
+        return self.preflight_state
+
+    async def snapshot(self, selected: AirPodsCandidate) -> BlueZCoexistenceState:
+        self.snapshot_calls += 1
+        self.assert_candidate = selected
+        item = self.snapshots.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class FakeRegistration:
+    def __init__(
+        self,
+        *,
+        register_error: BaseException | None = None,
+        registered_count: int = 0,
+    ) -> None:
+        self.register_error = register_error
+        self._registered_count = registered_count
+        self.register_calls = 0
+        self.unregister_calls = 0
+
+    @property
+    def registered_count(self) -> int:
+        return self._registered_count
+
+    async def register(self, selected_state: BlueZCoexistenceState) -> None:
+        self.register_calls += 1
+        self.selected_state = selected_state
+        if self.register_error is not None:
+            raise self.register_error
+
+    async def unregister(self) -> None:
+        self.unregister_calls += 1
+
+
+class FailingHandshake:
+    async def run_collected(self, transport: object) -> None:
+        del transport
+        raise RuntimeError("synthetic private detail")
+
+
+class DescriptorTimeoutHandshake:
+    def __init__(self, observation: HandshakeObservation) -> None:
+        self.observation = observation
+
+    async def run_collected(self, transport: object) -> None:
+        transport.send_handshake_request()
+        raise AAPDescriptorObservationTimeoutError(self.observation)
+
+
+class MissingACKHandshake:
+    async def run_collected(self, transport: object) -> None:
+        transport.send_handshake_request()
+        raise AAPHandshakeTimeoutError("exact ACK absent")
+
+
+class UnusedHeartRate:
+    async def run_collected(self, transport: object, handshake: object) -> None:
+        del transport, handshake
+        raise AssertionError("HR phase should not run")
 
 
 class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
@@ -669,5 +827,623 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.close_calls, 1)
         transport.close()
         self.assertEqual(fake.close_calls, 1)
+
+
+class CoexistenceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    def experimental_session(
+        self,
+        *,
+        observation: HandshakeObservation | None = None,
+        frames: list[bytes | BaseException] | None = None,
+        client: FakeClient | None = None,
+        heart_rate: object | None = None,
+        handshake: object | None = None,
+    ):
+        activation_event = asyncio.Event()
+        registration = FakeRegistration()
+        fake_socket = FakeSocket(
+            frames if frames is not None else activation_frames()
+        )
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+
+        def progress(
+            event: HeartRateProgress, report: HeartRateReport | None
+        ) -> None:
+            del report
+            if event is HeartRateProgress.START_ACKNOWLEDGED:
+                transport.arm_hr_stream_observation()
+                activation_event.set()
+
+        selected_heart_rate = heart_rate or HeartRateActivationSession(
+            sample_target=5,
+            minimum_bootstrap_seconds=0,
+            progress=progress,
+        )
+        selected_handshake = handshake or DescriptorTimeoutHandshake(
+            observation
+            or descriptor_timeout_observation(receive_frames_dropped=0)
+        )
+        output: list[str] = []
+        session = BlueZCoexistenceSession(
+            client or FakeClient(),
+            registration,
+            transport,
+            selected_handshake,
+            selected_heart_rate,
+            hr_activation_event=activation_event,
+            experimental_ack_only_hr=True,
+            output=output.append,
+        )
+        return session, registration, fake_socket, selected_heart_rate, output
+
+    async def successful_session(
+        self,
+        *,
+        client: FakeClient | None = None,
+        registration: FakeRegistration | None = None,
+        frames: list[bytes] | None = None,
+    ):
+        selected_client = client or FakeClient()
+        selected_registration = registration or FakeRegistration()
+        fake_socket = FakeSocket(frames or successful_frames())
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        reports: list[HeartRateReport] = []
+        output: list[str] = []
+
+        def progress(event: object, report: HeartRateReport | None) -> None:
+            if event is HeartRateProgress.START_ACKNOWLEDGED:
+                transport.arm_hr_stream_observation()
+            if report is not None:
+                reports.append(report)
+
+        session = BlueZCoexistenceSession(
+            selected_client,
+            selected_registration,
+            transport,
+            AAPHandshakeSession(),
+            HeartRateActivationSession(
+                sample_target=5,
+                minimum_bootstrap_seconds=0,
+                progress=progress,
+            ),
+            output=output.append,
+        )
+        result = await session.run()
+        return (
+            result,
+            selected_client,
+            selected_registration,
+            fake_socket,
+            reports,
+            output,
+        )
+
+    async def test_real_canonical_sessions_collect_exactly_five_reports(self) -> None:
+        result, client, registration, fake_socket, reports, output = (
+            await self.successful_session()
+        )
+        self.assertEqual(len(result.heart_rate.samples), 5)
+        self.assertEqual(len(reports), 5)
+        self.assertTrue(all(isinstance(item, HeartRateReport) for item in reports))
+        self.assertEqual([item.bpm for item in reports], [0, 10, 20, 30, 40])
+        self.assertTrue(all(len(item.raw_report) == 18 for item in reports))
+        self.assertTrue(result.hr_stream_observation.observation_armed)
+        self.assertTrue(
+            result.hr_stream_observation.observation_cleanly_disarmed
+        )
+        self.assertEqual(result.hr_stream_observation.frames_observed, 5)
+        self.assertEqual(result.hr_stream_observation.frames_with_hr_marker, 5)
+        self.assertEqual(fake_socket.sent[0], AAP_HANDSHAKE_REQUEST)
+        self.assertEqual(
+            fake_socket.sent[1:],
+            [command.payload for command in HeartRateCommand],
+        )
+        self.assertIn(
+            ("bind", (LOCAL_ADAPTER_ADDRESS, 0)), fake_socket.events
+        )
+        self.assertIn(
+            ("connect", (REMOTE_AIRPODS_ADDRESS, AAP_PSM)),
+            fake_socket.events,
+        )
+        self.assertEqual(registration.register_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(client.close_calls, 1)
+        self.assertEqual(
+            [phase for phase, connected in result.checkpoints],
+            list(CoexistencePhase),
+        )
+        self.assertTrue(all(connected for _, connected in result.checkpoints))
+        self.assertIn(
+            "Kernel L2CAP local adapter: selected BlueZ adapter confirmed",
+            output,
+        )
+        self.assertIn("KERNEL L2CAP LOCAL RX SUMMARY", output)
+        self.assertIn("  target_imtu=2048", output)
+        self.assertIn("  before_imtu=672", output)
+        self.assertIn("  after_imtu=2048", output)
+        self.assertIn("  preserved_omtu=yes", output)
+        self.assertIn("  preserved_flush_to=yes", output)
+        self.assertIn("  preserved_mode=yes", output)
+        self.assertIn("  preserved_fcs=yes", output)
+        self.assertIn("  preserved_max_tx=yes", output)
+        self.assertIn("  preserved_txwin_size=yes", output)
+        self.assertIn("  verified=yes", output)
+        self.assertEqual(result.local_rx_observation.after_imtu, 2048)
+        self.assertIn(
+            "Required compatibility UUID classes already present: 4/4",
+            output,
+        )
+        self.assertIn("Temporary BlueZ profiles registered: 0", output)
+        phase_one_output = "\n".join(
+            line
+            for line in output
+            if "compatibility UUID" in line or "profiles registered" in line
+        )
+        self.assertNotIn(LOCAL_ADAPTER_ADDRESS, phase_one_output)
+        self.assertNotIn(REMOTE_AIRPODS_ADDRESS, phase_one_output)
+
+    async def test_fresh_acl_refuses_connected_device_before_l2cap_or_aap(
+        self,
+    ) -> None:
+        client = FakeClient(preflight_state=state(), snapshots=[state()])
+        registration = FakeRegistration()
+        factory = Mock(return_value=FakeSocket())
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule, socket_factory=factory
+        )
+        handshake = SimpleNamespace(run_collected=AsyncMock())
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        output: list[str] = []
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            handshake,
+            heart_rate,
+            experimental_fresh_bluez_acl=True,
+            output=output.append,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.FRESH_ACL_REQUIRES_DISCONNECTED_DEVICE,
+        )
+        self.assertEqual(raised.exception.phase, CoexistencePhase.PREFLIGHT)
+        self.assertIs(client.preflight_require_connected, False)
+        self.assertEqual(registration.register_calls, 0)
+        factory.assert_not_called()
+        handshake.run_collected.assert_not_awaited()
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertIn("initial_link_state=connected", output)
+
+
+    async def test_fresh_acl_descriptor_timeout_stops_before_hr(self) -> None:
+        disconnected = state(connected=False)
+        connected = state()
+        client = FakeClient(
+            preflight_state=disconnected,
+            snapshots=[
+                disconnected,
+                connected,
+                connected,
+                connected,
+                connected,
+            ],
+        )
+        registration = FakeRegistration()
+        fake_socket = FakeSocket([AAP_HANDSHAKE_ACK, TimeoutError()])
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        ack_event = asyncio.Event()
+
+        def aap_progress(event: AAPProgress) -> None:
+            if event is AAPProgress.ACK_OBSERVED:
+                ack_event.set()
+
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        output: list[str] = []
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            AAPHandshakeSession(progress=aap_progress),
+            heart_rate,
+            aap_ack_event=ack_event,
+            experimental_fresh_bluez_acl=True,
+            output=output.append,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+        )
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        rendered = "\n".join(output)
+        self.assertIn("exact_ack_observed=yes", rendered)
+        self.assertIn("descriptor_complete=no", rendered)
+        self.assertIn(
+            "after_descriptor_phase: Device1.Connected=true", rendered
+        )
+
+    def test_ack_only_and_fresh_acl_session_modes_are_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            BlueZCoexistenceSession(
+                FakeClient(),
+                FakeRegistration(),
+                SimpleNamespace(),
+                FailingHandshake(),
+                UnusedHeartRate(),
+                experimental_ack_only_hr=True,
+                experimental_fresh_bluez_acl=True,
+            )
+
+    async def test_connection_loss_is_detected_at_phase_and_cleanup_rechecks(
+        self,
+    ) -> None:
+        client = FakeClient(
+            snapshots=[state(), state(connected=False), state(connected=False)]
+        )
+        registration = FakeRegistration()
+        fake_socket = FakeSocket()
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            AAPHandshakeSession(),
+            HeartRateActivationSession(minimum_bootstrap_seconds=0),
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.BLUEZ_CONNECTION_LOST
+        )
+        self.assertEqual(
+            raised.exception.phase, CoexistencePhase.L2CAP_CONNECTION
+        )
+        self.assertEqual(client.snapshot_calls, 3)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(fake_socket.close_calls, 1)
+
+    async def test_profile_failure_skips_later_phases_but_runs_cleanup(self) -> None:
+        registration = FakeRegistration(
+            register_error=CoexistenceFailure(
+                CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+                CoexistencePhase.PROFILE_REGISTRATION,
+            )
+        )
+        fake_socket = FakeSocket()
+        factory = Mock(return_value=fake_socket)
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule, socket_factory=factory
+        )
+        session = BlueZCoexistenceSession(
+            FakeClient(snapshots=[state()]),
+            registration,
+            transport,
+            AAPHandshakeSession(),
+            HeartRateActivationSession(minimum_bootstrap_seconds=0),
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure):
+            await session.run()
+        factory.assert_not_called()
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_handshake_failure_closes_socket_and_profile(self) -> None:
+        registration = FakeRegistration()
+        fake_socket = FakeSocket()
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        session = BlueZCoexistenceSession(
+            FakeClient(snapshots=[state(), state(), state()]),
+            registration,
+            transport,
+            FailingHandshake(),
+            UnusedHeartRate(),
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.AAP_HANDSHAKE_FAILED
+        )
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_descriptor_timeout_retains_observation_and_skips_hr(
+        self,
+    ) -> None:
+        observation = descriptor_timeout_observation()
+        registration = FakeRegistration()
+        fake_socket = FakeSocket()
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session = BlueZCoexistenceSession(
+            FakeClient(snapshots=[state(), state(), state()]),
+            registration,
+            transport,
+            DescriptorTimeoutHandshake(observation),
+            heart_rate,
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+        )
+        self.assertEqual(
+            raised.exception.phase, CoexistencePhase.AAP_HANDSHAKE
+        )
+        self.assertIs(raised.exception.handshake_observation, observation)
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+
+    async def test_experimental_mode_rejects_missing_exact_ack(self) -> None:
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            handshake=MissingACKHandshake(), heart_rate=heart_rate
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.AAP_HANDSHAKE_FAILED
+        )
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_experimental_mode_rejects_generic_handshake_failure(
+        self,
+    ) -> None:
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session, _, _, _, _ = self.experimental_session(
+            handshake=FailingHandshake(), heart_rate=heart_rate
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.AAP_HANDSHAKE_FAILED
+        )
+        heart_rate.run_collected.assert_not_awaited()
+
+    async def test_experimental_mode_rejects_receive_frame_drops(self) -> None:
+        observation = descriptor_timeout_observation(receive_frames_dropped=1)
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            observation=observation, heart_rate=heart_rate
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+        )
+        self.assertIs(raised.exception.handshake_observation, observation)
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_descriptor_timeout_without_exact_ack_cannot_continue(
+        self,
+    ) -> None:
+        observation = descriptor_timeout_observation(
+            ack_observed=False, receive_frames_dropped=0
+        )
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session, _, _, _, _ = self.experimental_session(
+            observation=observation, heart_rate=heart_rate
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+        )
+        heart_rate.run_collected.assert_not_awaited()
+
+    async def test_connection_loss_after_exact_ack_blocks_experiment(self) -> None:
+        client = FakeClient(
+            snapshots=[
+                state(),
+                state(),
+                state(connected=False),
+                state(connected=False),
+            ]
+        )
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            client=client, heart_rate=heart_rate
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.BLUEZ_CONNECTION_LOST
+        )
+        self.assertEqual(
+            raised.exception.phase, CoexistencePhase.AAP_HANDSHAKE
+        )
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+
+    async def test_route_mismatch_never_enters_aap_or_hr(self) -> None:
+        registration = FakeRegistration()
+        fake_socket = FakeSocket(
+            local_endpoint=("66:77:88:99:AA:BB", 0)
+        )
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        handshake = SimpleNamespace(run_collected=AsyncMock())
+        heart_rate = SimpleNamespace(run_collected=AsyncMock())
+        session = BlueZCoexistenceSession(
+            FakeClient(snapshots=[state(), state()]),
+            registration,
+            transport,
+            handshake,
+            heart_rate,
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.L2CAP_ROUTE_MISMATCH,
+        )
+        handshake.run_collected.assert_not_awaited()
+        heart_rate.run_collected.assert_not_awaited()
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_fewer_than_requested_samples_is_hr_timeout(self) -> None:
+        client = FakeClient()
+        registration = FakeRegistration()
+        fake_socket = FakeSocket(successful_frames(sample_count=2))
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            AAPHandshakeSession(),
+            HeartRateActivationSession(
+                sample_target=5, minimum_bootstrap_seconds=0
+            ),
+            output=lambda message: None,
+        )
+        # Move the stop ACK behind the two samples; receive timeout then triggers
+        # canonical HR cleanup and makes the partial outcome a probe failure.
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(raised.exception.category, CoexistenceCategory.HR_TIMEOUT)
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertIn(HeartRateCommand.STOP_HR.payload, fake_socket.sent)
+        self.assertIn(HeartRateCommand.HR_OFF.payload, fake_socket.sent)
+
+    async def test_cleanup_state_failure_is_categorized_as_cleanup(self) -> None:
+        client = FakeClient(
+            snapshots=[
+                state(),
+                state(),
+                state(),
+                state(),
+                state(),
+                RuntimeError("private D-Bus detail"),
+            ]
+        )
+        registration = FakeRegistration()
+        fake_socket = FakeSocket(successful_frames())
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake_socket),
+        )
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            AAPHandshakeSession(),
+            HeartRateActivationSession(
+                sample_target=5, minimum_bootstrap_seconds=0
+            ),
+            output=lambda message: None,
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(raised.exception.category, CoexistenceCategory.CLEANUP_FAILED)
+        self.assertEqual(raised.exception.phase, CoexistencePhase.CLEANUP)
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_cancellation_unwinds_probe_owned_resources(self) -> None:
+        import asyncio
+
+        entered = asyncio.Event()
+
+        class BlockingHandshake:
+            async def run_collected(self, transport: object) -> None:
+                del transport
+                entered.set()
+                await asyncio.Event().wait()
+
+        class CancellationTransport:
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.local_rx_observation = KernelL2CAPLocalRXObservation(
+                    target_imtu=2048,
+                    options_source="python-socket",
+                    before_imtu=672,
+                    after_imtu=2048,
+                    preserved_omtu=True,
+                    preserved_flush_to=True,
+                    preserved_mode=True,
+                    preserved_fcs=True,
+                    preserved_max_tx=True,
+                    preserved_txwin_size=True,
+                    verified=True,
+                )
+
+            async def open(
+                self, local_address: str, remote_address: str
+            ) -> None:
+                self.local_address = local_address
+                self.remote_address = remote_address
+
+            @asynccontextmanager
+            async def collect(self):
+                yield self
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        client = FakeClient(snapshots=[state(), state(), state()])
+        registration = FakeRegistration()
+        transport = CancellationTransport()
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            BlockingHandshake(),
+            UnusedHeartRate(),
+            output=lambda message: None,
+        )
+        task = asyncio.create_task(session.run())
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(transport.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(client.close_calls, 1)
 
 

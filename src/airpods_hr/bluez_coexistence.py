@@ -12,14 +12,19 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-
-from typing import Any
+from time import monotonic
+from typing import Any, Protocol
 
 from dbus_next.service import ServiceInterface, method
 
-from airpods_hr.aap import AAP_HANDSHAKE_REQUEST, AAPHandshakeError, HandshakeObservation
-
-
+from airpods_hr.aap import (
+    AAP_HANDSHAKE_REQUEST,
+    AAPDescriptorObservationTimeoutError,
+    AAPHandshakeError,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+    HandshakeObservation,
+)
 from airpods_hr.address import BluetoothAddress, InvalidBluetoothAddressError
 from airpods_hr.discovery import (
     AirPodsCandidate,
@@ -29,9 +34,14 @@ from airpods_hr.discovery import (
     NoAirPodsCandidatesError,
     select_single_candidate,
 )
-from airpods_hr.heart_rate_session import DEFAULT_CONTROL_SUMMARY_LIMIT, ControlFrameSummary
-
-
+from airpods_hr.heart_rate_session import (
+    DEFAULT_CONTROL_SUMMARY_LIMIT,
+    ControlFrameSummary,
+    HeartRateActivationSession,
+    HeartRateCompletion,
+    HeartRateNoSamplesError,
+    HeartRateSessionResult,
+)
 from airpods_hr.protocol import AAP_PSM, HEART_RATE_MARKER, HeartRateCommand
 from airpods_hr.sdp import (
     REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS,
@@ -186,6 +196,94 @@ class _L2CAPOptionsValues:
     fcs: int
     max_tx: int
     txwin_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class CoexistenceResult:
+    display_name: str
+    heart_rate: HeartRateSessionResult
+    registered_profile_count: int
+    checkpoints: tuple[tuple[CoexistencePhase, bool], ...]
+    handshake_observation: HandshakeObservation
+    descriptor_handshake_complete: bool
+    experimental_ack_only_hr_used: bool
+    hr_stream_observation: CoexistenceHRStreamObservation
+    local_rx_observation: KernelL2CAPLocalRXObservation
+
+
+@dataclass(frozen=True, slots=True)
+class _ExperimentalActivationAuthorization:
+    """Private gate adapter; it does not represent descriptor evidence."""
+
+    required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _ExperimentalACKOnlyActivationContext:
+    """Authorize only the probe's canonical HR session after an exact ACK."""
+
+    observation: HandshakeObservation
+    application_payloads_sent: int
+    handshake_sent_at: float
+    evidence: _ExperimentalActivationAuthorization = (
+        _ExperimentalActivationAuthorization()
+    )
+
+
+class BlueZStateClient(Protocol):
+    async def connect(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    async def preflight(
+        self, *, require_connected: bool = True
+    ) -> BlueZCoexistenceState: ...
+
+    async def snapshot(
+        self, candidate: AirPodsCandidate
+    ) -> BlueZCoexistenceState: ...
+
+
+class CompatibilityRegistration(Protocol):
+    @property
+    def registered_count(self) -> int: ...
+
+    async def register(self, state: BlueZCoexistenceState) -> None: ...
+
+    async def unregister(self) -> None: ...
+
+
+class CoexistenceTransport(Protocol):
+    @property
+    def application_payloads_sent(self) -> int: ...
+
+    @property
+    def dropped_frames(self) -> int: ...
+
+    @property
+    def pending_receive_frames(self) -> int: ...
+
+    @property
+    def hr_stream_observation(self) -> CoexistenceHRStreamObservation: ...
+
+    @property
+    def local_rx_observation(self) -> KernelL2CAPLocalRXObservation: ...
+
+    async def open(self, local_address: str, remote_address: str) -> None: ...
+
+    def close(self) -> None: ...
+
+    def collect(self) -> Any: ...
+
+    def send_handshake_request(self) -> None: ...
+
+    def send_heart_rate_command(self, command: HeartRateCommand) -> None: ...
+
+    def arm_hr_stream_observation(self) -> None: ...
+
+    def disarm_hr_stream_observation(self) -> None: ...
+
+    async def receive(self, timeout: float) -> bytes: ...
 
 
 def _value(value: Any) -> Any:
@@ -882,3 +980,563 @@ class KernelL2CAPTransport:
         return value
 
 
+class BlueZCoexistenceSession:
+    """Run the bounded coexistence phases without controller handoff."""
+
+    def __init__(
+        self,
+        client: BlueZStateClient,
+        registration: CompatibilityRegistration,
+        transport: CoexistenceTransport,
+        handshake: AAPHandshakeSession,
+        heart_rate: HeartRateActivationSession,
+        *,
+        aap_ack_event: asyncio.Event | None = None,
+        hr_activation_event: asyncio.Event | None = None,
+        experimental_ack_only_hr: bool = False,
+        experimental_fresh_bluez_acl: bool = False,
+        dbus_timeout: float = DEFAULT_DBUS_TIMEOUT,
+        clock: Callable[[], float] = monotonic,
+        output: Callable[[str], None] = print,
+    ) -> None:
+        self._client = client
+        self._registration = registration
+        self._transport = transport
+        self._handshake = handshake
+        self._heart_rate = heart_rate
+        self._aap_ack_event = aap_ack_event
+        self._hr_activation_event = hr_activation_event
+        self._experimental_ack_only_hr = experimental_ack_only_hr
+        self._experimental_fresh_bluez_acl = experimental_fresh_bluez_acl
+        if experimental_ack_only_hr and experimental_fresh_bluez_acl:
+            raise ValueError(
+                "ACK-only HR and fresh BlueZ ACL experiments are exclusive"
+            )
+        self._dbus_timeout = dbus_timeout
+        self._clock = clock
+        self._output = output
+        self._checkpoints: list[tuple[CoexistencePhase, bool]] = []
+
+    async def run(self) -> CoexistenceResult:
+        state: BlueZCoexistenceState | None = None
+        result: HeartRateSessionResult | None = None
+        handshake_observation: HandshakeObservation | None = None
+        descriptor_handshake_complete = True
+        experimental_ack_only_hr_used = False
+        primary_error: BaseException | None = None
+        self._phase(0, CoexistencePhase.PREFLIGHT)
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._client.connect(), timeout=self._dbus_timeout
+                )
+                state = await asyncio.wait_for(
+                    self._client.preflight(
+                        require_connected=(
+                            not self._experimental_fresh_bluez_acl
+                        )
+                    ),
+                    timeout=self._dbus_timeout,
+                )
+            except CoexistenceFailure:
+                raise
+            except Exception as error:
+                raise CoexistenceFailure(
+                    CoexistenceCategory.PREFLIGHT_FAILED,
+                    CoexistencePhase.PREFLIGHT,
+                    _safe_error_detail(error),
+                ) from error
+            self._record_checkpoint(CoexistencePhase.PREFLIGHT, state)
+            if self._experimental_fresh_bluez_acl:
+                self._output("EXPERIMENTAL: fresh BlueZ-managed ACL isolation")
+                self._output(
+                    "initial_link_state="
+                    f"{'connected' if state.device_connected else 'disconnected'}"
+                )
+                if state.device_connected:
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.FRESH_ACL_REQUIRES_DISCONNECTED_DEVICE,
+                        CoexistencePhase.PREFLIGHT,
+                        "Device1.Connected must be false before this experiment",
+                    )
+
+            self._phase(1, CoexistencePhase.PROFILE_REGISTRATION)
+            compatibility_uuid_count = len(
+                REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS.intersection(
+                    state.adapter_uuids
+                )
+            )
+            self._output(
+                "Required compatibility UUID classes already present: "
+                f"{compatibility_uuid_count}/"
+                f"{len(REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS)}"
+            )
+            await self._registration.register(state)
+            self._output(
+                "Temporary BlueZ profiles registered: "
+                f"{self._registration.registered_count}"
+            )
+            await self._checkpoint(
+                state.candidate, CoexistencePhase.PROFILE_REGISTRATION
+            )
+
+            self._phase(2, CoexistencePhase.L2CAP_CONNECTION)
+            try:
+                await self._transport.open(
+                    str(state.candidate.adapter_address),
+                    str(state.candidate.address),
+                )
+            except BaseException:
+                if self._experimental_fresh_bluez_acl:
+                    self._output("fresh_kernel_l2cap_connect=fail")
+                raise
+            if self._experimental_fresh_bluez_acl:
+                self._output("fresh_kernel_l2cap_connect=success")
+            self._output("KERNEL L2CAP LOCAL RX SUMMARY")
+            local_rx = self._transport.local_rx_observation
+            self._output(f"  target_imtu={local_rx.target_imtu}")
+            self._output(f"  options_source={local_rx.options_source}")
+            self._output(f"  before_imtu={local_rx.before_imtu}")
+            self._output(f"  after_imtu={local_rx.after_imtu}")
+            for field_name in (
+                "omtu",
+                "flush_to",
+                "mode",
+                "fcs",
+                "max_tx",
+                "txwin_size",
+            ):
+                preserved = getattr(local_rx, f"preserved_{field_name}")
+                self._output(
+                    f"  preserved_{field_name}="
+                    f"{'yes' if preserved else 'no'}"
+                )
+            self._output(
+                f"  verified={'yes' if local_rx.verified else 'no'}"
+            )
+            self._output(
+                "Kernel L2CAP local adapter: selected BlueZ adapter confirmed"
+            )
+            l2cap_state = await self._checkpoint(
+                state.candidate, CoexistencePhase.L2CAP_CONNECTION
+            )
+            if self._experimental_fresh_bluez_acl:
+                self._output(
+                    "bluez_connected_after_l2cap="
+                    f"{'yes' if l2cap_state.device_connected else 'no'}"
+                )
+
+            async with self._transport.collect():
+                self._phase(3, CoexistencePhase.AAP_HANDSHAKE)
+                handshake_started_at = self._clock()
+                try:
+                    handshake = await self._run_handshake_with_ack_checkpoint(
+                        state.candidate
+                    )
+                except AAPDescriptorObservationTimeoutError as error:
+                    handshake_observation = error.observation
+                    if self._experimental_fresh_bluez_acl:
+                        descriptor_state = await self._checkpoint(
+                            state.candidate, CoexistencePhase.AAP_HANDSHAKE
+                        )
+                        self._output(
+                            "exact_ack_observed="
+                            f"{'yes' if error.observation.ack_observed else 'no'}"
+                        )
+                        self._output("descriptor_complete=no")
+                        descriptor_connected = (
+                            "true"
+                            if descriptor_state.device_connected
+                            else "false"
+                        )
+                        self._output(
+                            "after_descriptor_phase: Device1.Connected="
+                            f"{descriptor_connected}"
+                        )
+                    if (
+                        not self._experimental_ack_only_hr
+                        or not error.observation.ack_observed
+                        or error.observation.receive_frames_dropped != 0
+                    ):
+                        raise CoexistenceFailure(
+                            CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+                            CoexistencePhase.AAP_HANDSHAKE,
+                            type(error).__name__,
+                            handshake_observation=error.observation,
+                        ) from error
+                    self._output(
+                        "EXPERIMENTAL: exact AAP ACK observed but descriptor "
+                        "evidence timed out."
+                    )
+                    await self._checkpoint(
+                        state.candidate, CoexistencePhase.AAP_HANDSHAKE
+                    )
+                    self._output(
+                        "EXPERIMENTAL: proceeding to canonical HR activation "
+                        "for coexistence feasibility testing only."
+                    )
+                    descriptor_handshake_complete = False
+                    experimental_ack_only_hr_used = True
+                    handshake = _ExperimentalACKOnlyActivationContext(
+                        observation=error.observation,
+                        application_payloads_sent=(
+                            self._transport.application_payloads_sent
+                        ),
+                        handshake_sent_at=handshake_started_at,
+                    )
+                except AAPHandshakeTimeoutError as error:
+                    if self._experimental_fresh_bluez_acl:
+                        observed = error.observation
+                        self._output(
+                            "exact_ack_observed="
+                            f"{'yes' if observed and observed.ack_observed else 'no'}"
+                        )
+                        self._output("descriptor_complete=no")
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.AAP_HANDSHAKE_FAILED,
+                        CoexistencePhase.AAP_HANDSHAKE,
+                        type(error).__name__,
+                        handshake_observation=(
+                            error.observation
+                            if self._experimental_fresh_bluez_acl
+                            else None
+                        ),
+                    ) from error
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.AAP_HANDSHAKE_FAILED,
+                        CoexistencePhase.AAP_HANDSHAKE,
+                        type(error).__name__,
+                    ) from error
+                else:
+                    handshake_observation = handshake.observation
+                    descriptor_state = await self._checkpoint(
+                        state.candidate, CoexistencePhase.AAP_HANDSHAKE
+                    )
+                    if self._experimental_fresh_bluez_acl:
+                        self._output("exact_ack_observed=yes")
+                        self._output("descriptor_complete=yes")
+                        descriptor_connected = (
+                            "true"
+                            if descriptor_state.device_connected
+                            else "false"
+                        )
+                        self._output(
+                            "after_descriptor_phase: Device1.Connected="
+                            f"{descriptor_connected}"
+                        )
+
+                self._phase(4, CoexistencePhase.HR_ACTIVATION)
+                try:
+                    result = await self._run_heart_rate_with_checkpoint(
+                        state.candidate, handshake
+                    )
+                except CoexistenceFailure as error:
+                    if not experimental_ack_only_hr_used:
+                        raise
+                    raise CoexistenceFailure(
+                        error.category,
+                        error.phase,
+                        error.detail,
+                        handshake_observation=handshake_observation,
+                        experimental_ack_only_hr_attempted=True,
+                    ) from error
+                except HeartRateNoSamplesError as error:
+                    stream_observation = self._transport.hr_stream_observation
+                    canonical_failed_frames = (
+                        error.non_hr_frames + error.malformed_hr_frames
+                    )
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.HR_TIMEOUT,
+                        CoexistencePhase.HR_RECEPTION,
+                        type(error).__name__,
+                        hr_timeout_diagnostics=CoexistenceHRTimeoutDiagnostics(
+                            stream_observation=stream_observation,
+                            canonical_non_hr_frames=error.non_hr_frames,
+                            canonical_malformed_hr_frames=(
+                                error.malformed_hr_frames
+                            ),
+                            control_frames_observed=(
+                                error.control_frames_observed
+                            ),
+                            frame_count_corresponds=(
+                                stream_observation.frames_observed
+                                == canonical_failed_frames
+                            ),
+                        ),
+                        handshake_observation=(
+                            handshake_observation
+                            if experimental_ack_only_hr_used
+                            else None
+                        ),
+                        experimental_ack_only_hr_attempted=(
+                            experimental_ack_only_hr_used
+                        ),
+                    ) from error
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.HR_ACTIVATION_FAILED,
+                        CoexistencePhase.HR_RECEPTION,
+                        type(error).__name__,
+                        handshake_observation=(
+                            handshake_observation
+                            if experimental_ack_only_hr_used
+                            else None
+                        ),
+                        experimental_ack_only_hr_attempted=(
+                            experimental_ack_only_hr_used
+                        ),
+                    ) from error
+                if result.completion is not HeartRateCompletion.TARGET_REACHED:
+                    stream_observation = self._transport.hr_stream_observation
+                    canonical_stream_frames = (
+                        len(result.samples)
+                        + result.non_hr_frames
+                        + result.malformed_hr_frames
+                    )
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.HR_TIMEOUT,
+                        CoexistencePhase.HR_RECEPTION,
+                        (
+                            f"received {len(result.samples)} of "
+                            f"{result.requested_samples} requested samples"
+                        ),
+                        hr_timeout_diagnostics=CoexistenceHRTimeoutDiagnostics(
+                            stream_observation=stream_observation,
+                            canonical_non_hr_frames=result.non_hr_frames,
+                            canonical_malformed_hr_frames=(
+                                result.malformed_hr_frames
+                            ),
+                            control_frames_observed=(
+                                result.control_frames_observed
+                            ),
+                            frame_count_corresponds=(
+                                stream_observation.frames_observed
+                                == canonical_stream_frames
+                            ),
+                        ),
+                        handshake_observation=(
+                            handshake_observation
+                            if experimental_ack_only_hr_used
+                            else None
+                        ),
+                        experimental_ack_only_hr_attempted=(
+                            experimental_ack_only_hr_used
+                        ),
+                    )
+                await self._checkpoint(state.candidate, CoexistencePhase.HR_RECEPTION)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            cleanup_errors: list[BaseException] = []
+            self._phase(6, CoexistencePhase.CLEANUP)
+            try:
+                self._transport.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                await self._registration.unregister()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            if state is not None:
+                try:
+                    cleanup_state = await asyncio.wait_for(
+                        self._client.snapshot(state.candidate),
+                        timeout=self._dbus_timeout,
+                    )
+                    self._record_checkpoint(CoexistencePhase.CLEANUP, cleanup_state)
+                    if state.device_connected and not cleanup_state.device_connected:
+                        cleanup_errors.append(
+                            CoexistenceFailure(
+                                CoexistenceCategory.BLUEZ_CONNECTION_LOST,
+                                CoexistencePhase.CLEANUP,
+                                "Device1.Connected became false",
+                            )
+                        )
+                    if not cleanup_state.adapter_powered:
+                        cleanup_errors.append(
+                            CoexistenceFailure(
+                                CoexistenceCategory.CLEANUP_FAILED,
+                                CoexistencePhase.CLEANUP,
+                                "adapter is not powered",
+                            )
+                        )
+                except BaseException as error:
+                    cleanup_errors.append(
+                        CoexistenceFailure(
+                            CoexistenceCategory.CLEANUP_FAILED,
+                            CoexistencePhase.CLEANUP,
+                            (
+                                error.detail
+                                if isinstance(error, CoexistenceFailure)
+                                else _safe_error_detail(error)
+                            ),
+                        )
+                    )
+            try:
+                self._client.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "coexistence cleanup also reported a failure"
+                    )
+                else:
+                    error = cleanup_errors[-1]
+                    if isinstance(error, CoexistenceFailure):
+                        raise error
+                    raise CoexistenceFailure(
+                        CoexistenceCategory.CLEANUP_FAILED,
+                        CoexistencePhase.CLEANUP,
+                        _safe_error_detail(error),
+                    ) from error
+
+        assert state is not None and result is not None
+        assert handshake_observation is not None
+        return CoexistenceResult(
+            display_name=state.candidate.display_name,
+            heart_rate=result,
+            registered_profile_count=self._registration.registered_count,
+            checkpoints=tuple(self._checkpoints),
+            handshake_observation=handshake_observation,
+            descriptor_handshake_complete=descriptor_handshake_complete,
+            experimental_ack_only_hr_used=experimental_ack_only_hr_used,
+            hr_stream_observation=self._transport.hr_stream_observation,
+            local_rx_observation=self._transport.local_rx_observation,
+        )
+
+    async def _run_heart_rate_with_checkpoint(
+        self,
+        candidate: AirPodsCandidate,
+        handshake: object,
+    ) -> HeartRateSessionResult:
+        if self._hr_activation_event is None:
+            result = await self._heart_rate.run_collected(
+                self._transport, handshake
+            )
+            await self._checkpoint(candidate, CoexistencePhase.HR_ACTIVATION)
+            self._phase(5, CoexistencePhase.HR_RECEPTION)
+            return result
+        activation_wait = asyncio.create_task(self._hr_activation_event.wait())
+        heart_rate_task = asyncio.create_task(
+            self._heart_rate.run_collected(self._transport, handshake)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                (activation_wait, heart_rate_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if activation_wait in done and self._hr_activation_event.is_set():
+                await self._checkpoint(
+                    candidate, CoexistencePhase.HR_ACTIVATION
+                )
+                self._phase(5, CoexistencePhase.HR_RECEPTION)
+            elif heart_rate_task in done:
+                result = await heart_rate_task
+                raise RuntimeError(
+                    "HR session completed without activation acknowledgement"
+                )
+            return await heart_rate_task
+        finally:
+            if not activation_wait.done():
+                activation_wait.cancel()
+            try:
+                await activation_wait
+            except BaseException:
+                pass
+            if not heart_rate_task.done():
+                heart_rate_task.cancel()
+                try:
+                    await heart_rate_task
+                except BaseException:
+                    pass
+
+    async def _run_handshake_with_ack_checkpoint(
+        self,
+        candidate: AirPodsCandidate,
+    ) -> object:
+        if (
+            not self._experimental_fresh_bluez_acl
+            or self._aap_ack_event is None
+        ):
+            return await self._handshake.run_collected(self._transport)
+        ack_wait = asyncio.create_task(self._aap_ack_event.wait())
+        handshake_task = asyncio.create_task(
+            self._handshake.run_collected(self._transport)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                (ack_wait, handshake_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if ack_wait in done and self._aap_ack_event.is_set():
+                ack_state = await self._checkpoint(
+                    candidate, CoexistencePhase.AAP_HANDSHAKE
+                )
+                self._output(
+                    "after_exact_aap_ack: Device1.Connected="
+                    f"{'true' if ack_state.device_connected else 'false'}"
+                )
+            return await handshake_task
+        finally:
+            if not ack_wait.done():
+                ack_wait.cancel()
+            try:
+                await ack_wait
+            except BaseException:
+                pass
+            if not handshake_task.done():
+                handshake_task.cancel()
+                try:
+                    await handshake_task
+                except BaseException:
+                    pass
+
+    async def _checkpoint(
+        self, candidate: AirPodsCandidate, phase: CoexistencePhase
+    ) -> BlueZCoexistenceState:
+        try:
+            state = await asyncio.wait_for(
+                self._client.snapshot(candidate), timeout=self._dbus_timeout
+            )
+        except CoexistenceFailure as error:
+            raise CoexistenceFailure(error.category, phase, error.detail) from error
+        except Exception as error:
+            raise CoexistenceFailure(
+                CoexistenceCategory.BLUEZ_NOT_AVAILABLE,
+                phase,
+                _safe_error_detail(error),
+            ) from error
+        self._record_checkpoint(phase, state)
+        if not state.device_connected and not self._experimental_fresh_bluez_acl:
+            raise CoexistenceFailure(
+                CoexistenceCategory.BLUEZ_CONNECTION_LOST,
+                phase,
+                "Device1.Connected became false",
+            )
+        if not state.adapter_powered:
+            raise CoexistenceFailure(
+                CoexistenceCategory.BLUEZ_CONNECTION_LOST,
+                phase,
+                "Adapter1.Powered became false",
+            )
+        return state
+
+    def _record_checkpoint(
+        self, phase: CoexistencePhase, state: BlueZCoexistenceState
+    ) -> None:
+        self._checkpoints.append((phase, state.device_connected))
+        self._output(
+            f"Checkpoint {phase.value}: BlueZ reachable=yes, "
+            f"adapter powered={'yes' if state.adapter_powered else 'no'}, "
+            f"Device1.Connected={'true' if state.device_connected else 'false'}"
+        )
+
+    def _phase(self, number: int, phase: CoexistencePhase) -> None:
+        self._output(f"PHASE {number} — {phase.value}")

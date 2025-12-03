@@ -53,6 +53,14 @@ class AAPHandshakeError(RuntimeError):
 class AAPHandshakeTimeoutError(AAPHandshakeError):
     """Raised when the exact known ACK is not observed before its deadline."""
 
+    def __init__(
+        self,
+        message: str,
+        observation: HandshakeObservation | None = None,
+    ) -> None:
+        self.observation = observation
+        super().__init__(message)
+
 
 class AAPDescriptorObservationTimeoutError(AAPHandshakeError):
     """Raised when required descriptor evidence is absent after a valid ACK."""
@@ -465,7 +473,16 @@ class AAPHandshakeSession:
             if len(summaries) < self._frame_summary_limit:
                 summaries += (AAPFrameSummary.from_frame(frame),)
             evidence = evidence.merged(frame)
-        raise AAPHandshakeTimeoutError("AAP handshake ACK was not observed")
+        raise AAPHandshakeTimeoutError(
+            "AAP handshake ACK was not observed",
+            HandshakeObservation(
+                ack_observed=False,
+                evidence=evidence,
+                pre_ack_frame_count=pre_ack_frame_count,
+                receive_frames_dropped=transport.dropped_frames,
+                pre_ack_frame_summaries=summaries,
+            ),
+        )
 
     async def _observe_descriptors(
         self,
@@ -536,6 +553,7 @@ class AAPHandshakeSession:
 @dataclass(frozen=True, slots=True)
 class AAPHandshakeProbeResult:
     display_name: str
+    observation: HandshakeObservation
     evidence: DescriptorEvidence
     application_payloads_sent: int
     replacement_key_reported: bool
@@ -605,6 +623,7 @@ class AAPHandshakeProbeSession:
         assert secure is not None and handshake is not None
         return AAPHandshakeProbeResult(
             display_name=secure.display_name,
+            observation=handshake.observation,
             evidence=handshake.evidence,
             application_payloads_sent=handshake.application_payloads_sent,
             replacement_key_reported=secure.replacement_key_reported,
