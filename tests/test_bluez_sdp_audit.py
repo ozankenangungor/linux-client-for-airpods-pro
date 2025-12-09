@@ -4,32 +4,25 @@ from __future__ import annotations
 
 import unittest
 from types import MappingProxyType
-
-
+from unittest.mock import AsyncMock, Mock, patch
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import BlueZCoexistenceState
-from airpods_hr.bluez_sdp_audit import (
-    LocalSDPInspection,
-    ObservedLocalSDPRecord,
-    ObservedSDPAttribute,
-    SDPComparisonStatus,
-    audit_bluez_sdp_identity,
-)
+from airpods_hr.bluez_sdp_audit import LocalSDPInspection, ObservedLocalSDPRecord, ObservedSDPAttribute, SDPComparisonStatus, audit_bluez_sdp_identity
 from airpods_hr.discovery import AirPodsCandidate
-from airpods_hr.sdp import (
-    AVDTP_L2CAP_PSM,
-    AVDTP_VERSION,
-    AVRCP_VERSION,
-    HANDS_FREE_RFCOMM_CHANNEL,
-    PNP_VENDOR_ID_SOURCE_USB,
-    USBAdapterIdentity,
-    build_bluez_sdp_service_records,
-)
+from airpods_hr.sdp import AVDTP_L2CAP_PSM, AVDTP_VERSION, AVRCP_VERSION, HANDS_FREE_RFCOMM_CHANNEL, PNP_VENDOR_ID_SOURCE_USB, USBAdapterIdentity, build_bluez_sdp_service_records
+from tools.probe_bluez_coexistence import run_live_sdp_audit
 
 
 IDENTITY = USBAdapterIdentity(0x1234, 0x5678, 0x9ABC)
+
+
+
 RECORDS = build_bluez_sdp_service_records(IDENTITY)
+
+
+
 UUID_BY_NAME = {record.name: record.uuid for record in RECORDS}
+
 
 
 def audit_state(*, uuids: frozenset[str] | None = None) -> BlueZCoexistenceState:
@@ -54,8 +47,10 @@ def audit_state(*, uuids: frozenset[str] | None = None) -> BlueZCoexistenceState
     )
 
 
+
 def observed(value: int) -> ObservedSDPAttribute:
     return ObservedSDPAttribute(observable=True, value=value)
+
 
 
 def matching_inspection() -> LocalSDPInspection:
@@ -99,6 +94,7 @@ def matching_inspection() -> LocalSDPInspection:
             }
         )
     )
+
 
 
 class BlueZSDPAuditComparisonTests(unittest.TestCase):
@@ -179,4 +175,29 @@ class BlueZSDPAuditComparisonTests(unittest.TestCase):
             )
         )
 
+
+
+class BlueZSDPAuditProbeTests(unittest.IsolatedAsyncioTestCase):
+
+
+    async def test_live_audit_uses_only_read_only_bluez_state_calls(self) -> None:
+        client = Mock()
+        client.connect = AsyncMock()
+        client.preflight = AsyncMock(return_value=audit_state())
+        client.close = Mock()
+        with patch(
+            "tools.probe_bluez_coexistence.DBusNextBlueZCoexistenceClient",
+            return_value=client,
+        ), patch(
+            "tools.probe_bluez_coexistence.BlueZCompatibilityRegistration"
+        ) as registration, patch(
+            "tools.probe_bluez_coexistence.KernelL2CAPTransport"
+        ) as transport:
+            result = await run_live_sdp_audit(lambda message: None, 5)
+        self.assertFalse(result.detailed_attribute_inspection_available)
+        client.connect.assert_awaited_once()
+        client.preflight.assert_awaited_once()
+        client.close.assert_called_once()
+        registration.assert_not_called()
+        transport.assert_not_called()
 
