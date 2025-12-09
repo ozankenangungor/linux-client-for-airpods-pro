@@ -2,36 +2,73 @@
 
 from __future__ import annotations
 
-
+import ast
 import asyncio
 import ctypes
 import socket
 import struct
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr
 from dataclasses import fields
-
-
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from xml.etree import ElementTree
 
-from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAP_HANDSHAKE_REQUEST, AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeSession, AAPHandshakeTimeoutError, AAPProgress, DescriptorEvidence, HandshakeObservation
-
-
+from airpods_hr.aap import (
+    AAP_FRAME_SUMMARY_LIMIT,
+    AAP_HANDSHAKE_ACK,
+    AAP_HANDSHAKE_REQUEST,
+    AAPDescriptorObservationTimeoutError,
+    AAPFrameSummary,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+    AAPProgress,
+    AAPType2BFrameSummary,
+    DescriptorEvidence,
+    HandshakeObservation,
+)
 from airpods_hr.address import BluetoothAddress
-from airpods_hr.bluez_coexistence import BlueZCompatibilityRegistration, BlueZCoexistenceSession, BlueZCoexistenceState, CoexistenceCategory, CoexistenceFailure, CoexistenceHRStreamObservation, CoexistencePhase, DBusNextBlueZCoexistenceClient, KernelL2CAPLocalRXObservation, KernelL2CAPTransport, _AAP_LOCAL_RX_IMTU, _L2CAP_IMTU_OFFSET, _L2CAP_OPTIONS_SIZE, _LINUX_L2CAP_OPTIONS, _LINUX_SOL_L2CAP, _NativeL2CAPOptions
-
-
+from airpods_hr.bluez_coexistence import (
+    BlueZCompatibilityRegistration,
+    BlueZCoexistenceSession,
+    BlueZCoexistenceState,
+    CoexistenceCategory,
+    CoexistenceFailure,
+    CoexistenceHRStreamObservation,
+    CoexistenceHRTimeoutDiagnostics,
+    CoexistencePhase,
+    DBusNextBlueZCoexistenceClient,
+    KernelL2CAPLocalRXObservation,
+    KernelL2CAPTransport,
+    _AAP_LOCAL_RX_IMTU,
+    _L2CAP_IMTU_OFFSET,
+    _L2CAP_OPTIONS_SIZE,
+    _LINUX_L2CAP_OPTIONS,
+    _LINUX_SOL_L2CAP,
+    _NativeL2CAPOptions,
+)
 from airpods_hr.discovery import AirPodsCandidate
-from airpods_hr.heart_rate_session import CONNECT4_ACK, DEFAULT_CONTROL_SUMMARY_LIMIT, HeartRateActivationSession, HeartRateProgress
-
-
+from airpods_hr.heart_rate_session import (
+    CONNECT4_ACK,
+    DEFAULT_CONTROL_SUMMARY_LIMIT,
+    ControlFrameSummary,
+    HeartRateActivationSession,
+    HeartRateProgress,
+)
 from airpods_hr.heartrate import HeartRateReport
 from airpods_hr.protocol import AAP_PSM, HEART_RATE_MARKER, HeartRateCommand
 from airpods_hr.sdp import (
     USBAdapterIdentity,
     build_bluez_sdp_service_records,
+)
+from tools.probe_bluez_coexistence import (
+    _heart_rate_progress,
+    build_parser,
+    main,
+    run_live_probe,
+    run_probe,
 )
 
 
@@ -334,6 +371,368 @@ class UnusedHeartRate:
     async def run_collected(self, transport: object, handshake: object) -> None:
         del transport, handshake
         raise AssertionError("HR phase should not run")
+
+
+class CoexistenceDryRunTests(unittest.IsolatedAsyncioTestCase):
+    def test_parser_defaults_are_safe_and_bounded(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertFalse(args.execute)
+        self.assertEqual(args.samples, 5)
+        self.assertEqual(args.connect_timeout, 10)
+        self.assertEqual(args.descriptor_timeout, 3)
+        self.assertFalse(args.audit_sdp)
+        self.assertFalse(args.experimental_ack_only_hr)
+        self.assertFalse(args.experimental_fresh_bluez_acl)
+        experimental = build_parser().parse_args(
+            ["--experimental-ack-only-hr"]
+        )
+        self.assertTrue(experimental.experimental_ack_only_hr)
+        fresh = build_parser().parse_args(
+            ["--experimental-fresh-bluez-acl"]
+        )
+        self.assertTrue(fresh.experimental_fresh_bluez_acl)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "--experimental-ack-only-hr",
+                    "--experimental-fresh-bluez-acl",
+                ]
+            )
+        audit = build_parser().parse_args(["--audit-sdp"])
+        self.assertTrue(audit.audit_sdp)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(["--execute", "--audit-sdp"])
+        for value in ("0", "2", "11"):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args(["--samples", value])
+        for value in ("0", "0.9", "31"):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args(["--descriptor-timeout", value])
+
+    def test_main_default_is_deterministic_dry_run(self) -> None:
+        first = StringIO()
+        second = StringIO()
+        with patch(
+            "tools.probe_bluez_coexistence.DBusNextBlueZCoexistenceClient"
+        ) as bluez, patch(
+            "tools.probe_bluez_coexistence.KernelL2CAPTransport"
+        ) as l2cap:
+            self.assertEqual(main([], stream=first), 0)
+            self.assertEqual(main([], stream=second), 0)
+        bluez.assert_not_called()
+        l2cap.assert_not_called()
+        self.assertEqual(first.getvalue(), second.getvalue())
+        self.assertIn("no Bluetooth or BlueZ state", first.getvalue())
+
+    async def test_dry_run_never_calls_live_runner(self) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=False, output=output.append, live_runner=runner
+        )
+        self.assertEqual(status, 0)
+        runner.assert_not_awaited()
+        self.assertTrue(
+            any(message.startswith("Controller handoff: no") for message in output)
+        )
+        self.assertTrue(
+            any("local RX MTU 2048" in message for message in output)
+        )
+
+    async def test_dry_run_prints_configured_descriptor_timeout(self) -> None:
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            handshake_timeout=9,
+            descriptor_timeout=17,
+            output=output.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(
+            any(
+                "AAP ACK=9s, AAP descriptor=17s" in message
+                for message in output
+            )
+        )
+
+    async def test_dry_run_reports_explicit_experimental_mode(self) -> None:
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            experimental_ack_only_hr=True,
+            output=output.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Experimental ACK-only HR: enabled.", output)
+
+    async def test_dry_run_reports_fresh_acl_requirements_without_live_work(
+        self,
+    ) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            experimental_fresh_bluez_acl=True,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_not_awaited()
+        self.assertIn("Experimental fresh BlueZ ACL: enabled.", output)
+        rendered = "\n".join(output)
+        self.assertIn("Device1.Connected=false", rendered)
+        self.assertIn(
+            "does not call BlueZ Connect, Disconnect, or ConnectProfile",
+            rendered,
+        )
+
+    async def test_custom_descriptor_timeout_reaches_canonical_session(
+        self,
+    ) -> None:
+        expected_result = object()
+        with patch(
+            "tools.probe_bluez_coexistence.AAPHandshakeSession"
+        ) as handshake_class, patch(
+            "tools.probe_bluez_coexistence.BlueZCoexistenceSession"
+        ) as coexistence_class:
+            coexistence_class.return_value.run = AsyncMock(
+                return_value=expected_result
+            )
+            result = await run_live_probe(
+                lambda message: None,
+                5,
+                5,
+                10,
+                7,
+                19,
+                12,
+                False,
+                False,
+            )
+        self.assertIs(result, expected_result)
+        self.assertEqual(handshake_class.call_args.kwargs["ack_timeout"], 7)
+        self.assertEqual(
+            handshake_class.call_args.kwargs["descriptor_timeout"], 19
+        )
+        self.assertFalse(
+            coexistence_class.call_args.kwargs[
+                "experimental_fresh_bluez_acl"
+            ]
+        )
+
+    async def test_fresh_acl_thirty_second_timeout_reaches_canonical_session(
+        self,
+    ) -> None:
+        expected_result = object()
+        with patch(
+            "tools.probe_bluez_coexistence.AAPHandshakeSession"
+        ) as handshake_class, patch(
+            "tools.probe_bluez_coexistence.BlueZCoexistenceSession"
+        ) as coexistence_class:
+            coexistence_class.return_value.run = AsyncMock(
+                return_value=expected_result
+            )
+            result = await run_live_probe(
+                lambda message: None,
+                5,
+                5,
+                10,
+                5,
+                30,
+                12,
+                False,
+                True,
+            )
+        self.assertIs(result, expected_result)
+        self.assertEqual(
+            handshake_class.call_args.kwargs["descriptor_timeout"], 30
+        )
+        self.assertTrue(
+            coexistence_class.call_args.kwargs[
+                "experimental_fresh_bluez_acl"
+            ]
+        )
+        self.assertIsNotNone(
+            coexistence_class.call_args.kwargs["aap_ack_event"]
+        )
+
+    async def test_failure_has_phase_category_and_no_fallback(self) -> None:
+        runner = AsyncMock(
+            side_effect=CoexistenceFailure(
+                CoexistenceCategory.L2CAP_CONNECT_FAILED,
+                CoexistencePhase.L2CAP_CONNECTION,
+                "errno EACCES (13)",
+            )
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output,
+            [
+                "COEXISTENCE FAIL at l2cap_connection: l2cap_connect_failed",
+                "Safe detail: errno EACCES (13)",
+            ],
+        )
+
+    async def test_local_rx_failure_prints_safe_metadata_when_verbose(
+        self,
+    ) -> None:
+        observation = KernelL2CAPLocalRXObservation(
+            target_imtu=2048,
+            options_source="linux-uapi-fallback",
+            before_imtu=672,
+            after_imtu=672,
+            preserved_omtu=True,
+            preserved_flush_to=True,
+            preserved_mode=True,
+            preserved_fcs=True,
+            preserved_max_tx=True,
+            preserved_txwin_size=True,
+            verified=False,
+        )
+        runner = AsyncMock(
+            side_effect=CoexistenceFailure(
+                CoexistenceCategory.L2CAP_LOCAL_RX_MTU_FAILED,
+                CoexistencePhase.L2CAP_CONNECTION,
+                "errno ENOPROTOOPT (92)",
+                l2cap_local_rx_observation=observation,
+            )
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=runner,
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIn("l2cap_local_rx_mtu_failed", rendered)
+        self.assertIn("target_imtu=2048", rendered)
+        self.assertIn("before_imtu=672", rendered)
+        self.assertIn("after_imtu=672", rendered)
+        self.assertIn("verified=no", rendered)
+        self.assertIn("Safe detail: errno ENOPROTOOPT (92)", rendered)
+
+    def test_hr_progress_prints_uninterpreted_safe_fields(self) -> None:
+        output: list[str] = []
+        activation_event = asyncio.Event()
+        transport = SimpleNamespace(arm_hr_stream_observation=Mock())
+        progress = _heart_rate_progress(
+            output.append, activation_event, transport
+        )
+        progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+        progress(
+            HeartRateProgress.SAMPLE,
+            HeartRateReport(
+                bpm=0,
+                aux=9,
+                sequence=7,
+                field_5=0,
+                timestamp_ticks=123,
+                flags=5,
+                raw_report=bytes(18),
+            ),
+        )
+        self.assertTrue(activation_event.is_set())
+        transport.arm_hr_stream_observation.assert_called_once_with()
+        self.assertIn(
+            "HR sample 1: bpm=0, sequence=7, field_5=0, flags=5, "
+            "raw_report_bytes=18",
+            output,
+        )
+
+    async def test_descriptor_timeout_verbose_output_is_safe_and_structured(
+        self,
+    ) -> None:
+        observation = descriptor_timeout_observation()
+        runner = AsyncMock(
+            side_effect=CoexistenceFailure(
+                CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+                CoexistencePhase.AAP_HANDSHAKE,
+                "PRIVATE_DESCRIPTOR_STRING",
+                handshake_observation=observation,
+            )
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=runner,
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIsInstance(
+            observation.post_ack_frame_summaries[0].type_2b_summary,
+            AAPType2BFrameSummary,
+        )
+        self.assertIn(
+            "COEXISTENCE FAIL at aap_handshake: aap_descriptor_timeout",
+            rendered,
+        )
+        for expected in (
+            "exact_ack_observed=yes",
+            "pre_ack_frames=2",
+            "post_ack_frames=3",
+            "receive_frames_dropped=1",
+            "sensor_framework=yes",
+            "heart_rate_service=no",
+            "heart_rate=yes",
+            "heartrate_access=no",
+            "header_u16_2_3=0x0004",
+            "header_u16_4_5=0x002B",
+            "Type-0x002B structural summary:",
+            "record_count_17=2",
+        ):
+            self.assertIn(expected, rendered)
+        self.assertNotIn("PRIVATE_DESCRIPTOR_STRING", rendered)
+        self.assertNotIn(
+            b"PRIVATE_DESCRIPTOR_STRING".hex(), rendered.lower()
+        )
+
+    async def test_descriptor_timeout_frame_summaries_are_canonically_bounded(
+        self,
+    ) -> None:
+        summary = AAPFrameSummary.from_frame(b"\x00\x01\x02\x03\x04\x05")
+        observation = HandshakeObservation(
+            ack_observed=True,
+            evidence=DescriptorEvidence(),
+            pre_ack_frame_count=AAP_FRAME_SUMMARY_LIMIT + 10,
+            post_ack_frame_count=1,
+            pre_ack_frame_summaries=(summary,)
+            * (AAP_FRAME_SUMMARY_LIMIT + 10),
+            post_ack_frame_summaries=(summary,),
+        )
+        runner = AsyncMock(
+            side_effect=CoexistenceFailure(
+                CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+                CoexistencePhase.AAP_HANDSHAKE,
+                handshake_observation=observation,
+            )
+        )
+        output: list[str] = []
+        await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=runner,
+        )
+        summary_lines = [
+            line
+            for line in output
+            if line.startswith(("  pre_ack_frame_", "  post_ack_frame_"))
+        ]
+        self.assertEqual(len(summary_lines), AAP_FRAME_SUMMARY_LIMIT)
+        self.assertFalse(any("post_ack_frame_" in line for line in summary_lines))
 
 
 class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
@@ -1024,6 +1423,125 @@ class CoexistenceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         heart_rate.run_collected.assert_not_awaited()
         self.assertIn("initial_link_state=connected", output)
 
+    async def test_fresh_acl_disconnected_preflight_uses_canonical_path(
+        self,
+    ) -> None:
+        disconnected = state(connected=False)
+        connected = state()
+        client = FakeClient(
+            preflight_state=disconnected,
+            snapshots=[
+                disconnected,
+                connected,
+                connected,
+                connected,
+                connected,
+                connected,
+                connected,
+            ],
+        )
+        registration = FakeRegistration()
+        fake_socket = FakeSocket(successful_frames())
+        factory = Mock(return_value=fake_socket)
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule, socket_factory=factory
+        )
+        ack_event = asyncio.Event()
+
+        def aap_progress(event: AAPProgress) -> None:
+            if event is AAPProgress.ACK_OBSERVED:
+                ack_event.set()
+
+        def heart_rate_progress(
+            event: HeartRateProgress, report: HeartRateReport | None
+        ) -> None:
+            del report
+            if event is HeartRateProgress.START_ACKNOWLEDGED:
+                transport.arm_hr_stream_observation()
+
+        output: list[str] = []
+        session = BlueZCoexistenceSession(
+            client,
+            registration,
+            transport,
+            AAPHandshakeSession(progress=aap_progress),
+            HeartRateActivationSession(
+                sample_target=5,
+                minimum_bootstrap_seconds=0,
+                progress=heart_rate_progress,
+            ),
+            aap_ack_event=ack_event,
+            experimental_fresh_bluez_acl=True,
+            output=output.append,
+        )
+        result = await session.run()
+
+        self.assertIs(client.preflight_require_connected, False)
+        self.assertEqual(len(result.heart_rate.samples), 5)
+        self.assertTrue(result.descriptor_handshake_complete)
+        self.assertFalse(result.experimental_ack_only_hr_used)
+        self.assertEqual(fake_socket.bound_endpoint, (LOCAL_ADAPTER_ADDRESS, 0))
+        self.assertIn(
+            ("connect", (REMOTE_AIRPODS_ADDRESS, AAP_PSM)),
+            fake_socket.events,
+        )
+        event_names = [
+            event[0] if isinstance(event, tuple) else event
+            for event in fake_socket.events
+        ]
+        self.assertLess(event_names.index("bind"), event_names.index("security"))
+        self.assertLess(
+            event_names.index("security"),
+            event_names.index("l2cap_getsockopt"),
+        )
+        self.assertLess(
+            event_names.index("l2cap_getsockopt"),
+            event_names.index("l2cap_setsockopt"),
+        )
+        self.assertLess(
+            event_names.index("l2cap_setsockopt"), event_names.index("connect")
+        )
+        self.assertLess(
+            event_names.index("connect"), event_names.index("getsockname")
+        )
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(result.local_rx_observation.after_imtu, 2048)
+        self.assertTrue(result.local_rx_observation.verified)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(
+            sum(
+                phase is CoexistencePhase.AAP_HANDSHAKE
+                for phase, _ in result.checkpoints
+            ),
+            2,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("initial_link_state=disconnected", rendered)
+        self.assertIn("fresh_kernel_l2cap_connect=success", rendered)
+        self.assertIn("bluez_connected_after_l2cap=yes", rendered)
+        self.assertIn(
+            "after_exact_aap_ack: Device1.Connected=true", rendered
+        )
+        self.assertIn("descriptor_complete=yes", rendered)
+        self.assertIn(
+            "after_descriptor_phase: Device1.Connected=true", rendered
+        )
+
+        probe_output: list[str] = []
+        runner = AsyncMock(return_value=result)
+        status = await run_probe(
+            execute=True,
+            experimental_fresh_bluez_acl=True,
+            output=probe_output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        self.assertIs(runner.await_args.args[-2], False)
+        self.assertIs(runner.await_args.args[-1], True)
+        self.assertEqual(
+            probe_output[-1],
+            "COEXISTENCE FRESH BLUEZ ACL EXPERIMENT PASS",
+        )
 
     async def test_fresh_acl_descriptor_timeout_stops_before_hr(self) -> None:
         disconnected = state(connected=False)
@@ -1203,6 +1721,59 @@ class CoexistenceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_socket.close_calls, 1)
         self.assertEqual(registration.unregister_calls, 1)
 
+    async def test_experimental_exact_ack_timeout_runs_canonical_hr(self) -> None:
+        observation = descriptor_timeout_observation(receive_frames_dropped=0)
+        session, registration, fake_socket, _, output = self.experimental_session(
+            observation=observation
+        )
+        result = await session.run()
+        self.assertFalse(result.descriptor_handshake_complete)
+        self.assertTrue(result.experimental_ack_only_hr_used)
+        self.assertIs(result.handshake_observation, observation)
+        self.assertFalse(result.handshake_observation.evidence.required)
+        self.assertEqual(len(result.heart_rate.samples), 5)
+        self.assertEqual(result.heart_rate.requested_samples, 5)
+        self.assertEqual(
+            [report.bpm for report in result.heart_rate.samples],
+            [0, 10, 20, 30, 40],
+        )
+        self.assertEqual(
+            fake_socket.sent,
+            [AAP_HANDSHAKE_REQUEST]
+            + [command.payload for command in HeartRateCommand],
+        )
+        self.assertIn(
+            "EXPERIMENTAL: exact AAP ACK observed but descriptor evidence "
+            "timed out.",
+            output,
+        )
+        self.assertIn(
+            "EXPERIMENTAL: proceeding to canonical HR activation for "
+            "coexistence feasibility testing only.",
+            output,
+        )
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(
+            [phase for phase, connected in result.checkpoints],
+            list(CoexistencePhase),
+        )
+        self.assertTrue(all(connected for _, connected in result.checkpoints))
+        probe_output: list[str] = []
+        runner = AsyncMock(return_value=result)
+        status = await run_probe(
+            execute=True,
+            experimental_ack_only_hr=True,
+            output=probe_output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        self.assertIs(runner.await_args.args[-2], True)
+        self.assertIs(runner.await_args.args[-1], False)
+        self.assertIn("Descriptor handshake: incomplete", probe_output)
+        self.assertIn("Exact AAP ACK: proven", probe_output)
+        self.assertIn("Experimental HR activation: pass", probe_output)
+        self.assertEqual(probe_output[-1], "COEXISTENCE HR EXPERIMENT PASS")
 
     async def test_experimental_mode_rejects_missing_exact_ack(self) -> None:
         heart_rate = SimpleNamespace(run_collected=AsyncMock())
@@ -1292,6 +1863,182 @@ class CoexistenceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_socket.close_calls, 1)
         self.assertEqual(registration.unregister_calls, 1)
 
+    async def test_experimental_hr_failure_still_cleans_resources(self) -> None:
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            frames=[]
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.HR_ACTIVATION_FAILED,
+        )
+        self.assertTrue(raised.exception.experimental_ack_only_hr_attempted)
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            experimental_ack_only_hr=True,
+            output=output.append,
+            live_runner=AsyncMock(side_effect=raised.exception),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("Descriptor handshake: incomplete", output)
+        self.assertIn("Exact AAP ACK: proven", output)
+        self.assertIn("Experimental HR activation: fail", output)
+
+    async def test_zero_frame_stream_timeout_preserves_safe_diagnostics(
+        self,
+    ) -> None:
+        frames: list[bytes | BaseException] = [
+            service_ack(0x0E),
+            CONNECT4_ACK,
+            service_ack(0x13),
+            TimeoutError(),
+            service_ack(0x13),
+        ]
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            frames=frames
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        failure = raised.exception
+        self.assertEqual(failure.category, CoexistenceCategory.HR_TIMEOUT)
+        diagnostics = failure.hr_timeout_diagnostics
+        self.assertIsNotNone(diagnostics)
+        assert diagnostics is not None
+        observation = diagnostics.stream_observation
+        self.assertTrue(observation.observation_armed)
+        self.assertTrue(observation.observation_cleanly_disarmed)
+        self.assertEqual(observation.frames_observed, 0)
+        self.assertEqual(observation.frames_with_hr_marker, 0)
+        self.assertEqual(observation.frames_without_hr_marker, 0)
+        self.assertEqual(diagnostics.canonical_non_hr_frames, 0)
+        self.assertEqual(diagnostics.canonical_malformed_hr_frames, 0)
+        self.assertEqual(diagnostics.control_frames_observed, 3)
+        self.assertTrue(diagnostics.frame_count_corresponds)
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(fake_socket.frames, [])
+
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            experimental_ack_only_hr=True,
+            verbose=True,
+            output=output.append,
+            live_runner=AsyncMock(side_effect=failure),
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIn("HR stream timeout diagnostics:", rendered)
+        self.assertIn("post_start_frames=0", rendered)
+        self.assertIn("canonical_non_hr_frames=0", rendered)
+        self.assertIn("canonical_malformed_hr_frames=0", rendered)
+        self.assertIn("frame_count_corresponds=yes", rendered)
+
+    async def test_non_hr_and_malformed_frames_are_observed_not_retained(
+        self,
+    ) -> None:
+        private_non_hr = b"PRIVATE_STREAM_STRING"
+        malformed_hr = b"prefix" + HEART_RATE_MARKER + b"short"
+        frames: list[bytes | BaseException] = [
+            service_ack(0x0E),
+            CONNECT4_ACK,
+            service_ack(0x13),
+            private_non_hr,
+            malformed_hr,
+            TimeoutError(),
+            service_ack(0x13),
+        ]
+        session, registration, fake_socket, _, _ = self.experimental_session(
+            frames=frames
+        )
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await session.run()
+        failure = raised.exception
+        diagnostics = failure.hr_timeout_diagnostics
+        self.assertIsNotNone(diagnostics)
+        assert diagnostics is not None
+        observation = diagnostics.stream_observation
+        self.assertEqual(observation.frames_observed, 2)
+        self.assertEqual(observation.frames_with_hr_marker, 1)
+        self.assertEqual(observation.frames_without_hr_marker, 1)
+        self.assertEqual(diagnostics.canonical_non_hr_frames, 1)
+        self.assertEqual(diagnostics.canonical_malformed_hr_frames, 1)
+        self.assertTrue(diagnostics.frame_count_corresponds)
+        self.assertTrue(
+            all(
+                isinstance(item, ControlFrameSummary)
+                for item in observation.frame_summaries
+            )
+        )
+        self.assertFalse(
+            any(
+                summary.service_ack_suffix_13
+                for summary in observation.frame_summaries
+            )
+        )
+        self.assertEqual(fake_socket.frames, [])
+        self.assertEqual(fake_socket.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+        output: list[str] = []
+        await run_probe(
+            execute=True,
+            experimental_ack_only_hr=True,
+            verbose=True,
+            output=output.append,
+            live_runner=AsyncMock(side_effect=failure),
+        )
+        rendered = "\n".join(output)
+        self.assertIn("post_start_frames=2", rendered)
+        self.assertIn("frames_with_hr_marker=1", rendered)
+        self.assertIn("frames_without_hr_marker=1", rendered)
+        self.assertIn("canonical_non_hr_frames=1", rendered)
+        self.assertIn("canonical_malformed_hr_frames=1", rendered)
+        self.assertIn("heart_rate_marker_present=yes", rendered)
+        self.assertIn("heart_rate_marker_present=no", rendered)
+        self.assertNotIn(private_non_hr.decode(), rendered)
+        self.assertNotIn(private_non_hr.hex(), rendered.lower())
+        self.assertNotIn(malformed_hr.hex(), rendered.lower())
+
+    async def test_timeout_diagnostics_report_frame_count_discrepancy(self) -> None:
+        summary = ControlFrameSummary.from_frame(b"safe-summary-only")
+        observation = CoexistenceHRStreamObservation(
+            frames_observed=2,
+            frames_with_hr_marker=0,
+            frames_without_hr_marker=2,
+            frame_summaries=(summary,) * (DEFAULT_CONTROL_SUMMARY_LIMIT + 3),
+            observation_armed=True,
+            observation_cleanly_disarmed=True,
+            receive_frames_dropped=0,
+        )
+        diagnostics = CoexistenceHRTimeoutDiagnostics(
+            stream_observation=observation,
+            canonical_non_hr_frames=1,
+            canonical_malformed_hr_frames=0,
+            control_frames_observed=3,
+            frame_count_corresponds=False,
+        )
+        failure = CoexistenceFailure(
+            CoexistenceCategory.HR_TIMEOUT,
+            CoexistencePhase.HR_RECEPTION,
+            hr_timeout_diagnostics=diagnostics,
+        )
+        output: list[str] = []
+        await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=AsyncMock(side_effect=failure),
+        )
+        self.assertIn("  frame_count_corresponds=no", output)
+        self.assertEqual(
+            sum(line.startswith("  stream_frame_") for line in output),
+            DEFAULT_CONTROL_SUMMARY_LIMIT,
+        )
 
     async def test_route_mismatch_never_enters_aap_or_hr(self) -> None:
         registration = FakeRegistration()
@@ -1447,3 +2194,75 @@ class CoexistenceOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.close_calls, 1)
 
 
+class StaticSafetyTests(unittest.TestCase):
+    def test_coexistence_sources_have_no_handoff_or_pairing_imports(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = [
+            root / "src/airpods_hr/bluez_coexistence.py",
+            root / "src/airpods_hr/bluez_sdp_audit.py",
+            root / "tools/probe_bluez_coexistence.py",
+        ]
+        forbidden_modules = {
+            "airpods_hr.authentication",
+            "airpods_hr.bluetooth",
+            "airpods_hr.bumble_keys",
+            "airpods_hr.monitor_cli",
+            "airpods_hr.pairing",
+        }
+        forbidden_names = {
+            "ControllerHandoff",
+            "HCI_CHANNEL_USER",
+            "BlueZPairingStore",
+            "BumbleClassicRuntimeFactory",
+            "HeartRateMonitorSession",
+        }
+        forbidden_dbus_calls = {
+            "call_connect",
+            "call_disconnect",
+            "call_connect_profile",
+            "call_disconnect_profile",
+        }
+        for source in sources:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            imported_modules: set[str] = set()
+            imported_names: set[str] = set()
+            called_attributes: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_modules.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imported_modules.add(node.module or "")
+                    imported_names.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Call) and isinstance(
+                    node.func, ast.Attribute
+                ):
+                    called_attributes.add(node.func.attr)
+            self.assertTrue(forbidden_modules.isdisjoint(imported_modules), source)
+            self.assertTrue(forbidden_names.isdisjoint(imported_names), source)
+            self.assertTrue(
+                forbidden_dbus_calls.isdisjoint(called_attributes), source
+            )
+
+    def test_protocol_source_is_not_modified_for_coexistence(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        protocol_source = root / "src/airpods_hr/protocol.py"
+        import hashlib
+
+        self.assertEqual(
+            hashlib.sha256(protocol_source.read_bytes()).hexdigest(),
+            "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca",
+        )
+
+    def test_classic_local_rx_fix_does_not_use_le_or_fallback_paths(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src/airpods_hr/bluez_coexistence.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("BT_RCVMTU", source)
+        self.assertNotIn("ControllerHandoff", source)
+        self.assertNotIn("HCI_CHANNEL_USER", source)
+        self.assertNotIn("BlueZPairingStore", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,24 +5,32 @@ from __future__ import annotations
 import unittest
 from types import MappingProxyType
 from unittest.mock import AsyncMock, Mock, patch
+
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import BlueZCoexistenceState
-from airpods_hr.bluez_sdp_audit import LocalSDPInspection, ObservedLocalSDPRecord, ObservedSDPAttribute, SDPComparisonStatus, audit_bluez_sdp_identity
+from airpods_hr.bluez_sdp_audit import (
+    LocalSDPInspection,
+    ObservedLocalSDPRecord,
+    ObservedSDPAttribute,
+    SDPComparisonStatus,
+    audit_bluez_sdp_identity,
+)
 from airpods_hr.discovery import AirPodsCandidate
-from airpods_hr.sdp import AVDTP_L2CAP_PSM, AVDTP_VERSION, AVRCP_VERSION, HANDS_FREE_RFCOMM_CHANNEL, PNP_VENDOR_ID_SOURCE_USB, USBAdapterIdentity, build_bluez_sdp_service_records
-from tools.probe_bluez_coexistence import run_live_sdp_audit
+from airpods_hr.sdp import (
+    AVDTP_L2CAP_PSM,
+    AVDTP_VERSION,
+    AVRCP_VERSION,
+    HANDS_FREE_RFCOMM_CHANNEL,
+    PNP_VENDOR_ID_SOURCE_USB,
+    USBAdapterIdentity,
+    build_bluez_sdp_service_records,
+)
+from tools.probe_bluez_coexistence import run_live_sdp_audit, run_probe
 
 
 IDENTITY = USBAdapterIdentity(0x1234, 0x5678, 0x9ABC)
-
-
-
 RECORDS = build_bluez_sdp_service_records(IDENTITY)
-
-
-
 UUID_BY_NAME = {record.name: record.uuid for record in RECORDS}
-
 
 
 def audit_state(*, uuids: frozenset[str] | None = None) -> BlueZCoexistenceState:
@@ -47,10 +55,8 @@ def audit_state(*, uuids: frozenset[str] | None = None) -> BlueZCoexistenceState
     )
 
 
-
 def observed(value: int) -> ObservedSDPAttribute:
     return ObservedSDPAttribute(observable=True, value=value)
-
 
 
 def matching_inspection() -> LocalSDPInspection:
@@ -94,7 +100,6 @@ def matching_inspection() -> LocalSDPInspection:
             }
         )
     )
-
 
 
 class BlueZSDPAuditComparisonTests(unittest.TestCase):
@@ -176,9 +181,30 @@ class BlueZSDPAuditComparisonTests(unittest.TestCase):
         )
 
 
-
 class BlueZSDPAuditProbeTests(unittest.IsolatedAsyncioTestCase):
-
+    async def test_audit_output_never_claims_uuid_only_equivalence(self) -> None:
+        audit = audit_bluez_sdp_identity(audit_state())
+        audit_runner = AsyncMock(return_value=audit)
+        live_runner = AsyncMock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            audit_sdp=True,
+            output=output.append,
+            live_runner=live_runner,
+            audit_runner=audit_runner,
+        )
+        self.assertEqual(status, 0)
+        live_runner.assert_not_awaited()
+        rendered = "\n".join(output)
+        self.assertIn("service-class coverage only", rendered)
+        self.assertIn("unknown/not-observable", rendered)
+        self.assertIn(
+            "UUID coverage alone does not establish SDP record equivalence.",
+            rendered,
+        )
+        self.assertNotIn("00:11:22:33:44:55", rendered)
+        self.assertNotIn("AA:BB:CC:DD:EE:FF", rendered)
 
     async def test_live_audit_uses_only_read_only_bluez_state_calls(self) -> None:
         client = Mock()
@@ -201,3 +227,28 @@ class BlueZSDPAuditProbeTests(unittest.IsolatedAsyncioTestCase):
         registration.assert_not_called()
         transport.assert_not_called()
 
+    async def test_audit_failure_is_safe_and_does_not_fall_back(self) -> None:
+        audit_runner = AsyncMock(side_effect=RuntimeError("private output"))
+        live_runner = AsyncMock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            audit_sdp=True,
+            verbose=True,
+            output=output.append,
+            live_runner=live_runner,
+            audit_runner=audit_runner,
+        )
+        self.assertEqual(status, 1)
+        live_runner.assert_not_awaited()
+        self.assertEqual(
+            output,
+            [
+                "BLUEZ SDP AUDIT FAIL: inspection_unavailable",
+                "Safe detail: RuntimeError",
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
