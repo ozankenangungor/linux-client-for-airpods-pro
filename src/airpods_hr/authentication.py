@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
@@ -127,6 +127,9 @@ class ClassicConnection(Protocol):
     async def create_l2cap_channel(self, spec: object) -> object: ...
 
 
+PreAuthenticationCallback = Callable[[ClassicConnection], Awaitable[None]]
+
+
 class SDPDiagnosticsObserver(Protocol):
     def observe(self, device: object) -> AbstractContextManager[None]: ...
 
@@ -227,6 +230,7 @@ class ClassicAuthenticationSession:
         *,
         progress: ProgressCallback | None = None,
         logging_hardener: Callable[[], None] = harden_bumble_logging,
+        pre_authentication: PreAuthenticationCallback | None = None,
     ) -> None:
         self._discovery = discovery
         self._pairing_store = pairing_store
@@ -234,6 +238,7 @@ class ClassicAuthenticationSession:
         self._runtime_factory = runtime_factory
         self._progress = progress
         self._logging_hardener = logging_hardener
+        self._pre_authentication = pre_authentication
 
     async def run(self) -> ClassicAuthenticationResult:
         authenticated: AuthenticatedClassicContext | None = None
@@ -300,6 +305,9 @@ class ClassicAuthenticationSession:
                                 "BR/EDR connection failed"
                             ) from None
                         self._emit(AuthenticationProgress.CONNECTED)
+
+                        if self._pre_authentication is not None:
+                            await self._pre_authentication(connection)
 
                         try:
                             await connection.authenticate()

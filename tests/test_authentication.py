@@ -327,6 +327,61 @@ class ClassicAuthenticationSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.aap_open_count, 0)
         self.assertEqual(runtime.sdp_install_count, 0)
 
+    async def test_optional_pre_authentication_hook_runs_at_exact_boundary(
+        self,
+    ) -> None:
+        events: list[str] = []
+        connection = FakeConnection(events)
+        runtime = FakeRuntime(events, connection)
+
+        async def pre_authentication(selected_connection) -> None:
+            self.assertIs(selected_connection, connection)
+            events.append("pre_authentication")
+
+        session = ClassicAuthenticationSession(
+            FakeDiscovery(events, [candidate()]),
+            FakePairingStore(events),
+            FakeHandoff(events),
+            FakeRuntimeFactory(runtime),
+            logging_hardener=lambda: events.append("logging"),
+            pre_authentication=pre_authentication,
+        )
+        await session.run()
+        self.assertLess(
+            events.index("connect"), events.index("pre_authentication")
+        )
+        self.assertLess(
+            events.index("pre_authentication"), events.index("authenticate")
+        )
+
+    async def test_pre_authentication_failure_propagates_and_cleans_up(
+        self,
+    ) -> None:
+        class SyntheticPreAuthenticationError(RuntimeError):
+            pass
+
+        events: list[str] = []
+        connection = FakeConnection(events)
+        runtime = FakeRuntime(events, connection)
+
+        async def pre_authentication(selected_connection) -> None:
+            self.assertIs(selected_connection, connection)
+            events.append("pre_authentication")
+            raise SyntheticPreAuthenticationError
+
+        session = ClassicAuthenticationSession(
+            FakeDiscovery(events, [candidate()]),
+            FakePairingStore(events),
+            FakeHandoff(events),
+            FakeRuntimeFactory(runtime),
+            logging_hardener=lambda: events.append("logging"),
+            pre_authentication=pre_authentication,
+        )
+        with self.assertRaises(SyntheticPreAuthenticationError):
+            await session.run()
+        self.assertNotIn("authenticate", events)
+        self.assertEqual(events[-3:], ["disconnect", "release", "restore"])
+
     async def test_zero_candidates_fails_before_handoff(self) -> None:
         session, events, _ = self.make_session(candidates=[])
 
