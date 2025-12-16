@@ -4,19 +4,42 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import fields
+from types import SimpleNamespace
+
 from bumble import sdp
-from bumble.core import BT_L2CAP_PROTOCOL_ID, BT_OBEX_PROTOCOL_ID, BT_RFCOMM_PROTOCOL_ID, UUID
+from bumble.core import (
+    BT_L2CAP_PROTOCOL_ID,
+    BT_OBEX_PROTOCOL_ID,
+    BT_RFCOMM_PROTOCOL_ID,
+    UUID,
+)
 from bumble.device import Device, DeviceConfiguration
+
 from airpods_hr.authentication import BumbleClassicRuntime
-from airpods_hr.reference_sdp_footprint import ATT_L2CAP_PSM, BLUEZ_LIKE_EXTRA_SERVICE_SPECS, REFERENCE_SDP_QUERY_SUMMARY_LIMIT, BlueZLikeServiceSpec, NOKIA_OBEX_PC_SUITE_SERVICE, ReferenceSDPFootprint, ReferenceSDPQueryDiagnostics, augment_reference_sdp_records
-from airpods_hr.sdp import USBAdapterIdentity, build_sdp_compatibility_records
-from bumble.core import BT_L2CAP_PROTOCOL_ID, BT_OBEX_PROTOCOL_ID, BT_RFCOMM_PROTOCOL_ID
-from airpods_hr.reference_sdp_footprint import ATT_L2CAP_PSM, BLUEZ_LIKE_EXTRA_SERVICE_SPECS, BlueZLikeServiceSpec, NOKIA_OBEX_PC_SUITE_SERVICE, ReferenceSDPFootprint, augment_reference_sdp_records
+from airpods_hr.reference_sdp_footprint import (
+    ATT_L2CAP_PSM,
+    BLUEZ_LIKE_EXTRA_SERVICE_SPECS,
+    REFERENCE_SDP_QUERY_SUMMARY_LIMIT,
+    BlueZLikeServiceSpec,
+    NOKIA_OBEX_PC_SUITE_SERVICE,
+    ReferenceSDPFootprint,
+    ReferenceSDPFootprintProfile,
+    ReferenceSDPFootprintSecureSession,
+    ReferenceSDPFootprintStrategy,
+    ReferenceSDPQueryDiagnostics,
+    augment_reference_sdp_records,
+)
+from airpods_hr.sdp import (
+    PreparedSDPCompatibilityProfile,
+    SDPCompatibilityProfile,
+    USBAdapterIdentity,
+    build_sdp_compatibility_records,
+)
+from airpods_hr.sdp_diagnostics import BumbleSDPDiagnostics
 
 
 def _attributes(record: sdp.Server.Service) -> dict[int, sdp.DataElement]:
     return {attribute.id: attribute.value for attribute in record}
-
 
 
 def _search_attribute_request(
@@ -39,7 +62,6 @@ def _search_attribute_request(
     )
 
 
-
 def _broad_l2cap_request(
     transaction_id: int = 1, continuation_state: bytes = b""
 ) -> bytes:
@@ -49,7 +71,6 @@ def _broad_l2cap_request(
         transaction_id=transaction_id,
         continuation_state=continuation_state,
     )
-
 
 
 def _ordinary_l2cap_request(transaction_id: int = 1) -> bytes:
@@ -62,7 +83,6 @@ def _ordinary_l2cap_request(transaction_id: int = 1) -> bytes:
     )
 
 
-
 def _unrelated_request(transaction_id: int) -> bytes:
     return _search_attribute_request(
         UUID.from_16_bits(0xF000 + transaction_id),
@@ -73,7 +93,6 @@ def _unrelated_request(transaction_id: int) -> bytes:
     )
 
 
-
 class ReplayChannel:
     def __init__(self, peer_mtu: int = 260) -> None:
         self.peer_mtu = peer_mtu
@@ -82,7 +101,6 @@ class ReplayChannel:
 
     def write(self, response: object) -> None:
         self.responses.append(bytes(response))
-
 
 
 class ReferenceSDPFootprintTests(unittest.TestCase):
@@ -177,6 +195,48 @@ class ReferenceSDPFootprintTests(unittest.TestCase):
         self.assertEqual(len(proven_matches), 2)
         self.assertGreater(len(bluez_like_matches), len(proven_matches))
 
+    def test_profile_wrapper_preserves_callback_and_changes_only_records(self) -> None:
+        callback = lambda: None
+        canonical_observer = object()
+        delegate = SimpleNamespace(
+            prepare=lambda candidate: PreparedSDPCompatibilityProfile(
+                records=self.proven,
+                installed_callback=callback,
+                diagnostics=canonical_observer,
+            )
+        )
+        diagnostics = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        prepared = ReferenceSDPFootprintProfile(
+            delegate, ReferenceSDPFootprint.BLUEZ_LIKE, diagnostics
+        ).prepare(object())
+        self.assertIs(prepared.installed_callback, callback)
+        self.assertEqual(
+            len(prepared.records),
+            4 + len(BLUEZ_LIKE_EXTRA_SERVICE_SPECS),
+        )
+        for handle, record in self.proven.items():
+            self.assertIs(prepared.records[handle], record)
+        self.assertIsNot(prepared.diagnostics, canonical_observer)
+
+    def test_secure_session_wraps_only_the_probe_profile(self) -> None:
+        calls: list[object] = []
+
+        class Delegate:
+            def open(self, *, pre_connect_profile=None):
+                calls.append(pre_connect_profile)
+                return "context"
+
+        profile = SimpleNamespace(prepare=lambda candidate: None)
+        strategy = ReferenceSDPFootprintStrategy(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        session = ReferenceSDPFootprintSecureSession(Delegate(), strategy)
+        self.assertEqual(
+            session.open(pre_connect_profile=profile), "context"
+        )
+        self.assertIsInstance(calls[0], ReferenceSDPFootprintProfile)
 
     def test_classic_extra_profile_values_match_observed_footprint(self) -> None:
         selected = augment_reference_sdp_records(
@@ -283,7 +343,6 @@ class ReferenceSDPFootprintTests(unittest.TestCase):
             ].value[0].value
             self.assertEqual(profile[0].value.to_hex_str(), profile_uuid)
             self.assertEqual(profile[1].value, version)
-
 
 
 class ReferenceSDPQueryDiagnosticsTests(unittest.TestCase):
@@ -432,3 +491,29 @@ class ReferenceSDPQueryDiagnosticsTests(unittest.TestCase):
             snapshot.l2cap_full_attribute_query().continuation_used
         )
 
+    def test_query_observer_composes_with_canonical_sdp_diagnostics(self) -> None:
+        canonical = BumbleSDPDiagnostics()
+        query = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        profile = SDPCompatibilityProfile(diagnostics=canonical)
+        prepared = ReferenceSDPFootprintProfile(
+            profile,
+            ReferenceSDPFootprint.BLUEZ_LIKE,
+            query,
+        ).prepare(SimpleNamespace(adapter_modalias="usb:v1234p5678d9ABC"))
+        channel = ReplayChannel()
+        with prepared.activate(self.runtime):
+            self.device.l2cap_channel_manager.servers[sdp.SDP_PSM].on_connection(
+                channel
+            )
+            assert channel.sink is not None
+            channel.sink(_broad_l2cap_request())
+
+        self.assertEqual(canonical.snapshot().sdp_requests_observed, 1)
+        self.assertIsNotNone(query.snapshot().l2cap_full_attribute_query())
+        self.assertNotIn("on_pdu", self.device.sdp_server.__dict__)
+
+
+if __name__ == "__main__":
+    unittest.main()
