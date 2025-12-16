@@ -4,23 +4,85 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import fields
-
-
 from bumble import sdp
-from bumble.core import BT_L2CAP_PROTOCOL_ID, BT_OBEX_PROTOCOL_ID, BT_RFCOMM_PROTOCOL_ID
-
-
+from bumble.core import BT_L2CAP_PROTOCOL_ID, BT_OBEX_PROTOCOL_ID, BT_RFCOMM_PROTOCOL_ID, UUID
 from bumble.device import Device, DeviceConfiguration
-
-
-from airpods_hr.reference_sdp_footprint import ATT_L2CAP_PSM, BLUEZ_LIKE_EXTRA_SERVICE_SPECS, BlueZLikeServiceSpec, NOKIA_OBEX_PC_SUITE_SERVICE, ReferenceSDPFootprint, augment_reference_sdp_records
-
-
+from airpods_hr.authentication import BumbleClassicRuntime
+from airpods_hr.reference_sdp_footprint import ATT_L2CAP_PSM, BLUEZ_LIKE_EXTRA_SERVICE_SPECS, REFERENCE_SDP_QUERY_SUMMARY_LIMIT, BlueZLikeServiceSpec, NOKIA_OBEX_PC_SUITE_SERVICE, ReferenceSDPFootprint, ReferenceSDPQueryDiagnostics, augment_reference_sdp_records
 from airpods_hr.sdp import USBAdapterIdentity, build_sdp_compatibility_records
+from bumble.core import BT_L2CAP_PROTOCOL_ID, BT_OBEX_PROTOCOL_ID, BT_RFCOMM_PROTOCOL_ID
+from airpods_hr.reference_sdp_footprint import ATT_L2CAP_PSM, BLUEZ_LIKE_EXTRA_SERVICE_SPECS, BlueZLikeServiceSpec, NOKIA_OBEX_PC_SUITE_SERVICE, ReferenceSDPFootprint, augment_reference_sdp_records
 
 
 def _attributes(record: sdp.Server.Service) -> dict[int, sdp.DataElement]:
     return {attribute.id: attribute.value for attribute in record}
+
+
+
+def _search_attribute_request(
+    service_uuid: UUID,
+    attribute: sdp.DataElement,
+    *,
+    transaction_id: int = 1,
+    continuation_state: bytes = b"",
+) -> bytes:
+    return bytes(
+        sdp.SDP_ServiceSearchAttributeRequest(
+            transaction_id=transaction_id,
+            service_search_pattern=sdp.DataElement.sequence(
+                [sdp.DataElement.uuid(service_uuid)]
+            ),
+            maximum_attribute_byte_count=0xFFFF,
+            attribute_id_list=sdp.DataElement.sequence([attribute]),
+            continuation_state=continuation_state,
+        )
+    )
+
+
+
+def _broad_l2cap_request(
+    transaction_id: int = 1, continuation_state: bytes = b""
+) -> bytes:
+    return _search_attribute_request(
+        BT_L2CAP_PROTOCOL_ID,
+        sdp.DataElement.unsigned_integer_32(0x0000FFFF),
+        transaction_id=transaction_id,
+        continuation_state=continuation_state,
+    )
+
+
+
+def _ordinary_l2cap_request(transaction_id: int = 1) -> bytes:
+    return _search_attribute_request(
+        BT_L2CAP_PROTOCOL_ID,
+        sdp.DataElement.unsigned_integer_16(
+            sdp.SDP_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID
+        ),
+        transaction_id=transaction_id,
+    )
+
+
+
+def _unrelated_request(transaction_id: int) -> bytes:
+    return _search_attribute_request(
+        UUID.from_16_bits(0xF000 + transaction_id),
+        sdp.DataElement.unsigned_integer_16(
+            sdp.SDP_SERVICE_CLASS_ID_LIST_ATTRIBUTE_ID
+        ),
+        transaction_id=transaction_id,
+    )
+
+
+
+class ReplayChannel:
+    def __init__(self, peer_mtu: int = 260) -> None:
+        self.peer_mtu = peer_mtu
+        self.sink = None
+        self.responses: list[bytes] = []
+
+    def write(self, response: object) -> None:
+        self.responses.append(bytes(response))
+
 
 
 class ReferenceSDPFootprintTests(unittest.TestCase):
@@ -222,4 +284,151 @@ class ReferenceSDPFootprintTests(unittest.TestCase):
             self.assertEqual(profile[0].value.to_hex_str(), profile_uuid)
             self.assertEqual(profile[1].value, version)
 
+
+
+class ReferenceSDPQueryDiagnosticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.device = Device(
+            config=DeviceConfiguration(classic_enabled=True, le_enabled=False)
+        )
+        self.runtime = BumbleClassicRuntime(
+            self.device,
+            connect_timeout=1,
+            security_timeout=1,
+            disconnect_timeout=1,
+        )
+        proven = build_sdp_compatibility_records(
+            USBAdapterIdentity(0x1234, 0x5678, 0x9ABC)
+        )
+        self.records = augment_reference_sdp_records(
+            proven, ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+
+    def test_broad_query_retains_only_safe_metadata(self) -> None:
+        observer = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        channel = ReplayChannel()
+        with self.runtime.temporary_sdp_records(self.records):
+            with self.runtime.observe_sdp(observer):
+                self.device.l2cap_channel_manager.servers[
+                    sdp.SDP_PSM
+                ].on_connection(channel)
+                assert channel.sink is not None
+                request = _broad_l2cap_request()
+                channel.sink(request)
+
+        snapshot = observer.snapshot()
+        self.assertEqual(snapshot.requests_observed, 1)
+        summary = snapshot.l2cap_full_attribute_query()
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary.search_uuids, (0x0100,))
+        self.assertEqual(summary.attribute_ranges, ((0x0000, 0xFFFF),))
+        self.assertEqual(summary.maximum_attribute_byte_count, 65535)
+        self.assertTrue(summary.continuation_used)
+        self.assertGreater(summary.matching_record_count, 2)
+        self.assertGreater(summary.total_response_bytes, 251)
+        self.assertNotIn(request.hex(), repr(snapshot).lower())
+
+    def test_summary_list_is_bounded_and_hooks_restore(self) -> None:
+        observer = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        server = self.device.sdp_server
+        channel = ReplayChannel(peer_mtu=2048)
+        with self.runtime.temporary_sdp_records(self.records):
+            with self.runtime.observe_sdp(observer):
+                self.device.l2cap_channel_manager.servers[
+                    sdp.SDP_PSM
+                ].on_connection(channel)
+                assert channel.sink is not None
+                for transaction_id in range(REFERENCE_SDP_QUERY_SUMMARY_LIMIT + 4):
+                    channel.sink(_unrelated_request(transaction_id + 1))
+        self.assertEqual(
+            observer.snapshot().requests_observed,
+            REFERENCE_SDP_QUERY_SUMMARY_LIMIT + 4,
+        )
+        self.assertEqual(
+            len(observer.snapshot().summaries),
+            REFERENCE_SDP_QUERY_SUMMARY_LIMIT,
+        )
+        self.assertNotIn("on_pdu", server.__dict__)
+
+    def test_target_survives_after_general_summary_limit(self) -> None:
+        observer = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        channel = ReplayChannel()
+        with self.runtime.temporary_sdp_records(self.records):
+            with self.runtime.observe_sdp(observer):
+                self.device.l2cap_channel_manager.servers[
+                    sdp.SDP_PSM
+                ].on_connection(channel)
+                assert channel.sink is not None
+                for transaction_id in range(1, REFERENCE_SDP_QUERY_SUMMARY_LIMIT + 4):
+                    channel.sink(_unrelated_request(transaction_id))
+                channel.sink(_broad_l2cap_request(100))
+
+        snapshot = observer.snapshot()
+        self.assertEqual(
+            len(snapshot.summaries), REFERENCE_SDP_QUERY_SUMMARY_LIMIT
+        )
+        target = snapshot.l2cap_full_attribute_query()
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.search_uuids, (0x0100,))
+        self.assertEqual(target.attribute_ranges, ((0x0000, 0xFFFF),))
+
+    def test_ordinary_l2cap_query_does_not_replace_full_range_target(self) -> None:
+        observer = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        channel = ReplayChannel()
+        with self.runtime.temporary_sdp_records(self.records):
+            with self.runtime.observe_sdp(observer):
+                self.device.l2cap_channel_manager.servers[
+                    sdp.SDP_PSM
+                ].on_connection(channel)
+                assert channel.sink is not None
+                channel.sink(_ordinary_l2cap_request(1))
+                channel.sink(_broad_l2cap_request(2))
+
+        snapshot = observer.snapshot()
+        self.assertEqual(snapshot.l2cap_query().attribute_ranges, ((0x0004, 0x0004),))
+        target = snapshot.l2cap_full_attribute_query()
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.attribute_ranges, ((0x0000, 0xFFFF),))
+
+    def test_target_continuation_pages_use_one_dedicated_slot(self) -> None:
+        observer = ReferenceSDPQueryDiagnostics(
+            ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+        channel = ReplayChannel()
+        with self.runtime.temporary_sdp_records(self.records):
+            with self.runtime.observe_sdp(observer):
+                self.device.l2cap_channel_manager.servers[
+                    sdp.SDP_PSM
+                ].on_connection(channel)
+                assert channel.sink is not None
+                channel.sink(_broad_l2cap_request(1))
+                response = sdp.SDP_PDU.from_bytes(channel.responses[-1])
+                pages = 1
+                while len(response.continuation_state) > 1:
+                    channel.sink(
+                        _broad_l2cap_request(
+                            1, response.continuation_state
+                        )
+                    )
+                    response = sdp.SDP_PDU.from_bytes(channel.responses[-1])
+                    pages += 1
+
+        snapshot = observer.snapshot()
+        self.assertGreater(pages, 1)
+        self.assertEqual(snapshot.requests_observed, pages)
+        self.assertEqual(snapshot.summaries, ())
+        self.assertTrue(
+            snapshot.l2cap_full_attribute_query().continuation_used
+        )
 
