@@ -2,27 +2,60 @@
 
 from __future__ import annotations
 
-
 import unittest
-
-
-from airpods_hr.aap import AAPFrameSummary, AAPProgress, DescriptorEvidence, HandshakeObservation
-
-
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+from airpods_hr.aap import AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeTimeoutError, AAPProgress, DescriptorEvidence, HandshakeObservation
 from airpods_hr.aap_channel import AAPChannel, AAPChannelProgress
-from airpods_hr.aap_config_diagnostics import AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
-
-
-from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXProfile
-
-
+from airpods_hr.aap_config_diagnostics import AAPConfigurationDiagnosticStrategy, AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
+from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXDiagnosticStrategy, AAPLocalRXProfile
 from airpods_hr.authentication import AuthenticationProgress
-
-
+from airpods_hr.pre_aap_diagnostics import PreAAPAAPChannelSession, PreAAPSequenceMode, PreAAPSequenceSecureSession
+from airpods_hr.reference_sdp_footprint import ReferenceSDPFootprint, ReferenceSDPFootprintSecureSession, ReferenceSDPQuerySnapshot, ReferenceSDPQuerySummary
+from tools.probe_reference_handshake import _ReportingHandoffTransport, _ReferenceAAPCompatibility, _aap_progress, _authentication_progress, _channel_progress, _print_l2cap_configuration_summary, _print_local_rx_configuration_summary, _print_post_ack_shape_summary, _print_sdp_query_summary, run_live_probe
+from airpods_hr.aap import AAPFrameSummary, AAPProgress, DescriptorEvidence, HandshakeObservation
+from airpods_hr.aap_config_diagnostics import AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
+from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXProfile
 from airpods_hr.reference_sdp_footprint import ReferenceSDPFootprint, ReferenceSDPQuerySnapshot, ReferenceSDPQuerySummary
-
-
 from tools.probe_reference_handshake import _aap_progress, _authentication_progress, _channel_progress, _print_l2cap_configuration_summary, _print_local_rx_configuration_summary, _print_post_ack_shape_summary, _print_sdp_query_summary
+
+
+def observation(
+    *,
+    ack_observed: bool = True,
+    pre_ack_frames: int = 2,
+    post_ack_frames: int = 26,
+    summaries: tuple[AAPFrameSummary, ...] = (),
+) -> HandshakeObservation:
+    return HandshakeObservation(
+        ack_observed=ack_observed,
+        evidence=DescriptorEvidence(
+            sensor_framework=False,
+            heart_rate_service=False,
+            heart_rate=True,
+            heartrate_access=False,
+        ),
+        pre_ack_frame_count=pre_ack_frames,
+        post_ack_frame_count=post_ack_frames,
+        receive_frames_dropped=0,
+        pre_ack_frame_summaries=summaries,
+    )
+
+
+
+class FakeHandoff:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    @asynccontextmanager
+    async def acquire(self, adapter_name: str):
+        self.events.append(f"enter:{adapter_name}")
+        try:
+            yield object()
+        finally:
+            self.events.append(f"exit:{adapter_name}")
+
 
 
 class ReferenceProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
@@ -162,6 +195,7 @@ class ReferenceProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payload", rendered.lower())
 
 
+
 class ReferenceProgressTests(unittest.TestCase):
     def test_reference_phases_report_safe_success_evidence(self) -> None:
         output: list[str] = []
@@ -192,4 +226,162 @@ class ReferenceProgressTests(unittest.TestCase):
         self.assertNotIn("PRIVATE DEVICE", rendered)
         self.assertNotIn("00112233445566778899AABBCCDDEEFF", rendered)
 
+
+
+class ReportingHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_handoff_cleanup_runs_on_success(self) -> None:
+        delegate = FakeHandoff()
+        reporting = _ReportingHandoffTransport(delegate, lambda message: None)
+        async with reporting.acquire("hci0"):
+            pass
+        self.assertEqual(delegate.events, ["enter:hci0", "exit:hci0"])
+
+    async def test_existing_handoff_cleanup_runs_on_handshake_failures(self) -> None:
+        failures = (
+            AAPDescriptorObservationTimeoutError(observation()),
+            AAPHandshakeTimeoutError("missing ACK", observation(ack_observed=False)),
+            AAPHandshakeError("generic handshake failure"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                delegate = FakeHandoff()
+                reporting = _ReportingHandoffTransport(
+                    delegate, lambda message: None
+                )
+                with self.assertRaises(type(failure)):
+                    async with reporting.acquire("hci0"):
+                        raise failure
+                self.assertEqual(
+                    delegate.events, ["enter:hci0", "exit:hci0"]
+                )
+
+
+
+class ReferenceCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_composition_reuses_existing_reference_components(
+        self,
+    ) -> None:
+        selected_observation = observation(
+            pre_ack_frames=0, post_ack_frames=3
+        )
+        discovery_backend = SimpleNamespace(
+            connect=AsyncMock(), close=Mock()
+        )
+        bluez_backend = SimpleNamespace(connect=AsyncMock(), close=Mock())
+        reference_handoff = object()
+        hci_transport = SimpleNamespace(ensure_available=AsyncMock())
+        secure_session = object()
+        channel_session = object()
+        handshake_session = object()
+        probe_session = SimpleNamespace(
+            run=AsyncMock(
+                return_value=SimpleNamespace(observation=selected_observation)
+            )
+        )
+        output: list[str] = []
+        with patch(
+            "tools.probe_reference_handshake.DBusNextManagedObjectsBackend",
+            return_value=discovery_backend,
+        ), patch(
+            "tools.probe_reference_handshake.DBusNextBlueZBackend",
+            return_value=bluez_backend,
+        ), patch(
+            "tools.probe_reference_handshake.create_controller_handoff_transport",
+            return_value=(reference_handoff, hci_transport),
+        ) as create_handoff, patch(
+            "tools.probe_reference_handshake.BlueZDeviceDiscovery"
+        ) as discovery_class, patch(
+            "tools.probe_reference_handshake.BlueZPairingStore"
+        ) as pairing_class, patch(
+            "tools.probe_reference_handshake.BumbleClassicRuntimeFactory"
+        ) as runtime_class, patch(
+            "tools.probe_reference_handshake.ClassicAuthenticationSession",
+            return_value=secure_session,
+        ) as authentication_class, patch(
+            "tools.probe_reference_handshake.AAPChannelSession",
+            return_value=channel_session,
+        ) as channel_class, patch(
+            "tools.probe_reference_handshake.AAPHandshakeSession",
+            return_value=handshake_session,
+        ) as handshake_class, patch(
+            "tools.probe_reference_handshake.AAPHandshakeProbeSession",
+            return_value=probe_session,
+        ) as probe_class:
+            result = await run_live_probe(output.append, 10)
+
+        self.assertIs(result, selected_observation)
+        discovery_backend.connect.assert_awaited_once_with()
+        bluez_backend.connect.assert_awaited_once_with()
+        create_handoff.assert_called_once_with(bluez_backend)
+        hci_transport.ensure_available.assert_awaited_once_with()
+        discovery_class.assert_called_once_with(discovery_backend)
+        pairing_class.assert_called_once_with()
+        runtime_class.assert_called_once_with()
+        self.assertIs(
+            authentication_class.call_args.args[3], runtime_class.return_value
+        )
+        self.assertTrue(
+            callable(
+                authentication_class.call_args.kwargs["pre_authentication"]
+            )
+        )
+        reporting_handoff = authentication_class.call_args.args[2]
+        self.assertIsInstance(reporting_handoff, _ReportingHandoffTransport)
+        self.assertIs(reporting_handoff._delegate, reference_handoff)
+        channel_class.assert_called_once()
+        self.assertTrue(callable(channel_class.call_args.kwargs["progress"]))
+        compatibility = channel_class.call_args.kwargs["compatibility"]
+        self.assertIsInstance(compatibility, _ReferenceAAPCompatibility)
+        self.assertIsInstance(
+            compatibility.response, AAPConfigurationDiagnosticStrategy
+        )
+        self.assertEqual(
+            compatibility.response.mode, AAPConfigureResponseMode.PROVEN
+        )
+        self.assertIsInstance(
+            compatibility.local_rx, AAPLocalRXDiagnosticStrategy
+        )
+        self.assertEqual(
+            compatibility.local_rx.mode, AAPLocalRXProfile.PROVEN
+        )
+        self.assertIn("AAP L2CAP CONFIGURATION SUMMARY", output)
+        self.assertIn("  response_mode=proven", output)
+        self.assertIn("AAP LOCAL RX CONFIGURATION SUMMARY", output)
+        handshake_class.assert_called_once()
+        self.assertEqual(
+            handshake_class.call_args.kwargs["descriptor_timeout"], 10
+        )
+        self.assertTrue(callable(handshake_class.call_args.kwargs["progress"]))
+        probe_class.assert_called_once()
+        wrapped_session = probe_class.call_args.args[0]
+        self.assertIsInstance(
+            wrapped_session, PreAAPSequenceSecureSession
+        )
+        footprint_session = wrapped_session.delegate
+        self.assertIsInstance(
+            footprint_session, ReferenceSDPFootprintSecureSession
+        )
+        self.assertIs(footprint_session.delegate, secure_session)
+        self.assertEqual(
+            footprint_session.strategy.footprint,
+            ReferenceSDPFootprint.PROVEN,
+        )
+        self.assertEqual(
+            wrapped_session.strategy.mode, PreAAPSequenceMode.PROVEN
+        )
+        wrapped_channel = probe_class.call_args.args[1]
+        self.assertIsInstance(wrapped_channel, PreAAPAAPChannelSession)
+        self.assertIs(wrapped_channel.delegate, channel_session)
+        self.assertIs(wrapped_channel.strategy, wrapped_session.strategy)
+        self.assertIs(
+            probe_class.call_args.args[2],
+            handshake_session,
+        )
+        self.assertIn("REFERENCE SDP QUERY SUMMARY", output)
+        self.assertIn("  sdp_footprint=proven", output)
+        self.assertIn("PRE-AAP SEQUENCE SUMMARY", output)
+        self.assertIn("  mode=proven", output)
+        self.assertIn("PRE-AUTH SEQUENCE SUMMARY", output)
+        discovery_backend.close.assert_called_once_with()
+        bluez_backend.close.assert_called_once_with()
 

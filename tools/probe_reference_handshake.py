@@ -1,54 +1,23 @@
-#!/usr/bin/env python3.14
 """Private diagnostic for the existing controller-handoff AAP handshake."""
 
 from __future__ import annotations
 
 import argparse
-
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Protocol
-
 from airpods_hr.aap import AAP_FRAME_SUMMARY_LIMIT, AAPHandshakeProbeSession, AAPHandshakeSession, AAPProgress, AAPType2BFrameSummary, HandshakeObservation
-
-
 from airpods_hr.aap_channel import AAPChannel, AAPChannelProgress, AAPChannelSession
-
-
-from airpods_hr.aap_config_diagnostics import (
-    AAPConfigurationDiagnosticStrategy,
-    AAPConfigureResponseMode,
-    AAPL2CAPConfigurationObservation,
-)
+from airpods_hr.aap_config_diagnostics import AAPConfigurationDiagnosticStrategy, AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
 from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXDiagnosticStrategy, AAPLocalRXProfile, AAPPostACKShapeObservation, L2CAP_CLASSIC_DEFAULT_MTU
-
-
 from airpods_hr.authentication import AuthenticationProgress, BumbleClassicRuntimeFactory, ClassicAuthenticationSession, create_controller_handoff_transport
-
-
 from airpods_hr.bluetooth import DBusNextBlueZBackend
-
-
 from airpods_hr.discovery import BlueZDeviceDiscovery, DBusNextManagedObjectsBackend
-
-
 from airpods_hr.pairing import BlueZPairingStore
 from airpods_hr.pre_aap_diagnostics import PreAAPAAPChannelSession, PreAAPSequenceMode, PreAAPSequenceObservation, PreAAPSequenceSecureSession, PreAAPSequenceStrategy
-
-
 from airpods_hr.pre_auth_diagnostics import PreAuthSequenceMode, PreAuthSequenceObservation, PreAuthSequenceStrategy
-
-
 from airpods_hr.sdp import REQUIRED_SDP_COMPATIBILITY_RECORDS
-
-
-from airpods_hr.reference_sdp_footprint import (
-    BLUEZ_LIKE_EXTRA_SERVICE_SPECS,
-    ReferenceSDPFootprint,
-    ReferenceSDPFootprintSecureSession,
-    ReferenceSDPFootprintStrategy,
-    ReferenceSDPQuerySnapshot,
-)
+from airpods_hr.reference_sdp_footprint import BLUEZ_LIKE_EXTRA_SERVICE_SPECS, ReferenceSDPFootprint, ReferenceSDPFootprintSecureSession, ReferenceSDPFootprintStrategy, ReferenceSDPQuerySnapshot
 
 
 LiveRunner = Callable[
@@ -64,12 +33,19 @@ LiveRunner = Callable[
     Awaitable[HandshakeObservation],
 ]
 
+
+
 DEFAULT_ACK_TIMEOUT = 5.0
+
+
+
 DEFAULT_DESCRIPTOR_TIMEOUT = 3.0
+
 
 
 class HandoffTransport(Protocol):
     def acquire(self, adapter_name: str) -> Any: ...
+
 
 
 class _ReportingHandoffTransport:
@@ -94,6 +70,7 @@ class _ReportingHandoffTransport:
             self._output("Controller handoff cleanup: attempted")
 
 
+
 def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
     def parse(value: str) -> float:
         parsed = float(value)
@@ -106,20 +83,25 @@ def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
     return parse
 
 
+
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
+
 
 
 def _optional_integer(value: int | None) -> str:
     return "unavailable" if value is None else str(value)
 
 
+
 def _optional_boolean(value: bool | None) -> str:
     return "unavailable" if value is None else _yes_no(value)
 
 
+
 def _optional_hex(value: int | None, width: int) -> str:
     return "unavailable" if value is None else f"0x{value:0{width}X}"
+
 
 
 def _print_type_2b_summary(
@@ -165,6 +147,7 @@ def _print_type_2b_summary(
     )
 
 
+
 def _print_frame_summaries(
     output: Callable[[str], None],
     observation: HandshakeObservation,
@@ -193,6 +176,7 @@ def _print_frame_summaries(
             emitted += 1
 
 
+
 def _print_observation_fields(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -207,6 +191,7 @@ def _print_observation_fields(
     output(f"  heartrate_access={_yes_no(evidence.heartrate_access)}")
 
 
+
 def _print_descriptor_timeout_diagnostics(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -215,12 +200,14 @@ def _print_descriptor_timeout_diagnostics(
     _print_frame_summaries(output, observation)
 
 
+
 def _print_ack_timeout_diagnostics(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
     output("Reference AAP ACK timeout diagnostics:")
     _print_observation_fields(output, observation)
     _print_frame_summaries(output, observation)
+
 
 
 def _print_reference_summary(
@@ -234,20 +221,24 @@ def _print_reference_summary(
     output(f"  descriptor_complete={_yes_no(descriptor_complete)}")
 
 
+
 def _format_option_types(option_types: tuple[int, ...]) -> str:
     if not option_types:
         return "none"
     return ",".join(f"0x{option_type:02X}" for option_type in option_types)
 
 
+
 def _format_config_value(value: int | None) -> str:
     return "not-observed" if value is None else str(value)
+
 
 
 def _format_rfc_mode(value: int | None) -> str:
     if value is None:
         return "not-observed"
     return "Basic" if value == 0 else str(value)
+
 
 
 def _print_l2cap_configuration_summary(
@@ -318,6 +309,7 @@ def _print_l2cap_configuration_summary(
     )
 
 
+
 def _print_local_rx_configuration_summary(
     output: Callable[[str], None],
     observation: AAPLocalRXConfigurationObservation,
@@ -380,6 +372,7 @@ def _print_local_rx_configuration_summary(
     )
 
 
+
 def _print_post_ack_shape_summary(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -401,6 +394,7 @@ def _print_post_ack_shape_summary(
     )
 
 
+
 class _ReferenceAAPCompatibility:
     """Compose independent request- and response-direction diagnostics."""
 
@@ -418,8 +412,10 @@ class _ReferenceAAPCompatibility:
             yield
 
 
+
 def _format_uuid16s(values: tuple[int, ...]) -> str:
     return "none" if not values else ",".join(f"0x{value:04X}" for value in values)
+
 
 
 def _format_attribute_ranges(values: tuple[tuple[int, int], ...]) -> str:
@@ -429,6 +425,7 @@ def _format_attribute_ranges(values: tuple[tuple[int, int], ...]) -> str:
         f"0x{start:04X}" if start == end else f"0x{start:04X}{end:04X}"
         for start, end in values
     )
+
 
 
 def _print_sdp_query_summary(
@@ -461,8 +458,10 @@ def _print_sdp_query_summary(
     output(f"  response_bytes={query.total_response_bytes}")
 
 
+
 def _format_information_mask(value: int | None, width: int) -> str:
     return "not-observed" if value is None else f"0x{value:0{width}X}"
+
 
 
 def _print_pre_aap_sequence_summary(
@@ -506,6 +505,7 @@ def _print_pre_aap_sequence_summary(
     output(f"  aap_open_attempted={_yes_no(observation.aap_open_attempted)}")
 
 
+
 def _format_remote_discovery_value(
     value: int | None, width: int, *, applicable: bool
 ) -> str:
@@ -514,12 +514,14 @@ def _format_remote_discovery_value(
     return "not-observed" if value is None else f"0x{value:0{width}X}"
 
 
+
 def _format_remote_discovery_integer(
     value: int | None, *, applicable: bool
 ) -> str:
     if not applicable:
         return "not-applicable"
     return "not-observed" if value is None else str(value)
+
 
 
 def _print_pre_auth_sequence_summary(
@@ -609,6 +611,7 @@ def _print_pre_auth_sequence_summary(
     )
 
 
+
 def _authentication_progress(output: Callable[[str], None]):
     phase_started = False
 
@@ -634,6 +637,7 @@ def _authentication_progress(output: Callable[[str], None]):
     return emit
 
 
+
 def _channel_progress(output: Callable[[str], None]):
     def emit(event: AAPChannelProgress, channel: AAPChannel | None) -> None:
         if event is AAPChannelProgress.OPENED and channel is not None:
@@ -643,6 +647,7 @@ def _channel_progress(output: Callable[[str], None]):
             output("Reference AAP L2CAP close: complete")
 
     return emit
+
 
 
 def _aap_progress(
@@ -678,6 +683,7 @@ def _aap_progress(
             output("Canonical descriptor evidence: complete")
 
     return emit
+
 
 
 async def run_live_probe(
@@ -769,5 +775,4 @@ async def run_live_probe(
                 raise RuntimeError("reference D-Bus cleanup failed") from None
         else:
             output("Reference D-Bus resources: closed")
-
 
