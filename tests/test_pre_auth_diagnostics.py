@@ -27,6 +27,10 @@ from airpods_hr.pre_auth_diagnostics import (
     RemoteDiscoveryResult,
     validate_bumble_pre_auth_api,
 )
+from tools.probe_reference_handshake import (
+    _print_pre_auth_sequence_summary,
+    run_probe,
+)
 
 
 class FakeDevice:
@@ -607,6 +611,48 @@ class PreAuthSafetyTests(unittest.IsolatedAsyncioTestCase):
             field_names & {"raw", "payload", "packet", "frame", "data", "name"}
         )
         self.assertNotIn("PRIVATE NAME", repr(selected))
+
+    def test_safe_summary_is_bounded_and_contains_no_name(self) -> None:
+        strategy = PreAuthSequenceStrategy(
+            PreAuthSequenceMode.BLUEZ_DISCOVERY
+        )
+        strategy._supported_request()
+        strategy._supported_response(
+            observed=True,
+            result=RemoteDiscoveryResult.SUCCESS,
+            mask=0x80,
+        )
+        output: list[str] = []
+        _print_pre_auth_sequence_summary(output.append, strategy.observation)
+        rendered = "\n".join(output)
+        self.assertIn("PRE-AUTH SEQUENCE SUMMARY", rendered)
+        self.assertIn("mode=bluez-discovery", rendered)
+        self.assertIn(
+            "remote_supported_features_mask=0x0000000000000080", rendered
+        )
+        self.assertIn(
+            "remote_supported_features_command_accepted=no", rendered
+        )
+        self.assertIn(
+            "remote_extended_features_page=not-applicable", rendered
+        )
+        self.assertIn("authentication_attempted=no", rendered)
+        self.assertNotIn("PRIVATE NAME", rendered)
+        self.assertNotIn("payload", rendered.lower())
+
+    async def test_probe_classifies_pre_auth_failure_distinctly(self) -> None:
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(
+                side_effect=PreAuthSequenceError("PRIVATE HCI DATA")
+            ),
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output, ["REFERENCE HANDSHAKE FAIL: pre_auth_sequence_failed"]
+        )
 
     def test_experiment_is_absent_from_frozen_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]

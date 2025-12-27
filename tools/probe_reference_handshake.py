@@ -1,23 +1,89 @@
+#!/usr/bin/env python3.14
 """Private diagnostic for the existing controller-handoff AAP handshake."""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, Protocol
-from airpods_hr.aap import AAP_FRAME_SUMMARY_LIMIT, AAPHandshakeProbeSession, AAPHandshakeSession, AAPProgress, AAPType2BFrameSummary, HandshakeObservation
-from airpods_hr.aap_channel import AAPChannel, AAPChannelProgress, AAPChannelSession
-from airpods_hr.aap_config_diagnostics import AAPConfigurationDiagnosticStrategy, AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
-from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXDiagnosticStrategy, AAPLocalRXProfile, AAPPostACKShapeObservation, L2CAP_CLASSIC_DEFAULT_MTU
-from airpods_hr.authentication import AuthenticationProgress, BumbleClassicRuntimeFactory, ClassicAuthenticationSession, create_controller_handoff_transport
-from airpods_hr.bluetooth import DBusNextBlueZBackend
-from airpods_hr.discovery import BlueZDeviceDiscovery, DBusNextManagedObjectsBackend
-from airpods_hr.pairing import BlueZPairingStore
-from airpods_hr.pre_aap_diagnostics import PreAAPAAPChannelSession, PreAAPSequenceMode, PreAAPSequenceObservation, PreAAPSequenceSecureSession, PreAAPSequenceStrategy
-from airpods_hr.pre_auth_diagnostics import PreAuthSequenceMode, PreAuthSequenceObservation, PreAuthSequenceStrategy
-from airpods_hr.sdp import REQUIRED_SDP_COMPATIBILITY_RECORDS
-from airpods_hr.reference_sdp_footprint import BLUEZ_LIKE_EXTRA_SERVICE_SPECS, ReferenceSDPFootprint, ReferenceSDPFootprintSecureSession, ReferenceSDPFootprintStrategy, ReferenceSDPQuerySnapshot
+from typing import Any, Protocol, TextIO
+
+from airpods_hr.aap import (
+    AAP_FRAME_SUMMARY_LIMIT,
+    AAPDescriptorObservationTimeoutError,
+    AAPFrameSummary,
+    AAPHandshakeError,
+    AAPHandshakeProbeSession,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+    AAPProgress,
+    AAPType2BFrameSummary,
+    HandshakeObservation,
+)
+from airpods_hr.aap_channel import (
+    AAPChannel,
+    AAPChannelError,
+    AAPChannelProgress,
+    AAPChannelSession,
+)
+from airpods_hr.aap_config_diagnostics import (
+    AAPConfigurationDiagnosticStrategy,
+    AAPConfigureResponseMode,
+    AAPL2CAPConfigurationObservation,
+)
+from airpods_hr.aap_local_rx_diagnostics import (
+    AAPLocalRXConfigurationObservation,
+    AAPLocalRXDiagnosticError,
+    AAPLocalRXDiagnosticStrategy,
+    AAPLocalRXProfile,
+    AAPPostACKShapeObservation,
+    L2CAP_CLASSIC_DEFAULT_MTU,
+)
+from airpods_hr.authentication import (
+    AuthenticationProgress,
+    BumbleClassicRuntimeFactory,
+    ClassicAuthenticationError,
+    ClassicAuthenticationSession,
+    create_controller_handoff_transport,
+)
+from airpods_hr.bluetooth import (
+    AdapterRestoreError,
+    DBusNextBlueZBackend,
+    HandoffError,
+)
+from airpods_hr.discovery import (
+    BlueZDeviceDiscovery,
+    DBusNextManagedObjectsBackend,
+    MultipleAirPodsCandidatesError,
+    NoAirPodsCandidatesError,
+)
+from airpods_hr.pairing import BlueZPairingStore, PairingStoreError
+from airpods_hr.pre_aap_diagnostics import (
+    PreAAPAAPChannelSession,
+    PreAAPSequenceError,
+    PreAAPSequenceMode,
+    PreAAPSequenceObservation,
+    PreAAPSequenceSecureSession,
+    PreAAPSequenceStrategy,
+)
+from airpods_hr.pre_auth_diagnostics import (
+    PreAuthSequenceError,
+    PreAuthSequenceMode,
+    PreAuthSequenceObservation,
+    PreAuthSequenceStrategy,
+)
+from airpods_hr.sdp import (
+    REQUIRED_SDP_COMPATIBILITY_RECORDS,
+    SDPCompatibilityError,
+)
+from airpods_hr.reference_sdp_footprint import (
+    BLUEZ_LIKE_EXTRA_SERVICE_SPECS,
+    ReferenceSDPFootprint,
+    ReferenceSDPFootprintSecureSession,
+    ReferenceSDPFootprintStrategy,
+    ReferenceSDPQuerySnapshot,
+)
 
 
 LiveRunner = Callable[
@@ -33,19 +99,12 @@ LiveRunner = Callable[
     Awaitable[HandshakeObservation],
 ]
 
-
-
 DEFAULT_ACK_TIMEOUT = 5.0
-
-
-
 DEFAULT_DESCRIPTOR_TIMEOUT = 3.0
-
 
 
 class HandoffTransport(Protocol):
     def acquire(self, adapter_name: str) -> Any: ...
-
 
 
 class _ReportingHandoffTransport:
@@ -70,6 +129,81 @@ class _ReportingHandoffTransport:
             self._output("Controller handoff cleanup: attempted")
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Diagnose the canonical AAP handshake through the existing "
+            "controller-handoff/Bumble reference path."
+        )
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform the opt-in reference controller-handoff diagnostic",
+    )
+    parser.add_argument(
+        "--descriptor-timeout",
+        type=_bounded_float(1.0, 30.0),
+        default=DEFAULT_DESCRIPTOR_TIMEOUT,
+        help="post-ACK descriptor window in seconds (default: 3; range: 1-30)",
+    )
+    parser.add_argument(
+        "--aap-config-response",
+        type=AAPConfigureResponseMode,
+        choices=tuple(AAPConfigureResponseMode),
+        default=AAPConfigureResponseMode.PROVEN,
+        help=(
+            "AAP Configure Response diagnostic strategy: proven (default) "
+            "or experimental kernel-mtu-only"
+        ),
+    )
+    parser.add_argument(
+        "--sdp-footprint",
+        type=ReferenceSDPFootprint,
+        choices=tuple(ReferenceSDPFootprint),
+        default=ReferenceSDPFootprint.PROVEN,
+        help=(
+            "reference SDP footprint: proven (default) or experimental "
+            "bluez-like"
+        ),
+    )
+    parser.add_argument(
+        "--pre-aap-sequence",
+        type=PreAAPSequenceMode,
+        choices=tuple(PreAAPSequenceMode),
+        default=PreAAPSequenceMode.PROVEN,
+        help=(
+            "reference pre-AAP sequence: proven (default), delay-only, "
+            "or experimental bluez-l2cap-info"
+        ),
+    )
+    parser.add_argument(
+        "--pre-auth-sequence",
+        type=PreAuthSequenceMode,
+        choices=tuple(PreAuthSequenceMode),
+        default=PreAuthSequenceMode.PROVEN,
+        help=(
+            "reference pre-authentication sequence: proven (default), "
+            "delay-only, or experimental bluez-discovery"
+        ),
+    )
+    parser.add_argument(
+        "--aap-local-rx-profile",
+        type=AAPLocalRXProfile,
+        choices=tuple(AAPLocalRXProfile),
+        default=AAPLocalRXProfile.PROVEN,
+        help=(
+            "host-originated AAP Configure Request profile: proven "
+            "(default) or experimental kernel-default"
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="include a safe exception category for non-observation failures",
+    )
+    return parser
+
 
 def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
     def parse(value: str) -> float:
@@ -83,25 +217,20 @@ def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
     return parse
 
 
-
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
-
 
 
 def _optional_integer(value: int | None) -> str:
     return "unavailable" if value is None else str(value)
 
 
-
 def _optional_boolean(value: bool | None) -> str:
     return "unavailable" if value is None else _yes_no(value)
 
 
-
 def _optional_hex(value: int | None, width: int) -> str:
     return "unavailable" if value is None else f"0x{value:0{width}X}"
-
 
 
 def _print_type_2b_summary(
@@ -147,7 +276,6 @@ def _print_type_2b_summary(
     )
 
 
-
 def _print_frame_summaries(
     output: Callable[[str], None],
     observation: HandshakeObservation,
@@ -176,7 +304,6 @@ def _print_frame_summaries(
             emitted += 1
 
 
-
 def _print_observation_fields(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -191,7 +318,6 @@ def _print_observation_fields(
     output(f"  heartrate_access={_yes_no(evidence.heartrate_access)}")
 
 
-
 def _print_descriptor_timeout_diagnostics(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -200,14 +326,12 @@ def _print_descriptor_timeout_diagnostics(
     _print_frame_summaries(output, observation)
 
 
-
 def _print_ack_timeout_diagnostics(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
     output("Reference AAP ACK timeout diagnostics:")
     _print_observation_fields(output, observation)
     _print_frame_summaries(output, observation)
-
 
 
 def _print_reference_summary(
@@ -221,24 +345,20 @@ def _print_reference_summary(
     output(f"  descriptor_complete={_yes_no(descriptor_complete)}")
 
 
-
 def _format_option_types(option_types: tuple[int, ...]) -> str:
     if not option_types:
         return "none"
     return ",".join(f"0x{option_type:02X}" for option_type in option_types)
 
 
-
 def _format_config_value(value: int | None) -> str:
     return "not-observed" if value is None else str(value)
-
 
 
 def _format_rfc_mode(value: int | None) -> str:
     if value is None:
         return "not-observed"
     return "Basic" if value == 0 else str(value)
-
 
 
 def _print_l2cap_configuration_summary(
@@ -309,7 +429,6 @@ def _print_l2cap_configuration_summary(
     )
 
 
-
 def _print_local_rx_configuration_summary(
     output: Callable[[str], None],
     observation: AAPLocalRXConfigurationObservation,
@@ -372,7 +491,6 @@ def _print_local_rx_configuration_summary(
     )
 
 
-
 def _print_post_ack_shape_summary(
     output: Callable[[str], None], observation: HandshakeObservation
 ) -> None:
@@ -394,7 +512,6 @@ def _print_post_ack_shape_summary(
     )
 
 
-
 class _ReferenceAAPCompatibility:
     """Compose independent request- and response-direction diagnostics."""
 
@@ -412,10 +529,8 @@ class _ReferenceAAPCompatibility:
             yield
 
 
-
 def _format_uuid16s(values: tuple[int, ...]) -> str:
     return "none" if not values else ",".join(f"0x{value:04X}" for value in values)
-
 
 
 def _format_attribute_ranges(values: tuple[tuple[int, int], ...]) -> str:
@@ -425,7 +540,6 @@ def _format_attribute_ranges(values: tuple[tuple[int, int], ...]) -> str:
         f"0x{start:04X}" if start == end else f"0x{start:04X}{end:04X}"
         for start, end in values
     )
-
 
 
 def _print_sdp_query_summary(
@@ -458,10 +572,8 @@ def _print_sdp_query_summary(
     output(f"  response_bytes={query.total_response_bytes}")
 
 
-
 def _format_information_mask(value: int | None, width: int) -> str:
     return "not-observed" if value is None else f"0x{value:0{width}X}"
-
 
 
 def _print_pre_aap_sequence_summary(
@@ -505,7 +617,6 @@ def _print_pre_aap_sequence_summary(
     output(f"  aap_open_attempted={_yes_no(observation.aap_open_attempted)}")
 
 
-
 def _format_remote_discovery_value(
     value: int | None, width: int, *, applicable: bool
 ) -> str:
@@ -514,14 +625,12 @@ def _format_remote_discovery_value(
     return "not-observed" if value is None else f"0x{value:0{width}X}"
 
 
-
 def _format_remote_discovery_integer(
     value: int | None, *, applicable: bool
 ) -> str:
     if not applicable:
         return "not-applicable"
     return "not-observed" if value is None else str(value)
-
 
 
 def _print_pre_auth_sequence_summary(
@@ -611,7 +720,6 @@ def _print_pre_auth_sequence_summary(
     )
 
 
-
 def _authentication_progress(output: Callable[[str], None]):
     phase_started = False
 
@@ -637,7 +745,6 @@ def _authentication_progress(output: Callable[[str], None]):
     return emit
 
 
-
 def _channel_progress(output: Callable[[str], None]):
     def emit(event: AAPChannelProgress, channel: AAPChannel | None) -> None:
         if event is AAPChannelProgress.OPENED and channel is not None:
@@ -647,7 +754,6 @@ def _channel_progress(output: Callable[[str], None]):
             output("Reference AAP L2CAP close: complete")
 
     return emit
-
 
 
 def _aap_progress(
@@ -683,7 +789,6 @@ def _aap_progress(
             output("Canonical descriptor evidence: complete")
 
     return emit
-
 
 
 async def run_live_probe(
@@ -776,3 +881,218 @@ async def run_live_probe(
         else:
             output("Reference D-Bus resources: closed")
 
+
+async def run_probe(
+    *,
+    execute: bool,
+    descriptor_timeout: float = DEFAULT_DESCRIPTOR_TIMEOUT,
+    response_mode: AAPConfigureResponseMode = AAPConfigureResponseMode.PROVEN,
+    sdp_footprint: ReferenceSDPFootprint = ReferenceSDPFootprint.PROVEN,
+    pre_aap_sequence: PreAAPSequenceMode = PreAAPSequenceMode.PROVEN,
+    pre_auth_sequence: PreAuthSequenceMode = PreAuthSequenceMode.PROVEN,
+    local_rx_profile: AAPLocalRXProfile = AAPLocalRXProfile.PROVEN,
+    verbose: bool = False,
+    output: Callable[[str], None] = print,
+    live_runner: LiveRunner = run_live_probe,
+) -> int:
+    response_mode = AAPConfigureResponseMode(response_mode)
+    sdp_footprint = ReferenceSDPFootprint(sdp_footprint)
+    pre_aap_sequence = PreAAPSequenceMode(pre_aap_sequence)
+    pre_auth_sequence = PreAuthSequenceMode(pre_auth_sequence)
+    local_rx_profile = AAPLocalRXProfile(local_rx_profile)
+    if not execute:
+        output("DRY RUN: no Bluetooth state will be changed.")
+        output("Planned reference diagnostic:")
+        output("  0. Discover one paired AirPods candidate.")
+        output("  1. Use the existing controller-handoff/Bumble backend.")
+        output("  2. Load existing local Classic credentials without printing them.")
+        output("  3. Authenticate, encrypt, and install four known SDP records.")
+        output("  4. Open the existing Bumble AAP PSM 0x1001 transport.")
+        output("  5. Run the canonical descriptor-gated AAP handshake only.")
+        output("  6. Close all reference resources and restore BlueZ.")
+        output("HR activation commands: none")
+        output("Reference diagnostic timeouts:")
+        output(f"  ACK={DEFAULT_ACK_TIMEOUT:g}s")
+        output(f"  descriptor={descriptor_timeout:g}s")
+        output(f"AAP Configure Response mode: {response_mode.value}")
+        output(f"Reference SDP footprint: {sdp_footprint.value}")
+        output(f"Pre-AAP sequence: {pre_aap_sequence.value}")
+        output(f"Pre-auth sequence: {pre_auth_sequence.value}")
+        output(f"AAP local RX profile: {local_rx_profile.value}")
+        if sdp_footprint is ReferenceSDPFootprint.BLUEZ_LIKE:
+            output(
+                "EXPERIMENTAL: the reference-only SDP server will add a "
+                "bounded BlueZ-like L2CAP-visible footprint."
+            )
+        if response_mode is AAPConfigureResponseMode.KERNEL_MTU_ONLY:
+            output(
+                "EXPERIMENTAL: successful AAP response will retain only "
+                "the peer MTU option on the wire."
+            )
+        if pre_aap_sequence is PreAAPSequenceMode.DELAY_ONLY:
+            output(
+                "EXPERIMENTAL: wait 20 ms after encryption without sending "
+                "additional L2CAP signaling."
+            )
+        elif pre_aap_sequence is PreAAPSequenceMode.BLUEZ_L2CAP_INFO:
+            output(
+                "EXPERIMENTAL: request Extended Features and Fixed Channels "
+                "through Bumble signaling before opening AAP."
+            )
+        if pre_auth_sequence is PreAuthSequenceMode.DELAY_ONLY:
+            output(
+                "EXPERIMENTAL: wait 85 ms after connection without sending "
+                "remote-discovery HCI commands."
+            )
+        elif pre_auth_sequence is PreAuthSequenceMode.BLUEZ_DISCOVERY:
+            output(
+                "EXPERIMENTAL: run the bounded BlueZ-style remote discovery "
+                "sequence before authentication."
+            )
+        if local_rx_profile is AAPLocalRXProfile.KERNEL_DEFAULT:
+            output(
+                "EXPERIMENTAL: omit the MTU option only from the initial "
+                "host-originated AAP Configure Request."
+            )
+        return 0
+
+    if response_mode is AAPConfigureResponseMode.KERNEL_MTU_ONLY:
+        output(f"AAP Configure Response mode: {response_mode.value}")
+        output(
+            "EXPERIMENTAL: using the kernel-mtu-only AAP Configure Response "
+            "for this reference diagnostic only."
+        )
+    elif verbose:
+        output(f"AAP Configure Response mode: {response_mode.value}")
+    if sdp_footprint is ReferenceSDPFootprint.BLUEZ_LIKE:
+        output(f"Reference SDP footprint: {sdp_footprint.value}")
+        output(
+            "EXPERIMENTAL: adding the bounded BlueZ-like footprint to the "
+            "four proven records for this reference diagnostic only."
+        )
+    elif verbose:
+        output(f"Reference SDP footprint: {sdp_footprint.value}")
+    if pre_aap_sequence is not PreAAPSequenceMode.PROVEN:
+        output(f"Pre-AAP sequence: {pre_aap_sequence.value}")
+        output(
+            "EXPERIMENTAL: changing only the reference pre-AAP sequence "
+            "for this diagnostic run."
+        )
+    elif verbose:
+        output(f"Pre-AAP sequence: {pre_aap_sequence.value}")
+    if pre_auth_sequence is not PreAuthSequenceMode.PROVEN:
+        output(f"Pre-auth sequence: {pre_auth_sequence.value}")
+        output(
+            "EXPERIMENTAL: changing only the reference pre-authentication "
+            "sequence for this diagnostic run."
+        )
+    elif verbose:
+        output(f"Pre-auth sequence: {pre_auth_sequence.value}")
+    if local_rx_profile is AAPLocalRXProfile.KERNEL_DEFAULT:
+        output(f"AAP local RX profile: {local_rx_profile.value}")
+        output(
+            "EXPERIMENTAL: changing only the host-originated AAP Configure "
+            "Request wire options for this diagnostic run."
+        )
+    elif verbose:
+        output(f"AAP local RX profile: {local_rx_profile.value}")
+    if verbose:
+        output("Reference diagnostic timeouts:")
+        output(f"  ACK={DEFAULT_ACK_TIMEOUT:g}s")
+        output(f"  descriptor={descriptor_timeout:g}s")
+    try:
+        observation = await live_runner(
+            output,
+            descriptor_timeout,
+            response_mode,
+            sdp_footprint,
+            pre_aap_sequence,
+            pre_auth_sequence,
+            local_rx_profile,
+        )
+    except AAPDescriptorObservationTimeoutError as error:
+        output("REFERENCE HANDSHAKE FAIL at aap_handshake: descriptor_timeout")
+        _print_descriptor_timeout_diagnostics(output, error.observation)
+        _print_reference_summary(
+            output, error.observation, descriptor_complete=False
+        )
+        _print_post_ack_shape_summary(output, error.observation)
+        return 1
+    except AAPHandshakeTimeoutError as error:
+        output("REFERENCE HANDSHAKE FAIL at aap_handshake: missing_exact_ack")
+        if error.observation is not None:
+            _print_ack_timeout_diagnostics(output, error.observation)
+            _print_reference_summary(
+                output, error.observation, descriptor_complete=False
+            )
+        return 1
+    except NoAirPodsCandidatesError:
+        category = "no_paired_airpods"
+    except MultipleAirPodsCandidatesError:
+        category = "multiple_airpods_candidates"
+    except PairingStoreError:
+        category = "pairing_credentials_unavailable"
+    except SDPCompatibilityError:
+        category = "reference_sdp_identity_failed"
+    except AAPChannelError:
+        category = "l2cap_connection_failed"
+    except AdapterRestoreError:
+        category = "bluez_restoration_failed"
+    except HandoffError:
+        category = "controller_handoff_failed"
+    except ClassicAuthenticationError:
+        category = "authentication_encryption_failed"
+    except AAPHandshakeError:
+        category = "aap_handshake_failed"
+    except PreAAPSequenceError:
+        category = "pre_aap_sequence_failed"
+    except PreAuthSequenceError:
+        category = "pre_auth_sequence_failed"
+    except AAPLocalRXDiagnosticError:
+        category = "aap_local_rx_configuration_failed"
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        category = "unexpected_reference_probe_error"
+        if verbose:
+            output(f"Safe detail: {type(error).__name__}")
+    else:
+        _print_reference_summary(
+            output, observation, descriptor_complete=True
+        )
+        _print_post_ack_shape_summary(output, observation)
+        output("REFERENCE HANDSHAKE PASS")
+        return 0
+
+    output(f"REFERENCE HANDSHAKE FAIL: {category}")
+    return 1
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stream: TextIO | None = None,
+) -> int:
+    args = build_parser().parse_args(argv)
+    emit = print if stream is None else lambda message: print(message, file=stream)
+    try:
+        return asyncio.run(
+            run_probe(
+                execute=args.execute,
+                descriptor_timeout=args.descriptor_timeout,
+                response_mode=args.aap_config_response,
+                sdp_footprint=args.sdp_footprint,
+                pre_aap_sequence=args.pre_aap_sequence,
+                pre_auth_sequence=args.pre_auth_sequence,
+                local_rx_profile=args.aap_local_rx_profile,
+                verbose=args.verbose,
+                output=emit,
+            )
+        )
+    except KeyboardInterrupt:
+        emit("REFERENCE HANDSHAKE FAIL: interrupted; cleanup was attempted")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

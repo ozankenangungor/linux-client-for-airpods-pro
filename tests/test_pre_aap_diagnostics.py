@@ -22,6 +22,10 @@ from airpods_hr.pre_aap_diagnostics import (
     PreAAPSequenceSecureSession,
     PreAAPSequenceStrategy,
 )
+from tools.probe_reference_handshake import (
+    _print_pre_aap_sequence_summary,
+    run_probe,
+)
 
 
 class FakeManager:
@@ -322,6 +326,40 @@ class PreAAPDiagnosticSafetyTests(unittest.IsolatedAsyncioTestCase):
         )}
         self.assertFalse(
             field_names & {"raw", "payload", "packet", "frame", "data"}
+        )
+
+    def test_safe_summary_contains_allowlisted_fields(self) -> None:
+        strategy = PreAAPSequenceStrategy(
+            PreAAPSequenceMode.BLUEZ_L2CAP_INFO
+        )
+        strategy._request_sent(0x0002)
+        strategy._response(
+            0x0002,
+            observed=True,
+            result=InformationResponseResult.SUCCESS,
+            mask=0x80,
+        )
+        output: list[str] = []
+        _print_pre_aap_sequence_summary(output.append, strategy.observation)
+        rendered = "\n".join(output)
+        self.assertIn("PRE-AAP SEQUENCE SUMMARY", rendered)
+        self.assertIn("mode=bluez-l2cap-info", rendered)
+        self.assertIn("extended_features_mask=0x00000080", rendered)
+        self.assertIn("aap_open_attempted=no", rendered)
+        self.assertNotIn("payload", rendered.lower())
+
+    async def test_probe_classifies_pre_aap_failure_distinctly(self) -> None:
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(
+                side_effect=PreAAPSequenceError("PRIVATE SIGNALING DATA")
+            ),
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output, ["REFERENCE HANDSHAKE FAIL: pre_aap_sequence_failed"]
         )
 
     def test_experiment_is_absent_from_production_paths(self) -> None:

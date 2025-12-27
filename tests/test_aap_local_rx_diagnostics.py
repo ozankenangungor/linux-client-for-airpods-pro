@@ -297,5 +297,22 @@ class AAPPostACKShapeTests(unittest.TestCase):
             & {"raw", "payload", "frame", "data"}
         )
 
+    def test_frozen_experiments_and_product_paths_do_not_import_strategy(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative in (
+            "src/airpods_hr/monitor_cli.py",
+            "src/airpods_hr/bluez_coexistence.py",
+            "src/airpods_hr/aap_config_diagnostics.py",
+            "src/airpods_hr/reference_sdp_footprint.py",
+            "src/airpods_hr/pre_aap_diagnostics.py",
+            "src/airpods_hr/pre_auth_diagnostics.py",
+        ):
+            source = (root / relative).read_text(encoding="utf-8")
+            self.assertNotIn("AAPLocalRXDiagnosticStrategy", source)
+            self.assertNotIn("kernel-default", source)
+
+
 if __name__ == "__main__":
     unittest.main()

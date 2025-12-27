@@ -2,23 +2,72 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
+import hashlib
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-from airpods_hr.aap import AAPDescriptorObservationTimeoutError, AAPFrameSummary, AAPHandshakeError, AAPHandshakeTimeoutError, AAPProgress, DescriptorEvidence, HandshakeObservation
+
+from airpods_hr.aap import (
+    AAP_FRAME_SUMMARY_LIMIT,
+    AAP_HANDSHAKE_ACK,
+    AAPDescriptorObservationTimeoutError,
+    AAPFrameSummary,
+    AAPHandshakeError,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+    AAPProgress,
+    DescriptorEvidence,
+    HandshakeObservation,
+)
 from airpods_hr.aap_channel import AAPChannel, AAPChannelProgress
-from airpods_hr.aap_config_diagnostics import AAPConfigurationDiagnosticStrategy, AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
-from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXDiagnosticStrategy, AAPLocalRXProfile
+from airpods_hr.aap_config_diagnostics import (
+    AAPConfigurationDiagnosticStrategy,
+    AAPConfigureResponseMode,
+    AAPL2CAPConfigurationObservation,
+)
+from airpods_hr.aap_local_rx_diagnostics import (
+    AAPLocalRXConfigurationObservation,
+    AAPLocalRXDiagnosticStrategy,
+    AAPLocalRXProfile,
+)
 from airpods_hr.authentication import AuthenticationProgress
-from airpods_hr.pre_aap_diagnostics import PreAAPAAPChannelSession, PreAAPSequenceMode, PreAAPSequenceSecureSession
-from airpods_hr.reference_sdp_footprint import ReferenceSDPFootprint, ReferenceSDPFootprintSecureSession, ReferenceSDPQuerySnapshot, ReferenceSDPQuerySummary
-from tools.probe_reference_handshake import _ReportingHandoffTransport, _ReferenceAAPCompatibility, _aap_progress, _authentication_progress, _channel_progress, _print_l2cap_configuration_summary, _print_local_rx_configuration_summary, _print_post_ack_shape_summary, _print_sdp_query_summary, run_live_probe
-from airpods_hr.aap import AAPFrameSummary, AAPProgress, DescriptorEvidence, HandshakeObservation
-from airpods_hr.aap_config_diagnostics import AAPConfigureResponseMode, AAPL2CAPConfigurationObservation
-from airpods_hr.aap_local_rx_diagnostics import AAPLocalRXConfigurationObservation, AAPLocalRXProfile
-from airpods_hr.reference_sdp_footprint import ReferenceSDPFootprint, ReferenceSDPQuerySnapshot, ReferenceSDPQuerySummary
-from tools.probe_reference_handshake import _aap_progress, _authentication_progress, _channel_progress, _print_l2cap_configuration_summary, _print_local_rx_configuration_summary, _print_post_ack_shape_summary, _print_sdp_query_summary
+from airpods_hr.pairing import PairingStoreError
+from airpods_hr.pre_aap_diagnostics import (
+    PreAAPAAPChannelSession,
+    PreAAPSequenceMode,
+    PreAAPSequenceSecureSession,
+)
+from airpods_hr.pre_auth_diagnostics import (
+    PreAuthSequenceMode,
+)
+from airpods_hr.reference_sdp_footprint import (
+    ReferenceSDPFootprint,
+    ReferenceSDPFootprintSecureSession,
+    ReferenceSDPQuerySnapshot,
+    ReferenceSDPQuerySummary,
+)
+from tools.probe_reference_handshake import (
+    _ReportingHandoffTransport,
+    _ReferenceAAPCompatibility,
+    _aap_progress,
+    _authentication_progress,
+    _channel_progress,
+    _print_l2cap_configuration_summary,
+    _print_local_rx_configuration_summary,
+    _print_post_ack_shape_summary,
+    _print_pre_aap_sequence_summary,
+    _print_pre_auth_sequence_summary,
+    _print_sdp_query_summary,
+    build_parser,
+    main,
+    run_live_probe,
+    run_probe,
+)
 
 
 def observation(
@@ -43,7 +92,6 @@ def observation(
     )
 
 
-
 class FakeHandoff:
     def __init__(self) -> None:
         self.events: list[str] = []
@@ -57,9 +105,292 @@ class FakeHandoff:
             self.events.append(f"exit:{adapter_name}")
 
 
+class MissingACKTransport:
+    def __init__(self, frames: list[bytes]) -> None:
+        self.frames = list(frames)
+        self.application_payloads_sent = 0
+        self.dropped_frames = 0
+
+    @asynccontextmanager
+    async def collect(self):
+        yield self
+
+    def send_handshake_request(self) -> None:
+        self.application_payloads_sent += 1
+
+    async def receive(self, timeout: float) -> bytes:
+        del timeout
+        if not self.frames:
+            raise TimeoutError
+        return self.frames.pop(0)
+
 
 class ReferenceProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
+    def test_parser_defaults_to_non_destructive_dry_run(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertFalse(args.execute)
+        self.assertFalse(args.verbose)
+        self.assertEqual(args.descriptor_timeout, 3)
+        self.assertEqual(
+            args.aap_config_response, AAPConfigureResponseMode.PROVEN
+        )
+        self.assertEqual(args.sdp_footprint, ReferenceSDPFootprint.PROVEN)
+        self.assertEqual(args.pre_aap_sequence, PreAAPSequenceMode.PROVEN)
+        self.assertEqual(args.pre_auth_sequence, PreAuthSequenceMode.PROVEN)
+        self.assertEqual(args.aap_local_rx_profile, AAPLocalRXProfile.PROVEN)
 
+    def test_aap_local_rx_profiles_are_explicit(self) -> None:
+        args = build_parser().parse_args(
+            ["--aap-local-rx-profile", "kernel-default"]
+        )
+        self.assertEqual(
+            args.aap_local_rx_profile, AAPLocalRXProfile.KERNEL_DEFAULT
+        )
+
+    def test_pre_aap_sequence_modes_are_explicit(self) -> None:
+        for value, expected in (
+            ("delay-only", PreAAPSequenceMode.DELAY_ONLY),
+            ("bluez-l2cap-info", PreAAPSequenceMode.BLUEZ_L2CAP_INFO),
+        ):
+            with self.subTest(value=value):
+                args = build_parser().parse_args(
+                    ["--pre-aap-sequence", value]
+                )
+                self.assertEqual(args.pre_aap_sequence, expected)
+
+    def test_pre_auth_sequence_modes_are_explicit(self) -> None:
+        for value, expected in (
+            ("delay-only", PreAuthSequenceMode.DELAY_ONLY),
+            ("bluez-discovery", PreAuthSequenceMode.BLUEZ_DISCOVERY),
+        ):
+            with self.subTest(value=value):
+                args = build_parser().parse_args(
+                    ["--pre-auth-sequence", value]
+                )
+                self.assertEqual(args.pre_auth_sequence, expected)
+
+    def test_bluez_like_sdp_footprint_is_explicit(self) -> None:
+        args = build_parser().parse_args(["--sdp-footprint", "bluez-like"])
+        self.assertEqual(
+            args.sdp_footprint, ReferenceSDPFootprint.BLUEZ_LIKE
+        )
+
+    def test_kernel_mtu_only_response_mode_is_explicit(self) -> None:
+        args = build_parser().parse_args(
+            ["--aap-config-response", "kernel-mtu-only"]
+        )
+        self.assertEqual(
+            args.aap_config_response,
+            AAPConfigureResponseMode.KERNEL_MTU_ONLY,
+        )
+
+    def test_descriptor_timeout_bounds(self) -> None:
+        self.assertEqual(
+            build_parser()
+            .parse_args(["--descriptor-timeout", "10"])
+            .descriptor_timeout,
+            10,
+        )
+        self.assertEqual(
+            build_parser()
+            .parse_args(["--descriptor-timeout", "30"])
+            .descriptor_timeout,
+            30,
+        )
+        for value in ("0", "0.9", "30.1", "31"):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args(["--descriptor-timeout", value])
+
+    def test_main_dry_run_constructs_no_live_backend(self) -> None:
+        output = StringIO()
+        with patch(
+            "tools.probe_reference_handshake.DBusNextManagedObjectsBackend"
+        ) as discovery, patch(
+            "tools.probe_reference_handshake.DBusNextBlueZBackend"
+        ) as bluez:
+            self.assertEqual(main([], stream=output), 0)
+        discovery.assert_not_called()
+        bluez.assert_not_called()
+        rendered = output.getvalue()
+        self.assertIn("DRY RUN", rendered)
+        self.assertIn("existing controller-handoff/Bumble backend", rendered)
+        self.assertIn("HR activation commands: none", rendered)
+        self.assertIn("ACK=5s", rendered)
+        self.assertIn("descriptor=3s", rendered)
+        self.assertIn("AAP Configure Response mode: proven", rendered)
+        self.assertIn("Reference SDP footprint: proven", rendered)
+        self.assertIn("Pre-AAP sequence: proven", rendered)
+        self.assertIn("Pre-auth sequence: proven", rendered)
+
+    async def test_dry_run_never_invokes_live_runner(self) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+        self.assertEqual(
+            await run_probe(
+                execute=False, output=output.append, live_runner=runner
+            ),
+            0,
+        )
+        runner.assert_not_awaited()
+
+    async def test_dry_run_and_verbose_execute_report_configured_timeout(
+        self,
+    ) -> None:
+        dry_output: list[str] = []
+        await run_probe(
+            execute=False,
+            descriptor_timeout=10,
+            output=dry_output.append,
+        )
+        self.assertIn("  descriptor=10s", dry_output)
+
+        selected = observation()
+        live_output: list[str] = []
+        runner = AsyncMock(return_value=selected)
+        self.assertEqual(
+            await run_probe(
+                execute=True,
+                descriptor_timeout=30,
+                verbose=True,
+                output=live_output.append,
+                live_runner=runner,
+            ),
+            0,
+        )
+        runner.assert_awaited_once_with(
+            live_output.append,
+            30,
+            AAPConfigureResponseMode.PROVEN,
+            ReferenceSDPFootprint.PROVEN,
+            PreAAPSequenceMode.PROVEN,
+            PreAuthSequenceMode.PROVEN,
+            AAPLocalRXProfile.PROVEN,
+        )
+        self.assertIn("  descriptor=30s", live_output)
+
+    async def test_experimental_response_mode_is_labeled_and_forwarded(
+        self,
+    ) -> None:
+        selected = observation()
+        runner = AsyncMock(return_value=selected)
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            descriptor_timeout=30,
+            response_mode=AAPConfigureResponseMode.KERNEL_MTU_ONLY,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_awaited_once_with(
+            output.append,
+            30,
+            AAPConfigureResponseMode.KERNEL_MTU_ONLY,
+            ReferenceSDPFootprint.PROVEN,
+            PreAAPSequenceMode.PROVEN,
+            PreAuthSequenceMode.PROVEN,
+            AAPLocalRXProfile.PROVEN,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("AAP Configure Response mode: kernel-mtu-only", rendered)
+        self.assertIn("EXPERIMENTAL:", rendered)
+
+    async def test_experimental_footprint_is_labeled_and_forwarded(self) -> None:
+        runner = AsyncMock(return_value=observation())
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            descriptor_timeout=30,
+            sdp_footprint=ReferenceSDPFootprint.BLUEZ_LIKE,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_awaited_once_with(
+            output.append,
+            30,
+            AAPConfigureResponseMode.PROVEN,
+            ReferenceSDPFootprint.BLUEZ_LIKE,
+            PreAAPSequenceMode.PROVEN,
+            PreAuthSequenceMode.PROVEN,
+            AAPLocalRXProfile.PROVEN,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("Reference SDP footprint: bluez-like", rendered)
+        self.assertIn("EXPERIMENTAL:", rendered)
+
+    async def test_pre_aap_mode_is_labeled_and_forwarded(self) -> None:
+        runner = AsyncMock(return_value=observation())
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            descriptor_timeout=30,
+            pre_aap_sequence=PreAAPSequenceMode.BLUEZ_L2CAP_INFO,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_awaited_once_with(
+            output.append,
+            30,
+            AAPConfigureResponseMode.PROVEN,
+            ReferenceSDPFootprint.PROVEN,
+            PreAAPSequenceMode.BLUEZ_L2CAP_INFO,
+            PreAuthSequenceMode.PROVEN,
+            AAPLocalRXProfile.PROVEN,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("Pre-AAP sequence: bluez-l2cap-info", rendered)
+        self.assertIn("EXPERIMENTAL:", rendered)
+
+    async def test_pre_auth_mode_is_labeled_and_forwarded(self) -> None:
+        runner = AsyncMock(return_value=observation())
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            descriptor_timeout=30,
+            pre_auth_sequence=PreAuthSequenceMode.BLUEZ_DISCOVERY,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_awaited_once_with(
+            output.append,
+            30,
+            AAPConfigureResponseMode.PROVEN,
+            ReferenceSDPFootprint.PROVEN,
+            PreAAPSequenceMode.PROVEN,
+            PreAuthSequenceMode.BLUEZ_DISCOVERY,
+            AAPLocalRXProfile.PROVEN,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("Pre-auth sequence: bluez-discovery", rendered)
+        self.assertIn("EXPERIMENTAL:", rendered)
+
+    async def test_local_rx_experiment_is_labeled_and_forwarded(self) -> None:
+        runner = AsyncMock(return_value=observation())
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            descriptor_timeout=30,
+            local_rx_profile=AAPLocalRXProfile.KERNEL_DEFAULT,
+            output=output.append,
+            live_runner=runner,
+        )
+        self.assertEqual(status, 0)
+        runner.assert_awaited_once_with(
+            output.append,
+            30,
+            AAPConfigureResponseMode.PROVEN,
+            ReferenceSDPFootprint.PROVEN,
+            PreAAPSequenceMode.PROVEN,
+            PreAuthSequenceMode.PROVEN,
+            AAPLocalRXProfile.KERNEL_DEFAULT,
+        )
+        rendered = "\n".join(output)
+        self.assertIn("AAP local RX profile: kernel-default", rendered)
+        self.assertIn("EXPERIMENTAL:", rendered)
 
     def test_safe_sdp_query_summary_reports_metadata_only(self) -> None:
         snapshot = ReferenceSDPQuerySnapshot(
@@ -195,7 +526,6 @@ class ReferenceProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payload", rendered.lower())
 
 
-
 class ReferenceProgressTests(unittest.TestCase):
     def test_reference_phases_report_safe_success_evidence(self) -> None:
         output: list[str] = []
@@ -227,7 +557,6 @@ class ReferenceProgressTests(unittest.TestCase):
         self.assertNotIn("00112233445566778899AABBCCDDEEFF", rendered)
 
 
-
 class ReportingHandoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_handoff_cleanup_runs_on_success(self) -> None:
         delegate = FakeHandoff()
@@ -254,7 +583,6 @@ class ReportingHandoffTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     delegate.events, ["enter:hci0", "exit:hci0"]
                 )
-
 
 
 class ReferenceCompositionTests(unittest.IsolatedAsyncioTestCase):
@@ -385,3 +713,211 @@ class ReferenceCompositionTests(unittest.IsolatedAsyncioTestCase):
         discovery_backend.close.assert_called_once_with()
         bluez_backend.close.assert_called_once_with()
 
+
+class ReferenceObservationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_success_summary_preserves_canonical_observation(self) -> None:
+        selected = HandshakeObservation(
+            ack_observed=True,
+            evidence=DescriptorEvidence(
+                sensor_framework=True,
+                heart_rate_service=True,
+                heart_rate=True,
+                heartrate_access=True,
+            ),
+            pre_ack_frame_count=4,
+            post_ack_frame_count=7,
+            receive_frames_dropped=0,
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(return_value=selected),
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 0)
+        self.assertIn("REFERENCE HANDSHAKE SUMMARY", rendered)
+        self.assertIn("exact_ack_observed=yes", rendered)
+        self.assertIn("pre_ack_frames=4", rendered)
+        self.assertIn("post_ack_frames=7", rendered)
+        self.assertIn("sensor_framework=yes", rendered)
+        self.assertIn("heart_rate_service=yes", rendered)
+        self.assertIn("heart_rate=yes", rendered)
+        self.assertIn("heartrate_access=yes", rendered)
+        self.assertIn("descriptor_complete=yes", rendered)
+        self.assertEqual(output[-1], "REFERENCE HANDSHAKE PASS")
+
+    async def test_descriptor_timeout_is_safe_bounded_and_never_activates_hr(
+        self,
+    ) -> None:
+        hidden_payload = b"PRIVATE_DESCRIPTOR_AND_LINK_KEY_0011223344556677"
+        frame = bytearray(51)
+        frame[2:4] = (4).to_bytes(2, "little")
+        frame[4:6] = (0x002B).to_bytes(2, "little")
+        frame[6] = 3
+        frame[7:9] = (34).to_bytes(2, "little")
+        frame[17 : 17 + min(34, len(hidden_payload))] = hidden_payload[:34]
+        summary = AAPFrameSummary.from_frame(bytes(frame))
+        selected = observation(
+            summaries=(summary,) * (AAP_FRAME_SUMMARY_LIMIT + 5)
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(
+                side_effect=AAPDescriptorObservationTimeoutError(selected)
+            ),
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIn("Reference AAP descriptor timeout diagnostics:", rendered)
+        self.assertIn("exact_ack_observed=yes", rendered)
+        self.assertIn("pre_ack_frames=2", rendered)
+        self.assertIn("post_ack_frames=26", rendered)
+        self.assertIn("receive_frames_dropped=0", rendered)
+        self.assertIn("header_u16_4_5=0x002B", rendered)
+        self.assertIn("Type-0x002B structural summary:", rendered)
+        self.assertIn("descriptor_complete=no", rendered)
+        summary_headers = [
+            line for line in output if line.startswith("  pre_ack_frame_")
+        ]
+        self.assertEqual(len(summary_headers), AAP_FRAME_SUMMARY_LIMIT)
+        self.assertNotIn(hidden_payload.decode(), rendered)
+        self.assertNotIn(hidden_payload.hex(), rendered.lower())
+        self.assertNotIn("HeartRateActivationSession", rendered)
+
+    async def test_missing_ack_observation_preserves_counts_and_evidence(
+        self,
+    ) -> None:
+        selected = observation(
+            ack_observed=False, pre_ack_frames=9, post_ack_frames=0
+        )
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(
+                side_effect=AAPHandshakeTimeoutError("missing", selected)
+            ),
+        )
+        rendered = "\n".join(output)
+        self.assertEqual(status, 1)
+        self.assertIn("missing_exact_ack", rendered)
+        self.assertIn("exact_ack_observed=no", rendered)
+        self.assertIn("pre_ack_frames=9", rendered)
+        self.assertIn("post_ack_frames=0", rendered)
+
+    async def test_canonical_missing_ack_policy_retains_safe_observation(
+        self,
+    ) -> None:
+        private_frame = b"PRIVATE PRE ACK FRAME"
+        transport = MissingACKTransport([private_frame])
+        with self.assertRaises(AAPHandshakeTimeoutError) as raised:
+            await AAPHandshakeSession().run(transport)
+        selected = raised.exception.observation
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertFalse(selected.ack_observed)
+        self.assertEqual(selected.pre_ack_frame_count, 1)
+        self.assertEqual(selected.post_ack_frame_count, 0)
+        self.assertEqual(len(selected.pre_ack_frame_summaries), 1)
+        self.assertNotIn(private_frame.hex(), repr(selected))
+
+    async def test_canonical_descriptor_policy_and_timeouts_are_unchanged(
+        self,
+    ) -> None:
+        session = AAPHandshakeSession()
+        self.assertEqual(session._ack_timeout, 5)
+        self.assertEqual(session._descriptor_timeout, 3)
+        transport = MissingACKTransport([AAP_HANDSHAKE_ACK])
+        with self.assertRaises(AAPDescriptorObservationTimeoutError) as raised:
+            await session.run(transport)
+        self.assertTrue(raised.exception.observation.ack_observed)
+        self.assertFalse(raised.exception.observation.evidence.required)
+
+    async def test_pairing_error_never_prints_link_key(self) -> None:
+        secret = "00112233445566778899AABBCCDDEEFF"
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            verbose=True,
+            output=output.append,
+            live_runner=AsyncMock(side_effect=PairingStoreError(secret)),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "REFERENCE HANDSHAKE FAIL: pairing_credentials_unavailable",
+            output,
+        )
+        self.assertNotIn(secret, "\n".join(output))
+
+    async def test_generic_handshake_failure_has_no_bypass(self) -> None:
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            output=output.append,
+            live_runner=AsyncMock(
+                side_effect=AAPHandshakeError("PRIVATE RAW PAYLOAD")
+            ),
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(output, ["REFERENCE HANDSHAKE FAIL: aap_handshake_failed"])
+
+
+class ReferenceStaticSafetyTests(unittest.TestCase):
+    def test_configuration_experiment_is_reference_probe_only(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        production_sources = (
+            root / "src/airpods_hr/aap_channel.py",
+            root / "src/airpods_hr/authentication.py",
+            root / "src/airpods_hr/monitor_cli.py",
+            root / "tools/probe_bluez_coexistence.py",
+        )
+        for source in production_sources:
+            text = source.read_text(encoding="utf-8")
+            self.assertNotIn("AAPConfigurationDiagnosticStrategy", text)
+            self.assertNotIn("KERNEL_MTU_ONLY", text)
+            self.assertNotIn("ReferenceSDPFootprintStrategy", text)
+            self.assertNotIn("BLUEZ_LIKE", text)
+            self.assertNotIn("PreAuthSequenceStrategy", text)
+            self.assertNotIn("bluez-discovery", text)
+
+    def test_reference_probe_uses_no_coexistence_or_hr_activation_path(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = root / "tools/probe_reference_handshake.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        imported_modules: set[str] = set()
+        imported_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported_modules.add(node.module or "")
+                imported_names.update(alias.name for alias in node.names)
+        self.assertNotIn("airpods_hr.bluez_coexistence", imported_modules)
+        self.assertNotIn("KernelL2CAPTransport", imported_names)
+        self.assertNotIn("HeartRateActivationSession", imported_names)
+        self.assertIn("AAPHandshakeProbeSession", imported_names)
+        self.assertIn("ClassicAuthenticationSession", imported_names)
+        self.assertIn("create_controller_handoff_transport", imported_names)
+
+    def test_protocol_and_normal_monitor_remain_byte_identical(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        expected = {
+            "src/airpods_hr/protocol.py": (
+                "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
+            ),
+            "src/airpods_hr/monitor_cli.py": (
+                "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
+            ),
+        }
+        for relative_path, expected_hash in expected.items():
+            self.assertEqual(
+                hashlib.sha256((root / relative_path).read_bytes()).hexdigest(),
+                expected_hash,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
