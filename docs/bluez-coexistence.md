@@ -7,6 +7,11 @@ isolated feasibility path in `tools/probe_bluez_coexistence.py`. The existing
 still uses controller handoff. This task does not define a public transport or
 heart-rate library API.
 
+A final hardware PASS. The corrected kernel coexistence path
+completed the canonical descriptor handshake and received real heart-rate
+reports while BlueZ retained controller ownership and normal AirPods audio
+continued without interruption.
+
 ## Transport and compatibility identity
 
 The default live probe requires exactly one paired AirPods candidate that is
@@ -565,16 +570,35 @@ A secondary untested transcript difference remains in the host L2CAP Extended
 Features response: reference reported `0x000000A8`, while BlueZ reported
 `0x000002B8`. receive-MTU experiment does not alter or interpret that mask.
 
-Canonical descriptor completion and HR through coexistence remain unproven.
-Therefore has not passed its full hardware feasibility gate.
+## Final hardware result
 
-## Feasibility unknowns
+Validated on real AirPods Pro hardware. The kernel local
+receive summary reported `before_imtu=672`, `after_imtu=2048`, every other
+`l2cap_options` field preserved, and `verified=yes`. The selected local adapter
+route was confirmed, the exact canonical AAP ACK arrived, the canonical
+descriptor handshake completed, and canonical HR activation was acknowledged.
+The probe received five of five requested reports, including BPM values 169,
+137, 112, 85, and 85, with sequences 0 through 4 and exact 18-byte raw reports.
 
-Bluetooth hardware operations require real hardware. The current
-evidence gap is whether the corrected real kernel socket advertises MTU 2048
-and then completes descriptors and receives real HR reports while the existing
-BlueZ connection and audio remain uninterrupted. The read-only SDP audit
-preserves attributes unavailable through its chosen API as unknown; the
-separate owner inspection above supplies observed critical values without
-claiming complete record equality. All experiments leave default protocol
-acceptance, canonical activation, and the selected backend unchanged.
+A later validation after a normal BlueZ disconnect/reconnect again completed
+the descriptor handshake and received five of five reports, including BPM
+values 169, 145, 120, 101, and 106. During the successful runs, BlueZ remained
+reachable, the adapter remained powered, `Device1.Connected` remained true,
+and observed uninterrupted normal AirPods audio. Cleanup preserved
+the BlueZ connection and audio connectivity. BlueZ retained controller
+ownership throughout, so A final hardware PASS.
+
+One lifecycle nuance remains. After a successful coexistence session,
+immediately starting a new probe process on the same BlueZ connection can
+receive the exact AAP ACK but time out waiting for descriptors. A normal BlueZ
+disconnect/reconnect restored full descriptor completion on the same corrected
+`imtu=2048` path. This suggests an AAP descriptor-bootstrap or channel-lifecycle
+state issue across separate channel opens; it does not invalidate the proven
+coexistence result. telemetry semantics captures should begin after a fresh
+normal BlueZ reconnect. Experiments that compare multiple HR activations should
+keep one AAP PSM `0x1001` channel open instead of reopening it between cycles.
+
+The read-only SDP audit continues to preserve attributes unavailable through
+its chosen API as unknown. Separate owner inspection supplies the observed
+critical values without claiming complete record equality. No public transport
+or heart-rate API is frozen by this feasibility result.
