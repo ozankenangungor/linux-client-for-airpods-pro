@@ -53,6 +53,52 @@ Not yet implemented:
 - Daemon operation and API/SDK integration.
 - A user-friendly installer.
 
+## Experimental BlueZ coexistence probe
+
+Adds a separate production-candidate transport experiment. The
+existing `airpods-hr monitor` command continues to use the known-good Bumble
+research backend, which temporarily takes direct controller ownership. Its
+backend and lifecycle have not changed.
+
+The coexistence probe instead leaves BlueZ active and opens an outgoing Linux
+kernel `AF_BLUETOOTH` / `SOCK_SEQPACKET` / `BTPROTO_L2CAP` socket to AAP PSM
+`0x1001` on the already paired and connected link. It asks the kernel for
+medium Bluetooth security and never reads a LinkKey. Before opening the socket,
+it compares the four compatibility service UUIDs from the accepted Bumble SDP
+identity with `Adapter1.UUIDs`; only missing records are temporarily registered
+through BlueZ `ProfileManager1`. All probe-owned profiles and the L2CAP socket
+are removed during cleanup. The probe does not disconnect the AirPods, power
+the adapter off, acquire an HCI user channel, or fall back to Bumble.
+
+Review the deterministic no-access plan:
+
+```console
+PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py
+```
+
+You can run the opt-in experiment, without `sudo` first, while the
+AirPods are already connected through BlueZ and continuous audio is playing:
+
+```console
+PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py --execute --samples 5
+```
+
+Only if that command fails solely with an access or capability error should
+retry the same operation with elevated privileges:
+
+```console
+sudo env PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py --execute --samples 5 --verbose
+```
+
+The probe reports BlueZ reachability, adapter power, and
+`Device1.Connected` at every phase and after cleanup. Hardware feasibility is
+not yet validated. A successful owner run must receive at least three
+canonical heart-rate reports, preferably five, retain the BlueZ connection at
+every checkpoint, and leave real audio uninterrupted. No public coexistence or
+heart-rate library API is frozen by this experiment. See
+[docs/bluez-coexistence.md](docs/bluez-coexistence.md) for the complete owner
+procedure and current feasibility unknowns.
+
 ## Continuous monitor command
 
 Install the package and its declared runtime dependencies in an isolated
