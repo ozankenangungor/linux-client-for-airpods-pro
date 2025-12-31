@@ -9,21 +9,36 @@ import unittest
 from contextlib import asynccontextmanager
 
 
-from airpods_hr.aap import AAPDescriptorObservationTimeoutError, AAPHandshakeResult, DescriptorEvidence, HandshakeObservation
-
-
+from airpods_hr.aap import (
+    AAP_HANDSHAKE_ACK,
+    AAPDescriptorObservationTimeoutError,
+    AAPHandshakeResult,
+    AAPHandshakeSession,
+    DescriptorEvidence,
+    HandshakeObservation,
+)
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import (
     BlueZCoexistenceState,
     KernelL2CAPLocalRXObservation,
 )
 from airpods_hr.discovery import AirPodsCandidate
+from airpods_hr.heart_rate_session import (
+    CONNECT4_ACK,
+    HeartRateMonitorActivationSession,
+    HeartRateMonitorSessionResult,
+    HeartRateProgress,
+)
+from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
+from airpods_hr.production_session import InternalProductionSession, ProductionSessionCategory, ProductionSessionError, ProductionSessionState, ProductionSessionStateError
 
 
-from airpods_hr.production_session import InternalProductionSession, ProductionSessionCategory, ProductionSessionError, ProductionSessionState
-
-
-from airpods_hr.protocol import HeartRateCommand
+from airpods_hr.protocol import (
+    HEART_RATE_MARKER,
+    HEART_RATE_REPORT_ID,
+    HEART_RATE_REPORT_SIZE,
+    HeartRateCommand,
+)
 
 
 LOCAL_ADDRESS = "00:11:22:33:44:55"
@@ -44,6 +59,64 @@ def candidate() -> AirPodsCandidate:
 
 def state(*, connected: bool = True, powered: bool = True):
     return BlueZCoexistenceState(candidate(), powered, connected, frozenset())
+
+
+def raw_report(
+    bpm: int,
+    sequence: int,
+    *,
+    field_5: int = 1,
+    timestamp_ticks: int = 100,
+    flags: int = 0x1000,
+) -> bytes:
+    report = bytearray(HEART_RATE_REPORT_SIZE)
+    report[0] = HEART_RATE_REPORT_ID
+    report[1] = bpm
+    report[2] = 20
+    report[3:5] = sequence.to_bytes(2, "little")
+    report[5] = field_5
+    report[6:14] = timestamp_ticks.to_bytes(8, "little")
+    report[14:18] = flags.to_bytes(4, "little")
+    return bytes(report)
+
+
+def parsed_report(*args, **kwargs) -> HeartRateReport:
+    return parse_heart_rate_packet(
+        HEART_RATE_MARKER + raw_report(*args, **kwargs)
+    )
+
+
+def heart_rate_packet(*args, **kwargs) -> bytes:
+    return b"outer" + HEART_RATE_MARKER + raw_report(*args, **kwargs)
+
+
+def service_ack(service_id: int) -> bytes:
+    return bytes.fromhex(
+        "04 00 04 00 17 00 00 00 10 00 08 00 08 01 10 01 4a 02 08"
+    ) + bytes((service_id,))
+
+
+def descriptor_frame() -> bytes:
+    return (
+        b"AccessoryService devmotion6 MaxReportSize ReportDescriptor "
+        b"HeartRateService HeartRate com.apple.hid.heartrate-access"
+    )
+
+
+def activation_frames(reports: list[bytes]) -> list[bytes]:
+    return [
+        service_ack(0x0E),
+        CONNECT4_ACK,
+        service_ack(0x13),
+        *reports,
+    ]
+
+
+async def stop_with_ack(
+    session: InternalProductionSession, transport: FakeTransport
+) -> None:
+    transport.add_frames([b"wake stream receiver", service_ack(0x13)])
+    await session.stop()
 
 
 class FakeClient:
@@ -238,7 +311,17 @@ def make_session(
 
 
 class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
-
+    async def test_initial_state_and_invalid_operations(self) -> None:
+        session, *_ = make_session()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+        with self.assertRaises(ProductionSessionStateError):
+            await session.start()
+        with self.assertRaises(ProductionSessionStateError):
+            await session.receive_report()
+        with self.assertRaises(ProductionSessionStateError):
+            await session.stop()
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
 
     async def test_open_order_once_and_descriptor_gated_ready(self) -> None:
         session, client, registration, transport, handshake, events = make_session()
@@ -387,5 +470,208 @@ class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
                     )
                 else:
                     self.assertEqual(transport.close_calls, 0)
+
+    async def test_activation_failure_fails_closed_without_reopening(self) -> None:
+        class FailedMonitor:
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake, stop_event
+                raise RuntimeError("activation failed")
+
+        session, client, registration, transport, handshake, _ = make_session(
+            monitor_factory=lambda progress: FailedMonitor()
+        )
+        await session.open()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.start()
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.ACTIVATION_FAILED,
+        )
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertEqual(len(transport.open_calls), 1)
+        self.assertEqual(handshake.calls, 1)
+        self.assertEqual(transport.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(client.close_calls, 1)
+
+
+class ProductionSessionStreamingTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def monitor_factory(progress):
+        return HeartRateMonitorActivationSession(
+            progress=progress,
+            minimum_bootstrap_seconds=0,
+            receive_poll_interval=0.01,
+        )
+
+    async def test_first_169_and_duplicates_are_returned_unchanged_in_order(
+        self,
+    ) -> None:
+        first = parsed_report(169, 0)
+        duplicate = parsed_report(169, 0)
+        session, _, _, transport, _, _ = make_session(
+            frames=activation_frames(
+                [
+                    b"prefix" + HEART_RATE_MARKER + first.raw_report,
+                    b"prefix" + HEART_RATE_MARKER + duplicate.raw_report,
+                ]
+            ),
+            monitor_factory=self.monitor_factory,
+        )
+        await session.open()
+        await session.start()
+        self.assertIs(session.state, ProductionSessionState.STREAMING)
+        observed_first = await session.receive_report(timeout=1)
+        observed_second = await session.receive_report(timeout=1)
+        self.assertIsInstance(observed_first, HeartRateReport)
+        self.assertEqual(observed_first, first)
+        self.assertEqual(observed_second, duplicate)
+        self.assertEqual(observed_first.bpm, 169)
+        self.assertEqual(observed_first.raw_report, first.raw_report)
+        await stop_with_ack(session, transport)
+        self.assertIs(session.state, ProductionSessionState.READY)
+        await session.close()
+
+    async def test_start_remains_starting_until_activation_ack(self) -> None:
+        activation_gate = asyncio.Event()
+
+        class GatedMonitor:
+            def __init__(self, progress) -> None:
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake
+                await activation_gate.wait()
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await stop_event.wait()
+                self.progress(HeartRateProgress.STOP_ACKNOWLEDGED, None)
+                self.progress(HeartRateProgress.HR_OFF_SENT, None)
+                return HeartRateMonitorSessionResult(
+                    samples_observed=0,
+                    stop_acknowledged=True,
+                    application_payloads_sent=10,
+                    control_frames_observed=0,
+                    non_hr_frames=0,
+                    malformed_hr_frames=0,
+                )
+
+        session, _, _, _, _, _ = make_session(
+            monitor_factory=GatedMonitor
+        )
+        await session.open()
+        starting = asyncio.create_task(session.start())
+        await asyncio.sleep(0)
+        self.assertIs(session.state, ProductionSessionState.STARTING)
+        activation_gate.set()
+        await starting
+        self.assertIs(session.state, ProductionSessionState.STREAMING)
+        await session.stop()
+        self.assertIs(session.state, ProductionSessionState.READY)
+        await session.close()
+
+    async def test_concurrent_report_consumer_is_rejected_deterministically(
+        self,
+    ) -> None:
+        session, _, _, transport, _, _ = make_session(
+            frames=activation_frames([]),
+            monitor_factory=self.monitor_factory,
+        )
+        await session.open()
+        await session.start()
+        first_consumer = asyncio.create_task(session.receive_report(timeout=1))
+        await asyncio.sleep(0)
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.receive_report(timeout=1)
+        self.assertEqual(
+            raised.exception.category, ProductionSessionCategory.INVALID_STATE
+        )
+        first_consumer.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_consumer
+        transport.add_frames([heart_rate_packet(70, 1)])
+        self.assertEqual((await session.receive_report(timeout=1)).bpm, 70)
+        await stop_with_ack(session, transport)
+        await session.close()
+
+    async def test_three_cycles_share_transport_and_handshake(self) -> None:
+        session, _, registration, transport, _, _ = make_session(
+            frames=[AAP_HANDSHAKE_ACK, descriptor_frame()],
+            handshake=AAPHandshakeSession(),
+            monitor_factory=self.monitor_factory,
+        )
+        await session.open()
+        samples: list[HeartRateReport] = []
+        for cycle in range(3):
+            reports = [
+                heart_rate_packet(169 if index == 0 else 80 + index, index)
+                for index in range(5)
+            ]
+            transport.add_frames(activation_frames(reports))
+            await session.start()
+            for _ in range(5):
+                samples.append(await session.receive_report(timeout=1))
+            await stop_with_ack(session, transport)
+            self.assertIs(session.state, ProductionSessionState.READY)
+
+        self.assertEqual(len(samples), 15)
+        self.assertEqual([samples[i].bpm for i in (0, 5, 10)], [169, 169, 169])
+        self.assertEqual(session.counters.transport_opens, 1)
+        self.assertEqual(session.counters.descriptor_handshakes, 1)
+        self.assertEqual(session.counters.hr_activations, 3)
+        self.assertEqual(session.counters.hr_stops, 3)
+        self.assertEqual(session.counters.reports_received, 15)
+        self.assertEqual(len(transport.open_calls), 1)
+        self.assertEqual(transport.collect_entries, 1)
+        self.assertEqual(transport.commands, list(HeartRateCommand) * 3)
+        self.assertEqual(transport.close_calls, 0)
+        self.assertEqual(registration.unregister_calls, 0)
+        await session.close()
+        self.assertEqual(transport.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+
+    async def test_close_from_streaming_stops_before_transport_and_is_idempotent(
+        self,
+    ) -> None:
+        events: list[str] = []
+        session, _, _, transport, _, events = make_session(
+            events=events,
+            frames=activation_frames([heart_rate_packet(70, 0)]),
+            monitor_factory=self.monitor_factory,
+        )
+        await session.open()
+        await session.start()
+        await session.receive_report(timeout=1)
+        transport.add_frames([b"wake stream receiver", service_ack(0x13)])
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+        self.assertEqual(session.counters.hr_stops, 1)
+        self.assertEqual(
+            transport.commands[-2:],
+            [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
+        )
+        self.assertLess(
+            events.index("collect_exit"), events.index("transport_close")
+        )
+        self.assertEqual(transport.close_calls, 1)
+        await session.close()
+        self.assertEqual(transport.close_calls, 1)
+
+    async def test_cancelled_receive_leaves_no_competing_consumer(self) -> None:
+        session, _, _, transport, _, _ = make_session(
+            frames=activation_frames([]),
+            monitor_factory=self.monitor_factory,
+        )
+        await session.open()
+        await session.start()
+        pending = asyncio.create_task(session.receive_report(timeout=5))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        transport.add_frames([heart_rate_packet(90, 0)])
+        report = await session.receive_report(timeout=1)
+        self.assertEqual(report.bpm, 90)
+        await stop_with_ack(session, transport)
+        await session.close()
 
 

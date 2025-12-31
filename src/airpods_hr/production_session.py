@@ -31,6 +31,7 @@ from airpods_hr.heart_rate_session import (
     HeartRateProgress,
 )
 from airpods_hr.heartrate import HeartRateReport
+from airpods_hr.protocol import HeartRateCommand
 
 
 DEFAULT_REPORT_TIMEOUT = 5.0
@@ -95,6 +96,31 @@ class ProductionSessionCounters:
     hr_activations: int
     hr_stops: int
     reports_received: int
+
+
+class _ActivationTransportView:
+    """Rebase the canonical per-activation payload counter on one channel."""
+
+    def __init__(self, transport: CoexistenceTransport) -> None:
+        self._transport = transport
+        self._starting_payload_count = transport.application_payloads_sent
+
+    @property
+    def application_payloads_sent(self) -> int:
+        return 1 + (
+            self._transport.application_payloads_sent
+            - self._starting_payload_count
+        )
+
+    @property
+    def pending_receive_frames(self) -> int:
+        return self._transport.pending_receive_frames
+
+    def send_heart_rate_command(self, command: HeartRateCommand) -> None:
+        self._transport.send_heart_rate_command(command)
+
+    async def receive(self, timeout: float) -> bytes:
+        return await self._transport.receive(timeout)
 
 
 MonitorFactory = Callable[
@@ -246,6 +272,129 @@ class InternalProductionSession:
             self.state = ProductionSessionState.READY
             self._output("SESSION READY: descriptor handshake complete")
 
+    async def start(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is not ProductionSessionState.READY:
+                raise ProductionSessionStateError("start", self.state)
+            assert self._handshake is not None
+            self.state = ProductionSessionState.STARTING
+            loop = asyncio.get_running_loop()
+            self._activation_stop = asyncio.Event()
+            self._activation_started = loop.create_future()
+            self._reports = asyncio.Queue()
+
+            def progress(
+                event: HeartRateProgress, report: HeartRateReport | None
+            ) -> None:
+                if event is HeartRateProgress.START_ACKNOWLEDGED:
+                    if not self._activation_started.done():
+                        self._activation_started.set_result(None)
+                elif event is HeartRateProgress.SAMPLE and report is not None:
+                    assert self._reports is not None
+                    self._reports.put_nowait(report)
+
+            monitor = self._monitor_factory(progress)
+            transport_view = _ActivationTransportView(self._transport)
+            self._activation_task = asyncio.create_task(
+                monitor.run_collected(
+                    transport_view,
+                    self._handshake,
+                    self._activation_stop,
+                ),
+                name="airpods-hr-production-activation",
+            )
+            try:
+                await self._wait_for_activation_start()
+            except BaseException as error:
+                await self._abort_activation()
+                cleanup_errors = await self._cleanup_resources()
+                self.state = ProductionSessionState.FAILED
+                self._annotate_cleanup(error, cleanup_errors)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                if isinstance(error, ProductionSessionError):
+                    raise
+                raise ProductionSessionError(
+                    ProductionSessionCategory.ACTIVATION_FAILED,
+                    "start",
+                    type(error).__name__,
+                ) from error
+            self._hr_activations += 1
+            self.state = ProductionSessionState.STREAMING
+
+    async def receive_report(
+        self, timeout: float = DEFAULT_REPORT_TIMEOUT
+    ) -> HeartRateReport:
+        if timeout <= 0:
+            raise ValueError("report timeout must be positive")
+        if self.state is not ProductionSessionState.STREAMING:
+            raise ProductionSessionStateError("receive_report", self.state)
+        if self._receive_in_progress:
+            raise ProductionSessionError(
+                ProductionSessionCategory.INVALID_STATE,
+                "receive_report",
+                "another report consumer is active",
+            )
+        assert self._reports is not None
+        assert self._activation_task is not None
+        self._receive_in_progress = True
+        get_task = asyncio.create_task(self._reports.get())
+        try:
+            done, _ = await asyncio.wait(
+                {get_task, self._activation_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if get_task in done:
+                report = get_task.result()
+                self._reports_received += 1
+                return report
+            if self._activation_task in done:
+                try:
+                    self._activation_task.result()
+                except BaseException as error:
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    self.state = ProductionSessionState.FAILED
+                    raise ProductionSessionError(
+                        ProductionSessionCategory.RECEIVE_FAILED,
+                        "receive_report",
+                        type(error).__name__,
+                    ) from error
+                raise ProductionSessionError(
+                    ProductionSessionCategory.RECEIVE_FAILED,
+                    "receive_report",
+                    "activation ended before a report arrived",
+                )
+            raise TimeoutError("no heart-rate report arrived before timeout")
+        finally:
+            if not get_task.done():
+                get_task.cancel()
+                try:
+                    await get_task
+                except asyncio.CancelledError:
+                    pass
+            self._receive_in_progress = False
+
+    async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is not ProductionSessionState.STREAMING:
+                raise ProductionSessionStateError("stop", self.state)
+            try:
+                await self._stop_locked()
+            except BaseException as error:
+                cleanup_errors = await self._cleanup_resources()
+                self.state = ProductionSessionState.FAILED
+                self._annotate_cleanup(error, cleanup_errors)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                if isinstance(error, ProductionSessionError):
+                    raise
+                raise ProductionSessionError(
+                    ProductionSessionCategory.STOP_FAILED,
+                    "stop",
+                    type(error).__name__,
+                ) from error
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
@@ -271,6 +420,22 @@ class InternalProductionSession:
                     type(errors[-1]).__name__,
                 ) from errors[-1]
 
+    async def _wait_for_activation_start(self) -> None:
+        assert self._activation_started is not None
+        assert self._activation_task is not None
+        done, _ = await asyncio.wait(
+            {self._activation_started, self._activation_task},
+            timeout=self._start_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise TimeoutError("HR activation acknowledgement timed out")
+        if self._activation_task in done:
+            self._activation_task.result()
+            raise RuntimeError("HR activation ended before streaming")
+        self._activation_started.result()
+        if self._activation_task.done():
+            self._activation_task.result()
 
     async def _stop_locked(self) -> None:
         assert self._activation_stop is not None
