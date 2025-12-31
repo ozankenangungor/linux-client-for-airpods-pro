@@ -487,24 +487,27 @@ The extracted HCI teardown evidence showed host-issued disconnect commands and
 the reason `Connection Terminated By Local Host`. It does not support claiming
 that the AirPods initiated those disconnects.
 
-The coexistence `btmon` capture also showed the AirPods issue an SDP
+An older, contaminated coexistence `btmon` capture contained an SDP
 `ServiceSearchAttributeRequest` with search pattern L2CAP UUID `0x0100`, maximum
-attribute byte count 65535, and full attribute range `0x0000ffff`. The BlueZ
-response was paginated across multiple roughly 250-byte continuation pages.
-This proves the peer inspects a broad L2CAP-visible part of the host SDP
-capability footprint rather than querying only Public Browse Group `0x1002`.
+attribute byte count 65535, and full attribute range `0x0000ffff`; its response
+used multiple continuation pages. Later clean captures do not support treating
+that broad query as part of the causal BlueZ failure. The clean reference PASS
+and BlueZ FAIL runs instead issued the same targeted set of nine SDP
+request/response exchanges.
 
 The private reference diagnostic now observes the same allowlisted query
 metadata and compares its exact four-record footprint with a bounded expanded
 set. A dedicated slot always retains the L2CAP `0x0100` full-attribute query,
 even after the general summary limit or across continuation pages. It reports
 UUIDs, attribute ranges, maximum byte count, continuation use, match count, and
-computed response size without retaining SDP packet payloads. The footprint
-remains an extra-record experiment rather than a complete BlueZ SDP clone.
-Clean targeted request/response decoding subsequently matched between a
-reference descriptor PASS and a BlueZ descriptor FAIL, and the expanded
-`bluez-like` reference experiment also completed all descriptors. These results
-make the added SDP footprint unlikely to explain the current difference.
+computed response size without retaining SDP packet payloads. This preserves a
+diagnostic for the historical query but does not make it causal evidence. The
+footprint remains an extra-record experiment rather than a complete BlueZ SDP
+clone. Clean targeted request/response decoding subsequently matched across all
+nine exchanges between a reference descriptor PASS and a BlueZ descriptor
+FAIL, and the expanded `bluez-like` reference experiment also completed all
+descriptors. These results make the added SDP footprint unlikely to explain the
+current difference.
 
 The same clean captures showed identical HCI Create Connection parameters:
 packet type `0xcc18`, page scan repetition mode R2, mandatory page scan mode,
