@@ -1,0 +1,454 @@
+"""Private persistent BlueZ/kernel heart-rate session core.
+
+This module is deliberately not exported from :mod:`airpods_hr`.  It validates a long-lived AAP lifecycle before any public API is fixed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
+
+from airpods_hr.aap import AAPHandshakeResult, AAPHandshakeSession
+from airpods_hr.bluez_coexistence import (
+    DEFAULT_DBUS_TIMEOUT,
+    DEFAULT_HANDSHAKE_TIMEOUT,
+    DEFAULT_L2CAP_CONNECT_TIMEOUT,
+    BlueZCoexistenceState,
+    BlueZCompatibilityRegistration,
+    BlueZStateClient,
+    CoexistenceTransport,
+    CompatibilityRegistration,
+    DBusNextBlueZCoexistenceClient,
+    KernelL2CAPTransport,
+)
+from airpods_hr.heart_rate_session import (
+    HeartRateMonitorActivationSession,
+    HeartRateMonitorSessionResult,
+    HeartRateProgress,
+)
+from airpods_hr.heartrate import HeartRateReport
+
+
+DEFAULT_REPORT_TIMEOUT = 5.0
+DEFAULT_START_TIMEOUT = 15.0
+DEFAULT_STOP_TIMEOUT = 5.0
+EXPECTED_LOCAL_RX_IMTU = 2048
+
+
+class ProductionSessionState(StrEnum):
+    CLOSED = "closed"
+    OPENING = "opening"
+    READY = "ready"
+    STARTING = "starting"
+    STREAMING = "streaming"
+    STOPPING = "stopping"
+    FAILED = "failed"
+
+
+class ProductionSessionCategory(StrEnum):
+    INVALID_STATE = "invalid_state"
+    PREFLIGHT_FAILED = "preflight_failed"
+    REGISTRATION_FAILED = "registration_failed"
+    TRANSPORT_FAILED = "transport_failed"
+    DESCRIPTOR_HANDSHAKE_FAILED = "descriptor_handshake_failed"
+    ACTIVATION_FAILED = "activation_failed"
+    RECEIVE_FAILED = "receive_failed"
+    STOP_FAILED = "stop_failed"
+    CLEANUP_FAILED = "cleanup_failed"
+
+
+class ProductionSessionError(RuntimeError):
+    """Typed internal failure containing no private Bluetooth material."""
+
+    def __init__(
+        self,
+        category: ProductionSessionCategory,
+        phase: str,
+        detail: str | None = None,
+    ) -> None:
+        self.category = category
+        self.phase = phase
+        self.detail = detail
+        message = f"{category.value} at {phase}"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
+class ProductionSessionStateError(ProductionSessionError):
+    def __init__(self, operation: str, state: ProductionSessionState) -> None:
+        super().__init__(
+            ProductionSessionCategory.INVALID_STATE,
+            operation,
+            f"state={state.value}",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSessionCounters:
+    transport_opens: int
+    descriptor_handshakes: int
+    hr_activations: int
+    hr_stops: int
+    reports_received: int
+
+
+MonitorFactory = Callable[
+    [Callable[[HeartRateProgress, HeartRateReport | None], None]],
+    HeartRateMonitorActivationSession,
+]
+
+
+class InternalProductionSession:
+    """One AAP connection with repeatable canonical HR activation cycles."""
+
+    def __init__(
+        self,
+        client: BlueZStateClient,
+        registration: CompatibilityRegistration,
+        transport: CoexistenceTransport,
+        handshake: AAPHandshakeSession,
+        *,
+        dbus_timeout: float = DEFAULT_DBUS_TIMEOUT,
+        start_timeout: float = DEFAULT_START_TIMEOUT,
+        stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+        monitor_factory: MonitorFactory | None = None,
+        output: Callable[[str], None] = print,
+    ) -> None:
+        if min(dbus_timeout, start_timeout, stop_timeout) <= 0:
+            raise ValueError("production session timeouts must be positive")
+        self._client = client
+        self._registration = registration
+        self._transport = transport
+        self._handshake_session = handshake
+        self._dbus_timeout = dbus_timeout
+        self._start_timeout = start_timeout
+        self._stop_timeout = stop_timeout
+        self._monitor_factory = monitor_factory or self._make_monitor
+        self._output = output
+
+        self.state = ProductionSessionState.CLOSED
+        self._lifecycle_lock = asyncio.Lock()
+        self._receive_in_progress = False
+        self._open_attempted = False
+        self._client_connected = False
+        self._registration_owned = False
+        self._transport_owned = False
+        self._collection_context: AbstractAsyncContextManager[Any] | None = None
+        self._collection_entered = False
+        self._initial_state: BlueZCoexistenceState | None = None
+        self._handshake: AAPHandshakeResult | None = None
+        self._activation_task: asyncio.Task[HeartRateMonitorSessionResult] | None = None
+        self._activation_stop: asyncio.Event | None = None
+        self._activation_started: asyncio.Future[None] | None = None
+        self._reports: asyncio.Queue[HeartRateReport] | None = None
+        self._transport_opens = 0
+        self._descriptor_handshakes = 0
+        self._hr_activations = 0
+        self._hr_stops = 0
+        self._reports_received = 0
+
+    @property
+    def counters(self) -> ProductionSessionCounters:
+        return ProductionSessionCounters(
+            transport_opens=self._transport_opens,
+            descriptor_handshakes=self._descriptor_handshakes,
+            hr_activations=self._hr_activations,
+            hr_stops=self._hr_stops,
+            reports_received=self._reports_received,
+        )
+
+    async def open(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is not ProductionSessionState.CLOSED:
+                raise ProductionSessionStateError("open", self.state)
+            if self._open_attempted:
+                raise ProductionSessionError(
+                    ProductionSessionCategory.INVALID_STATE,
+                    "open",
+                    "session objects are single-use after close or open failure",
+                )
+            self._open_attempted = True
+            self.state = ProductionSessionState.OPENING
+            phase = "bluez_connect"
+            try:
+                self._output("OPEN SESSION: BlueZ preflight")
+                self._client_connected = True
+                await asyncio.wait_for(
+                    self._client.connect(), timeout=self._dbus_timeout
+                )
+                phase = "preflight"
+                state = await asyncio.wait_for(
+                    self._client.preflight(require_connected=True),
+                    timeout=self._dbus_timeout,
+                )
+                self._initial_state = state
+                self._require_connected(state, phase)
+
+                phase = "compatibility_registration"
+                self._registration_owned = True
+                await self._registration.register(state)
+                await self._checkpoint("after_profile_registration")
+
+                phase = "transport_open"
+                self._transport_owned = True
+                await self._transport.open(
+                    str(state.candidate.adapter_address),
+                    str(state.candidate.address),
+                )
+                self._transport_opens += 1
+                local_rx = self._transport.local_rx_observation
+                if (
+                    not local_rx.verified
+                    or local_rx.after_imtu != EXPECTED_LOCAL_RX_IMTU
+                ):
+                    raise ProductionSessionError(
+                        ProductionSessionCategory.TRANSPORT_FAILED,
+                        "local_rx_imtu",
+                        "kernel local receive MTU verification failed",
+                    )
+                await self._checkpoint("after_transport_open")
+
+                phase = "transport_collection"
+                self._collection_context = self._transport.collect()
+                await self._collection_context.__aenter__()
+                self._collection_entered = True
+
+                phase = "descriptor_handshake"
+                handshake = await self._handshake_session.run_collected(
+                    self._transport
+                )
+                if not handshake.evidence.required:
+                    raise ProductionSessionError(
+                        ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+                        phase,
+                        "canonical descriptor evidence is incomplete",
+                    )
+                self._handshake = handshake
+                self._descriptor_handshakes += 1
+                await self._checkpoint("after_descriptor_handshake")
+            except BaseException as error:
+                cleanup_errors = await self._cleanup_resources()
+                self.state = ProductionSessionState.FAILED
+                self._annotate_cleanup(error, cleanup_errors)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                if isinstance(error, ProductionSessionError):
+                    raise
+                raise ProductionSessionError(
+                    self._open_category(phase), phase, type(error).__name__
+                ) from error
+
+            self.state = ProductionSessionState.READY
+            self._output("SESSION READY: descriptor handshake complete")
+
+
+    async def close(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is ProductionSessionState.CLOSED:
+                return
+            errors: list[BaseException] = []
+            if self.state is ProductionSessionState.STREAMING:
+                try:
+                    await self._stop_locked()
+                except BaseException as error:
+                    errors.append(error)
+            elif self._activation_task is not None:
+                try:
+                    await self._abort_activation()
+                except BaseException as error:
+                    errors.append(error)
+            errors.extend(await self._cleanup_resources())
+            self.state = ProductionSessionState.CLOSED
+            if errors:
+                raise ProductionSessionError(
+                    ProductionSessionCategory.CLEANUP_FAILED,
+                    "close",
+                    type(errors[-1]).__name__,
+                ) from errors[-1]
+
+
+    async def _stop_locked(self) -> None:
+        assert self._activation_stop is not None
+        assert self._activation_task is not None
+        self.state = ProductionSessionState.STOPPING
+        self._activation_stop.set()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(self._activation_task),
+                timeout=self._stop_timeout,
+            )
+        except TimeoutError as error:
+            await self._cancel_activation_task()
+            raise ProductionSessionError(
+                ProductionSessionCategory.STOP_FAILED,
+                "stop",
+                "canonical HR cleanup timed out",
+            ) from error
+        if not result.stop_acknowledged:
+            raise ProductionSessionError(
+                ProductionSessionCategory.STOP_FAILED,
+                "stop",
+                "canonical STOP_HR acknowledgement was not observed",
+            )
+        self._hr_stops += 1
+        self._clear_activation()
+        self.state = ProductionSessionState.READY
+
+    async def _abort_activation(self) -> None:
+        if self._activation_stop is not None:
+            self._activation_stop.set()
+        if self._activation_task is not None and not self._activation_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._activation_task),
+                    timeout=self._stop_timeout,
+                )
+            except BaseException:
+                await self._cancel_activation_task()
+        if self._activation_task is not None and self._activation_task.done():
+            try:
+                result = self._activation_task.result()
+                if result.stop_acknowledged:
+                    self._hr_stops += 1
+            except BaseException:
+                pass
+        self._clear_activation()
+
+    async def _cancel_activation_task(self) -> None:
+        assert self._activation_task is not None
+        self._activation_task.cancel()
+        try:
+            await asyncio.wait_for(
+                self._activation_task,
+                timeout=self._stop_timeout,
+            )
+        except BaseException:
+            pass
+
+    def _clear_activation(self) -> None:
+        self._activation_task = None
+        self._activation_stop = None
+        self._activation_started = None
+        self._reports = None
+
+    async def _cleanup_resources(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        if self._activation_task is not None:
+            try:
+                await self._abort_activation()
+            except BaseException as error:
+                errors.append(error)
+        if self._collection_entered and self._collection_context is not None:
+            try:
+                await self._collection_context.__aexit__(None, None, None)
+            except BaseException as error:
+                errors.append(error)
+            self._collection_entered = False
+        self._collection_context = None
+        if self._transport_owned:
+            try:
+                self._transport.close()
+            except BaseException as error:
+                errors.append(error)
+            self._transport_owned = False
+        if self._registration_owned:
+            try:
+                await self._registration.unregister()
+            except BaseException as error:
+                errors.append(error)
+            self._registration_owned = False
+        if self._client_connected and self._initial_state is not None:
+            try:
+                await self._checkpoint("after_cleanup")
+            except BaseException as error:
+                errors.append(error)
+        if self._client_connected:
+            try:
+                self._client.close()
+            except BaseException as error:
+                errors.append(error)
+            self._client_connected = False
+        return errors
+
+    async def _checkpoint(self, phase: str) -> BlueZCoexistenceState:
+        assert self._initial_state is not None
+        current = await asyncio.wait_for(
+            self._client.snapshot(self._initial_state.candidate),
+            timeout=self._dbus_timeout,
+        )
+        self._require_connected(current, phase)
+        self._output(
+            f"{phase}: BlueZ reachable=yes, adapter powered=yes, "
+            "Device1.Connected=true"
+        )
+        return current
+
+    @staticmethod
+    def _require_connected(state: BlueZCoexistenceState, phase: str) -> None:
+        if not state.adapter_powered or not state.device_connected:
+            raise ProductionSessionError(
+                ProductionSessionCategory.PREFLIGHT_FAILED,
+                phase,
+                "BlueZ adapter or device connection invariant failed",
+            )
+
+    @staticmethod
+    def _open_category(phase: str) -> ProductionSessionCategory:
+        if phase in {"bluez_connect", "preflight"}:
+            return ProductionSessionCategory.PREFLIGHT_FAILED
+        if phase == "compatibility_registration":
+            return ProductionSessionCategory.REGISTRATION_FAILED
+        if phase in {"transport_open", "transport_collection"}:
+            return ProductionSessionCategory.TRANSPORT_FAILED
+        return ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED
+
+    @staticmethod
+    def _annotate_cleanup(
+        primary: BaseException, cleanup_errors: list[BaseException]
+    ) -> None:
+        if cleanup_errors:
+            primary.add_note("production session cleanup also reported an error")
+
+    @staticmethod
+    def _make_monitor(
+        progress: Callable[[HeartRateProgress, HeartRateReport | None], None],
+    ) -> HeartRateMonitorActivationSession:
+        return HeartRateMonitorActivationSession(progress=progress)
+
+
+def create_production_session(
+    *,
+    descriptor_timeout: float = 30.0,
+    dbus_timeout: float = DEFAULT_DBUS_TIMEOUT,
+    connect_timeout: float = DEFAULT_L2CAP_CONNECT_TIMEOUT,
+    handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+    start_timeout: float = DEFAULT_START_TIMEOUT,
+    stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+    output: Callable[[str], None] = print,
+) -> InternalProductionSession:
+    """Compose the private core from the proven production components."""
+
+    client = DBusNextBlueZCoexistenceClient()
+    registration = BlueZCompatibilityRegistration(
+        client, operation_timeout=dbus_timeout
+    )
+    transport = KernelL2CAPTransport(connect_timeout=connect_timeout)
+    handshake = AAPHandshakeSession(
+        ack_timeout=handshake_timeout,
+        descriptor_timeout=descriptor_timeout,
+    )
+    return InternalProductionSession(
+        client,
+        registration,
+        transport,
+        handshake,
+        dbus_timeout=dbus_timeout,
+        start_timeout=start_timeout,
+        stop_timeout=stop_timeout,
+        output=output,
+    )
