@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-
+import ast
+import asyncio
+import hashlib
 import json
 import tempfile
 import unittest
-from contextlib import asynccontextmanager
-
+from contextlib import asynccontextmanager, redirect_stderr
+from io import StringIO
 from pathlib import Path
-
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAPHandshakeSession
@@ -39,6 +41,7 @@ from airpods_hr.protocol import (
     HEART_RATE_REPORT_SIZE,
     HeartRateCommand,
 )
+from tools.probe_hr_semantics import build_parser, main, run_probe
 
 
 LOCAL_ADDRESS = "00:11:22:33:44:55"
@@ -597,3 +600,132 @@ class SemanticsOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.close_calls, 1)
 
 
+class SemanticsProbeTests(unittest.IsolatedAsyncioTestCase):
+    def test_parser_defaults_and_bounds(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertFalse(args.execute)
+        self.assertEqual(args.scenario, "baseline")
+        self.assertEqual(args.samples, 30)
+        self.assertEqual(args.samples_per_cycle, 10)
+        self.assertEqual(args.restart_delay, 5)
+        self.assertEqual(args.descriptor_timeout, 30)
+        restart = build_parser().parse_args(
+            ["--scenario", "activation-restart"]
+        )
+        self.assertEqual(restart.scenario, "activation-restart")
+        for option, value in (
+            ("--samples", "0"),
+            ("--samples", "301"),
+            ("--samples-per-cycle", "0"),
+            ("--restart-delay", "31"),
+            ("--descriptor-timeout", "0"),
+        ):
+            with self.subTest(option=option), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args([option, value])
+
+    async def test_dry_run_creates_no_backend_or_file(self) -> None:
+        runner = AsyncMock()
+        output: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dry-run.jsonl"
+            status = await run_probe(
+                execute=False,
+                scenario=HRSemanticsScenario.ACTIVATION_RESTART,
+                output_path=target,
+                output=output.append,
+                live_runner=runner,
+            )
+            self.assertFalse(target.exists())
+        self.assertEqual(status, 0)
+        runner.assert_not_awaited()
+        rendered = "\n".join(output)
+        self.assertIn("AAP channels=1; descriptor handshakes=1", rendered)
+        self.assertIn("reports_per_cycle=10", rendered)
+        self.assertIn("kernel_local_rx_imtu=2048", rendered)
+
+    def test_main_default_is_deterministic_and_non_live(self) -> None:
+        first = StringIO()
+        second = StringIO()
+        self.assertEqual(main([], stream=first), 0)
+        self.assertEqual(main([], stream=second), 0)
+        self.assertEqual(first.getvalue(), second.getvalue())
+        self.assertIn("DRY RUN", first.getvalue())
+
+
+class SemanticsStaticSafetyTests(unittest.TestCase):
+    def test_frozen_protocol_parser_transport_and_monitor_hashes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        expected = {
+            "src/airpods_hr/protocol.py": (
+                "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
+            ),
+            "src/airpods_hr/monitor_cli.py": (
+                "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
+            ),
+            "src/airpods_hr/bluez_coexistence.py": (
+                "55824df2b95d698e60e972d52c500c7ef3e5901cb75793663bd6d9401e26305d"
+            ),
+            "src/airpods_hr/heartrate.py": (
+                "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
+            ),
+            "src/airpods_hr/aap.py": (
+                "a48cbb25a76e85d251d02611f04cd344b4f1704176b3a501226ab9dd1de2d28b"
+            ),
+            "src/airpods_hr/heart_rate_session.py": (
+                "80e7031a8688444180dd23e3c22c9d7a062009869403aeb257602c07f547bf8f"
+            ),
+            "src/airpods_hr/aap_config_diagnostics.py": (
+                "a5db6e50e14cc08f78bc0218f7c7ae7411739cfa644c9203e6f1f1c4a7a1970d"
+            ),
+            "src/airpods_hr/aap_local_rx_diagnostics.py": (
+                "40b5f39c3737eec4cd132804b2dfbfe57c7c2180265b15d7987139a876830d1e"
+            ),
+            "src/airpods_hr/pre_aap_diagnostics.py": (
+                "0b37874aa7136a4ef754974d873d064ad92027c01a4f263efc4dd214c9479782"
+            ),
+            "src/airpods_hr/pre_auth_diagnostics.py": (
+                "c0331641dad21cd9ace2e0708e8586c50863b4cc9c5a5b2bf1792661e6ec0d4c"
+            ),
+            "src/airpods_hr/reference_sdp_footprint.py": (
+                "3dab4655a72d2e97877691cb3a0d1b73d2d16ba35c02d2f98b4218cd68447325"
+            ),
+            "tools/probe_reference_handshake.py": (
+                "3928019cb5bd8948935d80aa6bd37e7ec6f109811160464d8f214004f717cb66"
+            ),
+        }
+        for relative, digest in expected.items():
+            self.assertEqual(
+                hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+                digest,
+            )
+
+    def test_semantics_path_has_no_bumble_handoff_or_pairing_dependency(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = (
+            root / "src/airpods_hr/hr_semantics.py",
+            root / "tools/probe_hr_semantics.py",
+        )
+        forbidden_modules = {
+            "airpods_hr.authentication",
+            "airpods_hr.bluetooth",
+            "airpods_hr.bumble_keys",
+            "airpods_hr.pairing",
+            "airpods_hr.reference_sdp_footprint",
+        }
+        for source in sources:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            imports = {
+                node.module or ""
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+            }
+            self.assertTrue(forbidden_modules.isdisjoint(imports))
+        self.assertNotIn("ControllerHandoff", "".join(s.read_text() for s in sources))
+        self.assertNotIn("HCI_CHANNEL_USER", "".join(s.read_text() for s in sources))
+
+
+if __name__ == "__main__":
+    unittest.main()

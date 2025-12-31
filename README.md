@@ -156,6 +156,11 @@ When the monitor runs under `sudo`, normal Unix behavior usually makes the new
 file root-owned. Diagnostic capture preserves received values without
 filtering, smoothing, startup suppression, or outlier rejection.
 
+Adds a separate private BlueZ-coexistence semantics capture tool for
+ordered baseline and same-AAP-channel restart experiments. It does not change
+the monitor or assign meanings to unresolved report fields. See
+[docs/hr-semantics.md](docs/hr-semantics.md).
+
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program
 does not invoke `sudo` or perform privilege escalation. There is no automatic
