@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-
+import ast
 import asyncio
-
+import hashlib
 import unittest
-from contextlib import asynccontextmanager
-
+from contextlib import asynccontextmanager, redirect_stderr
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from airpods_hr.aap import (
     AAP_HANDSHAKE_ACK,
@@ -30,15 +33,21 @@ from airpods_hr.heart_rate_session import (
     HeartRateProgress,
 )
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
-from airpods_hr.production_session import InternalProductionSession, ProductionSessionCategory, ProductionSessionError, ProductionSessionState, ProductionSessionStateError
-
-
+from airpods_hr.production_session import (
+    InternalProductionSession,
+    ProductionSessionCategory,
+    ProductionSessionCounters,
+    ProductionSessionError,
+    ProductionSessionState,
+    ProductionSessionStateError,
+)
 from airpods_hr.protocol import (
     HEART_RATE_MARKER,
     HEART_RATE_REPORT_ID,
     HEART_RATE_REPORT_SIZE,
     HeartRateCommand,
 )
+from tools.probe_production_session import build_parser, main, run_probe
 
 
 LOCAL_ADDRESS = "00:11:22:33:44:55"
@@ -675,3 +684,171 @@ class ProductionSessionStreamingTests(unittest.IsolatedAsyncioTestCase):
         await session.close()
 
 
+class ProductionProbeTests(unittest.IsolatedAsyncioTestCase):
+    def test_probe_defaults_and_bounds(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertFalse(args.execute)
+        self.assertEqual(args.cycles, 3)
+        self.assertEqual(args.samples_per_cycle, 5)
+        self.assertEqual(args.restart_delay, 5)
+        self.assertEqual(args.descriptor_timeout, 30)
+        for option, value in (
+            ("--cycles", "0"),
+            ("--samples-per-cycle", "0"),
+            ("--restart-delay", "31"),
+            ("--descriptor-timeout", "0"),
+        ):
+            with self.subTest(option=option), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args([option, value])
+
+    async def test_dry_run_never_constructs_session(self) -> None:
+        factory = unittest.mock.Mock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=False,
+            output=output.append,
+            session_factory=factory,
+        )
+        self.assertEqual(status, 0)
+        factory.assert_not_called()
+        rendered = "\n".join(output)
+        self.assertIn("AAP channels=1; descriptor handshakes=1", rendered)
+        self.assertIn("cycles=3; samples_per_cycle=5", rendered)
+        self.assertIn("kernel_local_rx_imtu=2048", rendered)
+
+    async def test_execute_reports_three_cycles_on_one_session(self) -> None:
+        class FakeProbeSession:
+            def __init__(self) -> None:
+                self.opens = 0
+                self.activations = 0
+                self.stops = 0
+                self.reports = 0
+                self.close_calls = 0
+
+            @property
+            def counters(self) -> ProductionSessionCounters:
+                return ProductionSessionCounters(
+                    transport_opens=self.opens,
+                    descriptor_handshakes=self.opens,
+                    hr_activations=self.activations,
+                    hr_stops=self.stops,
+                    reports_received=self.reports,
+                )
+
+            async def open(self) -> None:
+                self.opens += 1
+
+            async def start(self) -> None:
+                self.activations += 1
+
+            async def receive_report(self, timeout: float) -> HeartRateReport:
+                del timeout
+                self.reports += 1
+                return parsed_report(169, (self.reports - 1) % 5)
+
+            async def stop(self) -> None:
+                self.stops += 1
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        fake = FakeProbeSession()
+        factory = unittest.mock.Mock(return_value=fake)
+        sleep = AsyncMock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            cycles=3,
+            samples_per_cycle=5,
+            restart_delay=5,
+            output=output.append,
+            session_factory=factory,
+            sleep=sleep,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(fake.opens, 1)
+        self.assertEqual(fake.activations, 3)
+        self.assertEqual(fake.stops, 3)
+        self.assertEqual(fake.reports, 15)
+        self.assertEqual(fake.close_calls, 1)
+        self.assertEqual(sleep.await_count, 2)
+        self.assertIn("PERSISTENT SESSION PASS", output)
+
+    def test_main_default_is_deterministic_dry_run(self) -> None:
+        first = StringIO()
+        second = StringIO()
+        self.assertEqual(main([], stream=first), 0)
+        self.assertEqual(main([], stream=second), 0)
+        self.assertEqual(first.getvalue(), second.getvalue())
+        self.assertIn("DRY RUN", first.getvalue())
+
+
+class ProductionStaticSafetyTests(unittest.TestCase):
+    def test_frozen_protocol_parser_transport_monitor_and_semantics_hashes(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        expected = {
+            "src/airpods_hr/protocol.py": (
+                "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
+            ),
+            "src/airpods_hr/heartrate.py": (
+                "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
+            ),
+            "src/airpods_hr/bluez_coexistence.py": (
+                "55824df2b95d698e60e972d52c500c7ef3e5901cb75793663bd6d9401e26305d"
+            ),
+            "src/airpods_hr/monitor_cli.py": (
+                "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
+            ),
+            "src/airpods_hr/hr_semantics.py": (
+                "f6004987032f02c5b2a7c59590a4e3e2edb5ef85788f8259f2e0b9499f5bc4ba"
+            ),
+            "tools/probe_hr_semantics.py": (
+                "4e0fa4c54f3b29d376284e882225a0194f07fa79b8be5c2dec44d7bf73057e21"
+            ),
+            "src/airpods_hr/__init__.py": (
+                "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
+            ),
+        }
+        for relative, digest in expected.items():
+            self.assertEqual(
+                hashlib.sha256((root / relative).read_bytes()).hexdigest(), digest
+            )
+
+    def test_private_core_has_no_handoff_pairing_or_fallback_dependencies(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = (
+            root / "src/airpods_hr/production_session.py",
+            root / "tools/probe_production_session.py",
+        )
+        forbidden_modules = {
+            "airpods_hr.authentication",
+            "airpods_hr.bluetooth",
+            "airpods_hr.bumble_keys",
+            "airpods_hr.pairing",
+            "airpods_hr.reference_sdp_footprint",
+        }
+        rendered = "".join(source.read_text() for source in sources)
+        for source in sources:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            imports = {
+                node.module or ""
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+            }
+            self.assertTrue(forbidden_modules.isdisjoint(imports))
+        for forbidden in (
+            "ControllerHandoff",
+            "HCI_CHANNEL_USER",
+            "/var/lib/bluetooth",
+            "experimental_ack_only_hr",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()

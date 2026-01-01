@@ -161,6 +161,11 @@ ordered baseline and same-AAP-channel restart experiments. It does not change
 the monitor or assign meanings to unresolved report fields. See
 [docs/hr-semantics.md](docs/hr-semantics.md).
 
+Adds a private persistent-session core that performs one descriptor
+handshake and supports repeated canonical HR activation/stop cycles on the same
+AAP channel. Its interface is not public or frozen. See
+[docs/production-session.md](docs/production-session.md).
+
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program
 does not invoke `sudo` or perform privilege escalation. There is no automatic
