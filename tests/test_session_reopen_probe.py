@@ -10,7 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-from airpods_hr.session_reopen import BlueZReopenCheckpointObserver
+from airpods_hr.aap import AAPDescriptorObservationTimeoutError, DescriptorEvidence, HandshakeObservation
+
+
+from airpods_hr.session_reopen import BlueZReopenCheckpointObserver, _ObservedHandshakeSession
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,4 +66,25 @@ class SessionReopenDiagnosticBoundaryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_handshake_observer_retains_canonical_safe_timeout(self) -> None:
+        observation = HandshakeObservation(
+            True,
+            DescriptorEvidence(sensor_framework=True),
+            post_ack_frame_count=26,
+            receive_frames_dropped=0,
+        )
 
+        class Delegate:
+            async def run_collected(self, transport):
+                del transport
+                raise AAPDescriptorObservationTimeoutError(observation)
+
+        wrapper = _ObservedHandshakeSession(Delegate())
+        with self.assertRaises(AAPDescriptorObservationTimeoutError):
+            await wrapper.run_collected(object())
+        self.assertIs(wrapper.observation, observation)
+        self.assertEqual(wrapper.attempts, 1)
+        self.assertEqual(wrapper.completed, 0)
+        self.assertIsInstance(
+            wrapper.error, AAPDescriptorObservationTimeoutError
+        )
