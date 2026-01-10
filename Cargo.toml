@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/airpods-aap-core"]
+resolver = "3"

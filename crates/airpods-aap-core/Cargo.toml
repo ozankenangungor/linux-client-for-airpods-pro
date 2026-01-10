@@ -1,0 +1,9 @@
+[package]
+name = "airpods-aap-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Platform-independent AAP protocol types and parsers"
+publish = false
+
+[dependencies]

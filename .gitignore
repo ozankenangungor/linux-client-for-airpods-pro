@@ -18,6 +18,7 @@ env/
 build/
 dist/
 *.egg-info/
+target/
 
 # Bluetooth traces, packet captures, and diagnostic output
 *.btsnoop
