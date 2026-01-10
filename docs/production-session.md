@@ -5,6 +5,20 @@ coexistence transport. It is implementation scaffolding for hardware validation
 and does not freeze a public library API. The module is deliberately absent
 from `airpods_hr.__init__`.
 
+## Production session hardware result
+
+Production session is a final hardware pass on AirPods Pro 3. One production session
+opened through the BlueZ/kernel coexistence path, completed one descriptor
+handshake, and then completed three HR activation/stop cycles on that same AAP
+PSM `0x1001` channel. Each cycle returned five canonical reports. The final
+counters were one transport open, one descriptor handshake, three HR
+activations, three HR stops, and 15 reports.
+
+BlueZ remained reachable, the adapter remained powered, and
+`Device1.Connected` remained true after cleanup. Testing confirmed that
+ordinary A2DP music played continuously without interruption throughout the
+test. This proves persistent in-session reuse on real hardware.
+
 ## Why the AAP channel is long-lived
 
 Coexistence probe proved that a kernel-managed Classic L2CAP channel to AAP PSM `0x1001`
@@ -41,6 +55,14 @@ only after the canonical activation ACK. `stop()` uses canonical `STOP_HR`, its
 acknowledgement, and `HR_OFF`, then returns to `READY` without closing the
 transport or repeating descriptors. Final `close()` releases only session-owned
 resources and is idempotent.
+
+The audited active close order is canonical `STOP_HR`, stop acknowledgement,
+`HR_OFF`, activation collector shutdown, L2CAP collection shutdown, kernel
+socket close, temporary compatibility-profile cleanup, final BlueZ state
+check, and D-Bus client cleanup. Closing from `READY` starts at the collection
+and owned-resource cleanup steps because HR is already stopped. Production session
+therefore performs every known canonical protocol shutdown action; Session reopen
+does not invent another teardown frame.
 
 The internal state machine is:
 
@@ -112,6 +134,54 @@ one descriptor handshake, three HR activations, three canonical HR stops, and
 15 reports. The probe does not print addresses, credentials, or raw HCI
 security material.
 
-Session reopen may investigate safe recovery for a new AAP channel on an unchanged
-BlueZ ACL. Production session neither implements nor assumes such recovery, and no public
-API is frozen here.
+## Session reopen: same-ACL new-channel characterization
+
+Persistent reuse and new-channel reuse are separate lifecycle questions.
+Session reopen adds a private, safe-by-default diagnostic that constructs two
+independent production sessions in one process while deliberately preserving
+the existing BlueZ ACL. Session 1 opens, completes descriptors, collects HR,
+stops, and fully closes. Only then does session 2 use a newly constructed
+session object and a new kernel AAP channel.
+
+Every session owns fresh instances of its BlueZ client, compatibility
+registration, kernel transport and socket, receive collector, canonical AAP
+handshake and descriptor tracker, HR activation state, report queue, and
+counters. No module-level or class-level descriptor completion state exists in
+the production core. Descriptor evidence belongs to the AAP channel on which it
+was observed and is never copied to the next channel.
+
+The diagnostic records BlueZ reachability, adapter power, and
+`Device1.Connected` before session 1, after session 1 closes, and immediately
+before session 2 opens. It also records the verified local receive MTU and
+selected-adapter route for each successfully opened transport. If the second
+channel sees the exact ACK but no descriptor catalog, it reports
+`SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT`, cleans up, and stops. Missing ACK,
+transport failure, changed BlueZ state, and other failures remain distinct.
+
+The probe does not retry, create a third channel, continue on ACK alone,
+disconnect or reconnect BlueZ, or fall back to Bumble. It does not cache the
+first session's descriptor result. Current production behavior therefore
+continues to fail closed on a new channel whose descriptor bootstrap is
+incomplete. Session reopen characterizes this behavior and does not claim its root
+cause or install an automatic Bluetooth reconnect workaround.
+
+The dry run performs no D-Bus or Bluetooth operations:
+
+```console
+cd /home/kenan/airpods-hr-linux
+PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py
+```
+
+The future owner characterization command is:
+
+```console
+cd /home/kenan/airpods-hr-linux
+PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
+  --execute \
+  --samples-per-session 5 \
+  --reopen-delay 5 \
+  --descriptor-timeout 30 \
+  --verbose
+```
+
+No public API is frozen in Session reopen.
