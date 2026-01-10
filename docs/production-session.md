@@ -143,6 +143,26 @@ the existing BlueZ ACL. Session 1 opens, completes descriptors, collects HR,
 stops, and fully closes. Only then does session 2 use a newly constructed
 session object and a new kernel AAP channel.
 
+Session reopen passed its hardware characterization by cleanly reproducing the
+limitation. Session 1 used a new production dependency graph, verified kernel
+`imtu=2048` and the selected adapter route, completed the exact AAP ACK and
+descriptor handshake, received five canonical HR reports, performed the
+canonical stop and `HR_OFF` lifecycle, and fully closed. BlueZ remained
+reachable, powered, and connected. After five seconds, session 2 used another
+new dependency graph and socket on that unchanged BlueZ connection. Its
+`imtu=2048` and route verification passed and its exact AAP ACK arrived, but
+descriptor observation timed out after 27 post-ACK frames with zero receive
+drops and none of the four required descriptor markers.
+
+The measured totals were two session objects, transport opens and transport
+closes; two descriptor-handshake attempts with one completion; two exact ACKs;
+one HR activation and stop; five reports from session 1 and none from session
+2. The result was `SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT`. Testing observed
+uninterrupted A2DP audio throughout. This proves the new-channel phenomenon is
+reproducible after eliminating local session, socket, collector, descriptor,
+activation, and dependency-graph reuse. It does not prove that descriptors are
+sent only once per ACL.
+
 Every session owns fresh instances of its BlueZ client, compatibility
 registration, kernel transport and socket, receive collector, canonical AAP
 handshake and descriptor tracker, HR activation state, report queue, and
@@ -172,7 +192,7 @@ cd /home/kenan/airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py
 ```
 
-The future owner characterization command is:
+The Session reopen owner characterization command was:
 
 ```console
 cd /home/kenan/airpods-hr-linux
@@ -184,4 +204,71 @@ PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --verbose
 ```
 
-No public API is frozen in Session reopen.
+No public API was frozen in Session reopen.
+
+## Iteration 9.6C: descriptor-bootstrap state isolation
+
+Iteration 9.6C varies only session 1 behavior and the same-ACL idle delay. The
+default `hr-cycle` mode preserves Session reopen exactly: session 1 opens, completes
+descriptors, starts HR, receives the requested reports, performs canonical
+stop and `HR_OFF`, then closes. The `descriptor-only` mode opens session 1
+through normal descriptor-gated READY and closes it without starting HR,
+receiving reports, sending `STOP_HR`, or sending `HR_OFF`. Session 2 is normal
+and identical in both modes: it uses fresh dependencies and a new AAP channel,
+requires its own exact handshake and descriptor evidence, and validates HR only
+if READY is reached.
+
+The experiment separates current evidence as follows.
+
+**Proven:**
+
+- Repeated START/STOP cycles work on one persistent AAP channel.
+- A new channel on an unchanged BlueZ ACL can receive the exact ACK but omit
+  required descriptor evidence.
+- No production session, transport, collector, descriptor, or activation state
+  is reused by that new channel.
+
+**Unresolved:**
+
+- Whether initial descriptor delivery alone is sufficient to trigger the
+  later behavior.
+- Whether the HR activation, stop, or `HR_OFF` lifecycle contributes.
+- Whether same-ACL idle time provides a cooldown.
+- Whether the responsible state is strictly scoped to the ACL.
+- Whether another known protocol lifecycle event resets it.
+
+The highest-priority planned owner test, after architecture ZIP review, starts
+with a fresh normal BlueZ reconnect and ordinary A2DP audio, then uses a
+descriptor-only first session and a five-second reopen delay:
+
+```console
+cd /home/kenan/airpods-hr-linux
+PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
+  --execute \
+  --session-1-mode descriptor-only \
+  --samples-per-session 5 \
+  --reopen-delay 5 \
+  --descriptor-timeout 30 \
+  --verbose
+```
+
+The cooldown matrix uses a fresh normal BlueZ reconnect before each independent
+run. Its five-second `hr-cycle` control is the completed Session reopen observation.
+The planned longer experiment holds that mode constant and changes only the
+delay to 60 seconds:
+
+```console
+cd /home/kenan/airpods-hr-linux
+PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
+  --execute \
+  --session-1-mode hr-cycle \
+  --samples-per-session 5 \
+  --reopen-delay 60 \
+  --descriptor-timeout 30 \
+  --verbose
+```
+
+A successful 60-second reopen would establish a time dimension. Another exact
+ACK plus descriptor timeout would make a simple short cooldown less likely; it
+would not prove permanent ACL scope. Neither planned command is run as part of
+the implementation or before architecture review.
