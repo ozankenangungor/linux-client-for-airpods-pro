@@ -1,5 +1,10 @@
 # Persistent production session core
 
+Iteration 9.6 is a final hardware pass. The production architecture is one
+long-lived AAP channel, one descriptor bootstrap, and many HR START/STOP
+cycles. This is an accepted lifecycle constraint, not an automatic recovery
+policy.
+
 Adds a private production-session core over the proven BlueZ/kernel
 coexistence transport. It is implementation scaffolding for hardware validation
 and does not freeze a public library API. The module is deliberately absent
@@ -218,28 +223,68 @@ and identical in both modes: it uses fresh dependencies and a new AAP channel,
 requires its own exact handshake and descriptor evidence, and validates HR only
 if READY is reached.
 
-The experiment separates current evidence as follows.
+Iteration 9.6C passed its hardware characterization. From a fresh normal BlueZ
+connection, session 1 ran in `descriptor-only` mode: it opened a new production
+session, received the exact AAP acknowledgement, completed the descriptor
+catalog, reached READY, and closed. It did not start HR, receive HR reports,
+send `STOP_HR`, or send `HR_OFF`.
+
+After a five-second delay, session 2 used a completely fresh session graph and
+new transport/socket on the unchanged BlueZ connection. It verified
+`imtu=2048` and received the exact AAP acknowledgement, followed by 27 frames
+with zero receive drops. None contained the sensor framework, heart-rate
+service, heart-rate, or heartrate-access descriptor markers, so descriptor
+gating timed out as designed. The result was
+`SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT`.
+
+After another fresh normal BlueZ reconnect, the descriptor-only experiment was
+repeated with a 60-second reopen delay. Session 2 again received the exact AAP
+acknowledgement and 27 post-ACK frames with zero receive drops, but none of the
+four required descriptor markers. The result was again
+`SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT`. Ordinary A2DP audio remained
+uninterrupted during both tests.
+
+Together with Production session and Session reopen, the final evidence is:
 
 **Proven:**
 
-- Repeated START/STOP cycles work on one persistent AAP channel.
-- A new channel on an unchanged BlueZ ACL can receive the exact ACK but omit
-  required descriptor evidence.
-- No production session, transport, collector, descriptor, or activation state
-  is reused by that new channel.
+- Three repeated HR activation/stop cycles work on one continuously open AAP
+  PSM `0x1001` channel after one descriptor handshake. The measured totals were
+  `transport_opens=1`, `descriptor_handshakes=1`, `hr_activations=3`,
+  `hr_stops=3`, and `reports_received=15`.
+- BlueZ remains controller owner, `Device1.Connected` remains true, and
+  ordinary A2DP audio can continue without interruption during that persistent
+  session.
+- A new AAP channel on the same BlueZ connection can receive the exact AAP ACK
+  yet omit the required descriptor catalog. In the characterized failures it
+  delivered 27 post-ACK frames with zero receive drops and none of the sensor
+  framework, heart-rate service, heart-rate, or heartrate-access markers.
+- HR activation, HR report reception, `STOP_HR`, and `HR_OFF` are not necessary
+  to trigger that behavior: a descriptor-only first session reproduced it.
+- A 60-second idle delay between channels was insufficient to restore
+  descriptor bootstrap in the tested case.
+- No production session, transport, collector, descriptor, activation, or
+  dependency-graph state was reused by the new channel.
 
-**Unresolved:**
+**Not proven:**
 
-- Whether initial descriptor delivery alone is sufficient to trigger the
-  later behavior.
-- Whether the HR activation, stop, or `HR_OFF` lifecycle contributes.
-- Whether same-ACL idle time provides a cooldown.
-- Whether the responsible state is strictly scoped to the ACL.
-- Whether another known protocol lifecycle event resets it.
+- The exact firmware-internal cause.
+- The exact lifetime of the remote state.
+- Strictly ACL-scoped descriptor semantics.
+- The exact Apple teardown or reset mechanism.
 
-The highest-priority planned owner test, after architecture ZIP review, starts
-with a fresh normal BlueZ reconnect and ordinary A2DP audio, then uses a
-descriptor-only first session and a five-second reopen delay:
+The safe conclusion is that descriptor-bootstrap behavior is affected by
+AirPods/accessory remote state whose lifetime exceeds an individual AAP L2CAP
+channel and which has previously been observed to reset after a normal BlueZ
+disconnect/reconnect. The evidence does not establish that descriptors are
+strictly once per ACL.
+
+The production response remains one persistent AAP channel, one descriptor
+bootstrap, and repeated HR START/STOP cycles. Production does not cache
+descriptors across channels, bypass descriptor gating, continue from an ACK
+alone, or automatically reconnect Bluetooth.
+
+The completed five-second descriptor-only characterization used:
 
 ```console
 cd /home/kenan/airpods-hr-linux
@@ -252,23 +297,20 @@ PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --verbose
 ```
 
-The cooldown matrix uses a fresh normal BlueZ reconnect before each independent
-run. Its five-second `hr-cycle` control is the completed Session reopen observation.
-The planned longer experiment holds that mode constant and changes only the
-delay to 60 seconds:
+The completed 60-second descriptor-only characterization used a fresh normal
+BlueZ reconnect before the independent run:
 
 ```console
 cd /home/kenan/airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --execute \
-  --session-1-mode hr-cycle \
+  --session-1-mode descriptor-only \
   --samples-per-session 5 \
   --reopen-delay 60 \
   --descriptor-timeout 30 \
   --verbose
 ```
 
-A successful 60-second reopen would establish a time dimension. Another exact
-ACK plus descriptor timeout would make a simple short cooldown less likely; it
-would not prove permanent ACL scope. Neither planned command is run as part of
-the implementation or before architecture review.
+These commands record the completed owner-run hardware procedure. They are not
+part of routine software validation and must never be invoked by automated
+tests.
