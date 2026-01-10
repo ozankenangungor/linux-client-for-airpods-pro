@@ -22,6 +22,7 @@ from airpods_hr.session_reopen import (
     BlueZReopenCheckpoint,
     BlueZReopenCheckpointObserver,
     ReopenSessionBundle,
+    Session1Mode,
     SessionReopenCounters,
     SessionReopenResult,
     SessionReopenResultCategory,
@@ -75,13 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="perform the opt-in Bluetooth lifecycle characterization",
     )
     parser.add_argument(
+        "--session-1-mode",
+        choices=tuple(mode.value for mode in Session1Mode),
+        default=Session1Mode.HR_CYCLE.value,
+        help="choose whether session 1 runs HR or stops after descriptors",
+    )
+    parser.add_argument(
         "--samples-per-session",
         type=_bounded_int(1, 100),
         default=DEFAULT_SAMPLES_PER_SESSION,
     )
     parser.add_argument(
         "--reopen-delay",
-        type=_bounded_float(0.0, 30.0),
+        type=_bounded_float(0.0, 300.0),
         default=DEFAULT_REOPEN_DELAY,
     )
     parser.add_argument(
@@ -128,6 +135,7 @@ async def _exercise_session(
     session_index: int,
     samples: int,
     report_timeout: float,
+    activate_hr: bool,
     output: Callable[[str], None],
 ) -> None:
     session = bundle.session
@@ -140,6 +148,9 @@ async def _exercise_session(
     )
     output(f"SESSION {session_index}: selected adapter route verified=yes")
     output(f"SESSION {session_index}: descriptor handshake complete")
+    if not activate_hr:
+        output(f"SESSION {session_index}: descriptor-only READY; HR not activated")
+        return
     await session.start()
     for sample_index in range(1, samples + 1):
         report = await session.receive_report(timeout=report_timeout)
@@ -183,11 +194,14 @@ def _classify_session_2_failure(
 def _aggregate(
     bundles: list[ReopenSessionBundle],
     checkpoints: list[BlueZReopenCheckpoint],
+    session_1_mode: Session1Mode,
     category: SessionReopenResultCategory,
     failure: BaseException | None,
 ) -> SessionReopenResult:
     production_counters = [bundle.session.counters for bundle in bundles]
+    first_counters = production_counters[0] if production_counters else None
     counters = SessionReopenCounters(
+        session_1_mode=session_1_mode,
         session_objects_created=len(bundles),
         transport_opens=sum(item.transport_opens for item in production_counters),
         transport_closes=sum(
@@ -209,6 +223,12 @@ def _aggregate(
         ),
         hr_activations=sum(item.hr_activations for item in production_counters),
         hr_stops=sum(item.hr_stops for item in production_counters),
+        hr_activations_session_1=(
+            first_counters.hr_activations if first_counters is not None else 0
+        ),
+        hr_stops_session_1=(
+            first_counters.hr_stops if first_counters is not None else 0
+        ),
         reports_received_session_1=(
             production_counters[0].reports_received if production_counters else 0
         ),
@@ -238,7 +258,8 @@ def _print_result(
     counters = result.counters
     output("SESSION REOPEN COUNTERS")
     for name in SessionReopenCounters.__dataclass_fields__:
-        output(f"  {name}={getattr(counters, name)}")
+        value = getattr(counters, name)
+        output(f"  {name}={value}")
     observation = result.session_2_handshake_observation
     if (
         verbose
@@ -265,6 +286,7 @@ def _print_result(
 async def run_probe(
     *,
     execute: bool,
+    session_1_mode: Session1Mode | str = Session1Mode.HR_CYCLE,
     samples_per_session: int = DEFAULT_SAMPLES_PER_SESSION,
     reopen_delay: float = DEFAULT_REOPEN_DELAY,
     descriptor_timeout: float = DEFAULT_DESCRIPTOR_TIMEOUT,
@@ -277,6 +299,7 @@ async def run_probe(
     observer_factory: ObserverFactory = BlueZReopenCheckpointObserver,
     sleep: Sleeper = asyncio.sleep,
 ) -> tuple[int, SessionReopenResult | None]:
+    selected_mode = Session1Mode(session_1_mode)
     if not execute:
         output("DRY RUN: no Bluetooth or BlueZ state will be changed.")
         output("sessions=2; AAP channels=2; descriptor state shared=no")
@@ -284,6 +307,7 @@ async def run_probe(
         output("automatic BlueZ reconnect=no; Bumble fallback=no")
         output("kernel_local_rx_imtu=2048")
         output(
+            f"session_1_mode={selected_mode.value}; "
             f"samples_per_session={samples_per_session}; "
             f"reopen_delay={reopen_delay:g}s; "
             f"descriptor_timeout={descriptor_timeout:g}s"
@@ -321,6 +345,7 @@ async def run_probe(
                 session_index=1,
                 samples=samples_per_session,
                 report_timeout=report_timeout,
+                activate_hr=selected_mode is Session1Mode.HR_CYCLE,
                 output=output,
             )
         except BaseException as error:
@@ -376,6 +401,7 @@ async def run_probe(
                 session_index=2,
                 samples=samples_per_session,
                 report_timeout=report_timeout,
+                activate_hr=True,
                 output=output,
             )
         except BaseException as error:
@@ -398,7 +424,9 @@ async def run_probe(
 
     if isinstance(failure, asyncio.CancelledError):
         raise failure
-    result = _aggregate(bundles, checkpoints, category, failure)
+    result = _aggregate(
+        bundles, checkpoints, selected_mode, category, failure
+    )
     _print_result(result, verbose=verbose, output=output)
     return (
         0 if category is SessionReopenResultCategory.BOTH_SESSIONS_PASS else 1,
@@ -418,6 +446,7 @@ def main(
         status, _ = asyncio.run(
             run_probe(
                 execute=args.execute,
+                session_1_mode=args.session_1_mode,
                 samples_per_session=args.samples_per_session,
                 reopen_delay=args.reopen_delay,
                 descriptor_timeout=args.descriptor_timeout,

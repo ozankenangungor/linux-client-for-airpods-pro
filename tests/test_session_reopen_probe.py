@@ -27,6 +27,7 @@ from airpods_hr.session_reopen import (
     BlueZReopenCheckpointObserver,
     BlueZReopenCheckpoint,
     ReopenSessionBundle,
+    Session1Mode,
     SessionReopenResultCategory,
     _ObservedHandshakeSession,
     create_reopen_session_bundle,
@@ -38,6 +39,23 @@ ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
     "f4141c6372c9bda65b4aca1b09c40e2f024ec8fe1b75964e8cc5f26c2156371e"
 )
+FROZEN_SHA256 = {
+    "src/airpods_hr/protocol.py": (
+        "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
+    ),
+    "src/airpods_hr/heartrate.py": (
+        "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
+    ),
+    "src/airpods_hr/bluez_coexistence.py": (
+        "55824df2b95d698e60e972d52c500c7ef3e5901cb75793663bd6d9401e26305d"
+    ),
+    "src/airpods_hr/monitor_cli.py": (
+        "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
+    ),
+    "src/airpods_hr/hr_semantics.py": (
+        "f6004987032f02c5b2a7c59590a4e3e2edb5ef85788f8259f2e0b9499f5bc4ba"
+    ),
+}
 
 
 class FakeTransport:
@@ -91,6 +109,7 @@ class FakeSession:
         self.open_error = open_error
         self.report_error = report_error
         self.close_error = close_error
+        self.state = "closed"
         self.opens = 0
         self.activations = 0
         self.stops = 0
@@ -111,10 +130,13 @@ class FakeSession:
         self.opens += 1
         if self.open_error is not None:
             raise self.open_error
+        self.state = "ready"
+        self.events.append(f"session_{self.identity}_ready")
 
     async def start(self) -> None:
         self.events.append(f"session_{self.identity}_start")
         self.activations += 1
+        self.state = "streaming"
 
     async def receive_report(self, timeout: float):
         del timeout
@@ -130,11 +152,15 @@ class FakeSession:
 
     async def stop(self) -> None:
         self.events.append(f"session_{self.identity}_stop")
+        self.events.append(f"session_{self.identity}_hr_off")
         self.stops += 1
+        self.state = "ready"
 
     async def close(self) -> None:
+        self.events.append(f"session_{self.identity}_close_from_{self.state}")
         self.events.append(f"session_{self.identity}_close")
         self.transport.close_calls += 1
+        self.state = "closed"
         if self.close_error is not None:
             raise self.close_error
 
@@ -233,12 +259,13 @@ class SessionReopenProbeTests(unittest.IsolatedAsyncioTestCase):
     def test_defaults_and_bounds(self) -> None:
         args = build_parser().parse_args([])
         self.assertFalse(args.execute)
+        self.assertEqual(args.session_1_mode, Session1Mode.HR_CYCLE.value)
         self.assertEqual(args.samples_per_session, 5)
         self.assertEqual(args.reopen_delay, 5)
         self.assertEqual(args.descriptor_timeout, 30)
         for option, value in (
             ("--samples-per-session", "0"),
-            ("--reopen-delay", "31"),
+            ("--reopen-delay", "301"),
             ("--descriptor-timeout", "0"),
         ):
             with self.subTest(option=option), redirect_stderr(StringIO()):
@@ -263,6 +290,14 @@ class SessionReopenProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions=2; AAP channels=2", rendered)
         self.assertIn("descriptor state shared=no", rendered)
         self.assertIn("automatic BlueZ reconnect=no", rendered)
+        self.assertIn("session_1_mode=hr-cycle", rendered)
+
+    def test_descriptor_only_mode_is_parsed(self) -> None:
+        args = build_parser().parse_args(
+            ["--session-1-mode", "descriptor-only", "--reopen-delay", "60"]
+        )
+        self.assertEqual(args.session_1_mode, "descriptor-only")
+        self.assertEqual(args.reopen_delay, 60)
 
     async def test_two_fresh_sessions_pass_with_expected_counters(self) -> None:
         factory = BundleFactory(self.events)
@@ -272,6 +307,7 @@ class SessionReopenProbeTests(unittest.IsolatedAsyncioTestCase):
             result.category, SessionReopenResultCategory.BOTH_SESSIONS_PASS
         )
         self.assertEqual(result.counters.session_objects_created, 2)
+        self.assertIs(result.counters.session_1_mode, Session1Mode.HR_CYCLE)
         self.assertEqual(result.counters.transport_opens, 2)
         self.assertEqual(result.counters.transport_closes, 2)
         self.assertEqual(result.counters.descriptor_handshakes_attempted, 2)
@@ -279,8 +315,80 @@ class SessionReopenProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.counters.exact_aap_acks, 2)
         self.assertEqual(result.counters.hr_activations, 2)
         self.assertEqual(result.counters.hr_stops, 2)
+        self.assertEqual(result.counters.hr_activations_session_1, 1)
+        self.assertEqual(result.counters.hr_stops_session_1, 1)
         self.assertEqual(result.counters.reports_received_session_1, 2)
         self.assertEqual(result.counters.reports_received_session_2, 2)
+        self.assertIn("session_1_start", self.events)
+        self.assertIn("session_1_stop", self.events)
+        self.assertIn("session_1_hr_off", self.events)
+
+    async def test_descriptor_only_first_session_never_activates_hr(self) -> None:
+        factory = BundleFactory(self.events)
+        output: list[str] = []
+        status, result = await run_probe(
+            execute=True,
+            session_1_mode=Session1Mode.DESCRIPTOR_ONLY,
+            samples_per_session=2,
+            reopen_delay=5,
+            output=output.append,
+            bundle_factory=factory,
+            observer_factory=lambda: self.observer,
+            sleep=AsyncMock(),
+        )
+        assert result is not None
+        self.assertEqual(status, 0)
+        self.assertIs(
+            result.counters.session_1_mode, Session1Mode.DESCRIPTOR_ONLY
+        )
+        self.assertIn("session_1_ready", self.events)
+        self.assertNotIn("session_1_start", self.events)
+        self.assertNotIn("session_1_stop", self.events)
+        self.assertNotIn("session_1_hr_off", self.events)
+        self.assertIn("session_1_close_from_ready", self.events)
+        self.assertEqual(result.counters.hr_activations_session_1, 0)
+        self.assertEqual(result.counters.hr_stops_session_1, 0)
+        self.assertEqual(result.counters.reports_received_session_1, 0)
+        self.assertEqual(result.counters.reports_received_session_2, 2)
+        self.assertIn("session_1_mode=descriptor-only", "\n".join(output))
+
+    async def test_descriptor_only_timeout_preserves_classification(self) -> None:
+        observation = HandshakeObservation(
+            True,
+            DescriptorEvidence(),
+            post_ack_frame_count=27,
+            receive_frames_dropped=0,
+        )
+        factory = BundleFactory(
+            self.events,
+            second_error=ProductionSessionError(
+                ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+                "descriptor_handshake",
+            ),
+            second_observation=observation,
+            second_handshake_error=AAPDescriptorObservationTimeoutError(
+                observation
+            ),
+        )
+        _, result = await run_probe(
+            execute=True,
+            session_1_mode="descriptor-only",
+            samples_per_session=2,
+            output=lambda message: None,
+            bundle_factory=factory,
+            observer_factory=lambda: self.observer,
+            sleep=AsyncMock(),
+        )
+        assert result is not None
+        self.assertIs(
+            result.category,
+            SessionReopenResultCategory.SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT,
+        )
+        self.assertEqual(result.counters.session_objects_created, 2)
+        self.assertEqual(result.counters.hr_activations_session_1, 0)
+        self.assertEqual(result.counters.hr_stops_session_1, 0)
+        self.assertEqual(result.counters.reports_received_session_1, 0)
+        self.assertNotIn("session_3_open", self.events)
 
     async def test_objects_transports_and_handshakes_are_distinct(self) -> None:
         factory = BundleFactory(self.events)
@@ -513,6 +621,12 @@ class SessionReopenStaticSafetyTests(unittest.TestCase):
     def test_production_core_is_frozen(self) -> None:
         data = (ROOT / "src/airpods_hr/production_session.py").read_bytes()
         self.assertEqual(hashlib.sha256(data).hexdigest(), PRODUCTION_SESSION_SHA256)
+
+    def test_protocol_parser_transport_monitor_and_semantics_are_frozen(self) -> None:
+        for relative, expected in FROZEN_SHA256.items():
+            with self.subTest(path=relative):
+                data = (ROOT / relative).read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), expected)
 
     def test_private_modules_are_not_publicly_exported(self) -> None:
         package_init = (ROOT / "src/airpods_hr/__init__.py").read_text()

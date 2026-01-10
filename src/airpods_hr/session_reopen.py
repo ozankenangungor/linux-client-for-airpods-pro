@@ -47,6 +47,11 @@ class SessionReopenResultCategory(StrEnum):
     OTHER_FAILURE = "OTHER_FAILURE"
 
 
+class Session1Mode(StrEnum):
+    HR_CYCLE = "hr-cycle"
+    DESCRIPTOR_ONLY = "descriptor-only"
+
+
 @dataclass(frozen=True, slots=True)
 class BlueZReopenCheckpoint:
     label: str
@@ -65,6 +70,7 @@ class BlueZReopenCheckpoint:
 
 @dataclass(frozen=True, slots=True)
 class SessionReopenCounters:
+    session_1_mode: Session1Mode
     session_objects_created: int
     transport_opens: int
     transport_closes: int
@@ -73,6 +79,8 @@ class SessionReopenCounters:
     exact_aap_acks: int
     hr_activations: int
     hr_stops: int
+    hr_activations_session_1: int
+    hr_stops_session_1: int
     reports_received_session_1: int
     reports_received_session_2: int
 
