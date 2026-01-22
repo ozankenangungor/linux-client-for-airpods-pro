@@ -19,6 +19,8 @@ build/
 dist/
 *.egg-info/
 target/
+*.so
+*.pyd
 
 # Bluetooth traces, packet captures, and diagnostic output
 *.btsnoop
