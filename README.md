@@ -166,6 +166,10 @@ handshake and supports repeated canonical HR activation/stop cycles on the same
 AAP channel. Its interface is not public or frozen. See
 [docs/production-session.md](docs/production-session.md).
 
+Adds a standard-library-only Rust protocol core and a shared safe
+golden corpus. Python remains authoritative and no production path calls Rust.
+See [docs/rust-core-architecture.md](docs/rust-core-architecture.md).
+
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program
 does not invoke `sudo` or perform privilege escalation. There is no automatic
