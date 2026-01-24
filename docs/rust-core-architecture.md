@@ -253,3 +253,17 @@ Before Rust can replace any Python path, a later task must:
 Successful FFI binding FFI parity establishes a private native bridge. It does
 not authorize a production parser switch or satisfy the hardware migration
 gates.
+
+## Iteration 9.7 final pass
+
+Iteration 9.7 is accepted as a final pass. Protocol core established the std-only,
+unsafe-free `airpods-aap-core` parity foundation and its shared safe golden
+corpus. FFI binding added the separate private `_airpods_aap_core` PyO3 bridge
+for real native FFI parity testing. The Python parser remains authoritative;
+no production parser selection, Bluetooth behavior, public API, or runtime
+dependency changed.
+
+Testing environment validated Python 3.14.6, rustc and Cargo 1.97.0, PyO3
+0.29.2, and maturin 1.15.0. The final accepted results were 601 Python tests
+passed with zero failures and zero skips, and 13 Rust tests passed with zero
+failures.
