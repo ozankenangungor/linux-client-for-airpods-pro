@@ -55,9 +55,11 @@ or compare the wire data without an allocation in the report model. The small
 copy favors straightforward parity over premature optimization.
 
 The proven Linux transport remains in Python. In particular,
-`production_session.py`, `bluez_coexistence.py`, `monitor_cli.py`, and the
-transport/session code they compose do not call Rust. There is no FFI, PyO3,
-maturin runtime dependency, daemon, or Rust transport API in Protocol core.
+`production_session.py`, `bluez_coexistence.py`, `heart_rate_session.py`,
+`monitor_cli.py`, `hr_semantics.py`, and the transport/session code they
+compose do not call Rust. Adds an isolated development FFI binding,
+but there is no binding import, parser selection, daemon, or Rust transport API
+in any production path.
 
 ## Heart-rate parity contract
 
@@ -126,22 +128,87 @@ The intended separation is:
 This layout is directional and does not freeze crate APIs or the final
 end-user interface.
 
-## Future Python binding
+## Private Python binding
 
-A later internal extension can expose the portable parser through PyO3 and be
-packaged with maturin while Python continues to own BlueZ, D-Bus, and Linux
-orchestration:
+Adds `crates/airpods-aap-py` as a separate PyO3 crate. The dependency
+direction is one-way: `airpods-aap-py` depends on `airpods-aap-core`, while the
+core manifest remains empty of dependencies and its source remains free of
+PyO3 and Python runtime knowledge. Both crates are unpublished.
+
+The binding exposes the top-level private module `_airpods_aap_core` for
+development and parity testing:
 
 ```text
 Python BlueZ / D-Bus / Linux orchestration
                     |
                     v
-       internal Rust protocol extension
+      _airpods_aap_core (private PyO3)
+                    |
+                    v
+            airpods-aap-core
 ```
 
-The package-level experience should remain `from airpods_hr import ...`; users
-should not need to know which internal parser is active. Adds no
-binding code, Python dependency, import change, or packaging hook.
+The module name begins with an underscore and is not part of
+`airpods_hr.__all__`. Keeping it top-level avoids modifying the existing
+setuptools build, the `airpods_hr` package contents, or normal installation.
+The binding has its own `pyproject.toml`; the root `pyproject.toml` continues to
+use setuptools. This is a development-only packaging boundary, not final
+end-user installation or API design.
+
+The private function `_airpods_aap_core.parse_heart_rate_packet()` accepts
+Python `bytes` only. PyO3 extracts `PyBytes` directly, so mutable `bytearray`,
+`memoryview`, strings, and other objects raise `TypeError`. The returned frozen
+private object exposes the six neutral fields plus exact `raw_report` bytes.
+Its `source_side()` method returns `("left", None)`, `("right", None)`, or
+`("unknown", raw)` while preserving `field_5`. It does not interpret `aux`,
+name flags, rename `timestamp_ticks`, filter BPM 169, or deduplicate reports.
+
+Rust parse failures map to three private Python exception types:
+`MarkerNotFoundError`, `TruncatedReportError`, and `InvalidReportIdError`. These
+categories support parity testing without replacing the existing public Python
+exceptions. No parser falls back to the other on failure.
+
+FFI binding uses PyO3 `0.29.2` and maturin `1.15.0`. They build against the tested
+CPython `3.14.6` and Rust/Cargo `1.97.0` environment. PyO3 is pinned exactly in
+the binding manifest because this private native boundary is compiler-facing;
+maturin is pinned exactly in the binding-only build configuration so developer
+rebuilds use the validated frontend. Neither pin affects the root Python
+package or the core crate.
+
+Install the development build and run mandatory real-FFI parity tests from the
+repository root:
+
+```console
+.venv/bin/python -m pip install maturin==1.15.0
+cd crates/airpods-aap-py
+../../.venv/bin/maturin develop --release --locked
+cd ../..
+PYTHONPATH=src .venv/bin/python -m unittest -v tests.test_rust_ffi_parity
+```
+
+The test module imports `_airpods_aap_core` unconditionally. A missing or
+unbuildable extension fails FFI binding instead of turning all FFI checks into
+skips. The tests compare every golden vector and a bounded deterministic
+synthetic corpus through the real native module, including failures, integer
+widths, trailing frame bytes, raw report bytes, source side, BPM 169, and
+duplicates.
+
+To remove the development installation and its targeted build output:
+
+```console
+.venv/bin/python -m pip uninstall -y airpods-aap-py
+cargo clean -p airpods-aap-py
+```
+
+Run the install commands again for a clean rebuild. Generated extension
+libraries, wheels, and `target/` contents are build artifacts and are not
+source-controlled.
+
+`tools/rust_shadow.py` is an explicit hardware-independent comparison helper.
+Given caller-supplied bytes, it invokes both parsers and compares all fields,
+raw bytes, failure category, and source-side derivation. It neither opens or
+intercepts Bluetooth traffic nor logs packet data, chooses a production parser,
+or falls back between implementations. Production code never imports it.
 
 ## Future persistent daemon
 
@@ -171,15 +238,18 @@ Before Rust can replace any Python path, a later task must:
 
 1. Keep every safe golden vector passing through both parsers and expand the
    corpus for any newly proven structure.
-2. Review an internal binding API without freezing the end-user API.
-3. Add PyO3/maturin packaging and import behavior with explicit fallback and
-   failure contracts.
-4. Prove Python package, wheel, and supported-platform behavior in CI.
-5. Re-run all hardware-independent Python and Rust validation with the binding
-   enabled.
+2. Review the private binding boundary before defining any end-user API.
+3. Design supported-platform wheel and source-build behavior without changing
+   the current setuptools installation until that packaging is accepted.
+4. Define an explicit production integration and rollback plan; the FFI binding
+   shadow helper is manual and is not a runtime selection mechanism.
+5. Keep all hardware-independent Python, core, binding, and FFI parity checks
+   mandatory on supported development environments.
 6. Perform separately authorized hardware validation of persistent-session,
    descriptor gating, cleanup, BlueZ ownership, and audio coexistence.
 7. Stage any production switch so the proven Python path remains available
    until parity, rollback, and failure behavior are accepted.
 
-No migration gate is satisfied merely by creating this crate.
+Successful FFI binding FFI parity establishes a private native bridge. It does
+not authorize a production parser switch or satisfy the hardware migration
+gates.

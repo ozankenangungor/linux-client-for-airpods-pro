@@ -168,6 +168,8 @@ AAP channel. Its interface is not public or frozen. See
 
 Adds a standard-library-only Rust protocol core and a shared safe
 golden corpus. Python remains authoritative and no production path calls Rust.
+Adds a separate private development binding for real FFI parity
+testing without changing the setuptools package or production parser.
 See [docs/rust-core-architecture.md](docs/rust-core-architecture.md).
 
 The currently tested setup may require elevated privileges to read existing
