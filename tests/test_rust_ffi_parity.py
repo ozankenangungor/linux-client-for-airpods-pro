@@ -19,6 +19,10 @@ from airpods_hr.heartrate import (
     parse_heart_rate_packet as parse_python,
 )
 from airpods_hr.protocol import HEART_RATE_MARKER
+from tools.rust_shadow import (
+    ShadowFailureCategory,
+    compare_heart_rate_packet,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -241,6 +245,30 @@ class NativeExtensionTests(unittest.TestCase):
                     rust_core.parse_heart_rate_packet(value)
 
 
+class ShadowHarnessTests(unittest.TestCase):
+    def test_success_is_compared_explicitly(self) -> None:
+        result = compare_heart_rate_packet(
+            make_packet(
+                bpm=68,
+                aux=20,
+                sequence=1,
+                field_5=1,
+                timestamp_ticks=1_000_000_000,
+                flags=0x0000_1000,
+            )
+        )
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(result.failure_category)
+
+    def test_failure_is_compared_without_fallback(self) -> None:
+        result = compare_heart_rate_packet(b"no marker")
+        self.assertFalse(result.succeeded)
+        self.assertEqual(
+            result.failure_category,
+            ShadowFailureCategory.MARKER_NOT_FOUND,
+        )
+
+
 class BindingBoundaryTests(unittest.TestCase):
     def test_binding_is_private_and_absent_from_airpods_hr_exports(self) -> None:
         self.assertNotIn("_airpods_aap_core", airpods_hr.__all__)
@@ -332,3 +360,5 @@ class BindingBoundaryTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
 
 
+if __name__ == "__main__":
+    unittest.main()
