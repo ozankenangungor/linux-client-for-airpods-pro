@@ -132,6 +132,15 @@ the original device and inode before unlinking. On Linux, each accepted peer
 is checked with `SO_PEERCRED` and its UID must equal the daemon UID. Unix user
 isolation is the Daemon serviceA security boundary.
 
+The daemon itself creates, binds, permissions, and starts listening on the
+Unix socket before constructing or opening the sensor session. A concurrent
+bind reports ownership failure without another unlink attempt. Only after the
+session opens does the daemon hand the already-bound socket to asyncio with
+automatic pathname cleanup disabled. This makes listener ownership the gate
+for session ownership and keeps pathname creation and removal under one policy.
+If session open or asyncio handoff fails, the private listener is closed and
+only its recorded pathname identity is eligible for cleanup.
+
 ## Backpressure and failure behavior
 
 Each client has a bounded outbound queue of 16 JSON messages. Fan-out uses

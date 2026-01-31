@@ -210,23 +210,25 @@ class AirPodsHubDaemon:
                 raise HubDaemonError("daemon objects are single-use")
             self._start_attempted = True
             self.state = DaemonState.STARTING
+            owned_listener: socket.socket | None = None
             try:
                 _validate_socket_path(self.socket_path)
                 await _remove_safe_stale_socket(self.socket_path)
+                owned_listener = self._acquire_listener()
                 self._session = self._session_factory()
                 await self._bounded(self._session.open())
                 self._server = await asyncio.start_unix_server(
                     self._handle_client,
-                    path=self.socket_path,
+                    sock=owned_listener,
                     limit=MAX_FRAME_SIZE + 1,
+                    cleanup_socket=False,
                 )
-                os.chmod(self.socket_path, 0o600)
-                socket_stat = self.socket_path.lstat()
-                if not stat.S_ISSOCK(socket_stat.st_mode):
-                    raise UnsafeSocketPathError("bound path is not a Unix socket")
-                self._owned_socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
+                owned_listener = None
             except BaseException as error:
                 self.state = DaemonState.FAILED
+                if owned_listener is not None:
+                    owned_listener.close()
+                self._remove_owned_socket()
                 if isinstance(error, asyncio.CancelledError):
                     raise
                 if isinstance(
@@ -235,6 +237,49 @@ class AirPodsHubDaemon:
                     raise
                 raise SessionOperationError("daemon startup failed") from error
             self.state = DaemonState.READY
+
+    def _acquire_listener(self) -> socket.socket:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.socket_path))
+        except OSError as error:
+            listener.close()
+            if error.errno == errno.EADDRINUSE:
+                raise DaemonAlreadyRunningError(
+                    "another daemon acquired the socket during startup"
+                ) from error
+            raise UnsafeSocketPathError("could not bind daemon socket") from error
+
+        try:
+            socket_stat = self.socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(socket_stat.st_mode)
+                or socket_stat.st_uid != os.geteuid()
+            ):
+                raise UnsafeSocketPathError("bound path is not an owned Unix socket")
+            self._owned_socket_identity = (
+                socket_stat.st_dev,
+                socket_stat.st_ino,
+            )
+            os.chmod(self.socket_path, 0o600)
+            current = self.socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or (current.st_dev, current.st_ino)
+                != self._owned_socket_identity
+                or stat.S_IMODE(current.st_mode) != 0o600
+            ):
+                raise UnsafeSocketPathError(
+                    "daemon socket path changed during listener setup"
+                )
+            listener.listen(socket.SOMAXCONN)
+            listener.setblocking(False)
+            return listener
+        except BaseException:
+            listener.close()
+            self._remove_owned_socket()
+            raise
 
     async def shutdown(self) -> None:
         async with self._shutdown_lock:

@@ -55,6 +55,7 @@ class FakeSession:
         self.open_error: BaseException | None = None
         self.start_error: BaseException | None = None
         self.stop_error: BaseException | None = None
+        self.open_gate: asyncio.Event | None = None
         self.start_gate: asyncio.Event | None = None
         self.stop_gate: asyncio.Event | None = None
         self.reports: asyncio.Queue[HeartRateReport | BaseException] = asyncio.Queue()
@@ -63,6 +64,8 @@ class FakeSession:
     async def open(self) -> None:
         self.open_calls += 1
         self.events.append("open")
+        if self.open_gate is not None:
+            await self.open_gate.wait()
         if self.open_error is not None:
             raise self.open_error
 
@@ -105,6 +108,24 @@ class FakeFactory:
     def __call__(self) -> FakeSession:
         self.calls += 1
         return self.session
+
+
+class LazyFactory:
+    def __init__(self, open_gate: asyncio.Event | None = None) -> None:
+        self.open_gate = open_gate
+        self.calls = 0
+        self.sessions: list[FakeSession] = []
+
+    @property
+    def open_calls(self) -> int:
+        return sum(session.open_calls for session in self.sessions)
+
+    def __call__(self) -> FakeSession:
+        self.calls += 1
+        session = FakeSession()
+        session.open_gate = self.open_gate
+        self.sessions.append(session)
+        return session
 
 
 class JsonClient:
@@ -470,14 +491,15 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await first.request("ping"))["pong"])
         original = self.socket_path.lstat()
 
-        second_factory = FakeFactory()
+        second_factory = LazyFactory()
         second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
         try:
             with self.assertRaises(DaemonAlreadyRunningError):
                 await second_daemon.start()
             self.assertEqual(second_daemon.state, DaemonState.FAILED)
             self.assertEqual(second_factory.calls, 0)
-            self.assertEqual(second_factory.session.open_calls, 0)
+            self.assertEqual(second_factory.open_calls, 0)
+            self.assertFalse(second_factory.sessions)
             current = self.socket_path.lstat()
             self.assertEqual(
                 (current.st_dev, current.st_ino),
@@ -489,6 +511,147 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.daemon.state, DaemonState.READY)
         finally:
             await second_daemon.shutdown()
+
+    async def test_starting_daemon_owns_listener_before_session_open(self) -> None:
+        open_gate = self.factory.session.open_gate = asyncio.Event()
+        first_start = asyncio.create_task(self.daemon.start())
+        await self.wait_for(lambda: self.factory.session.open_calls == 1)
+        self.assertEqual(self.daemon.state, DaemonState.STARTING)
+        self.assertTrue(stat.S_ISSOCK(self.socket_path.lstat().st_mode))
+
+        second_factory = LazyFactory()
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        try:
+            with self.assertRaises(DaemonAlreadyRunningError):
+                await second_daemon.start()
+            self.assertEqual(second_factory.calls, 0)
+            self.assertEqual(second_factory.open_calls, 0)
+            self.assertFalse(second_factory.sessions)
+            self.assertEqual(self.daemon.state, DaemonState.STARTING)
+
+            open_gate.set()
+            await first_start
+            self.assertEqual(self.daemon.state, DaemonState.READY)
+            client = await self.client()
+            self.assertTrue((await client.request("ping"))["pong"])
+            self.assertEqual(
+                self.factory.calls + second_factory.calls,
+                1,
+            )
+            self.assertEqual(
+                self.factory.session.open_calls
+                + second_factory.open_calls,
+                1,
+            )
+            await client.close()
+            self.clients.remove(client)
+            await self.daemon.shutdown()
+            self.assertFalse(self.socket_path.exists())
+        finally:
+            open_gate.set()
+            await asyncio.gather(first_start, return_exceptions=True)
+            await second_daemon.shutdown()
+
+    async def test_simultaneous_prebind_race_has_one_session_owner(self) -> None:
+        open_gate = asyncio.Event()
+        first_factory = LazyFactory(open_gate)
+        second_factory = LazyFactory(open_gate)
+        first_daemon = AirPodsHubDaemon(first_factory, self.socket_path)
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        both_at_boundary = asyncio.Event()
+        arrivals = 0
+
+        async def synchronized_prebind(_path: Path) -> None:
+            nonlocal arrivals
+            arrivals += 1
+            if arrivals == 2:
+                both_at_boundary.set()
+            await both_at_boundary.wait()
+
+        try:
+            with patch.object(
+                hubd_server,
+                "_remove_safe_stale_socket",
+                side_effect=synchronized_prebind,
+            ):
+                starts = [
+                    asyncio.create_task(first_daemon.start()),
+                    asyncio.create_task(second_daemon.start()),
+                ]
+                await self.wait_for(
+                    lambda: first_factory.open_calls + second_factory.open_calls == 1
+                )
+                await self.wait_for(lambda: any(task.done() for task in starts))
+                self.assertEqual(
+                    first_factory.calls + second_factory.calls, 1
+                )
+                self.assertEqual(
+                    len(first_factory.sessions) + len(second_factory.sessions), 1
+                )
+                self.assertEqual(
+                    first_factory.open_calls + second_factory.open_calls, 1
+                )
+                self.assertEqual(
+                    sum(
+                        daemon.state is DaemonState.STARTING
+                        for daemon in (first_daemon, second_daemon)
+                    ),
+                    1,
+                )
+                open_gate.set()
+                results = await asyncio.gather(*starts, return_exceptions=True)
+
+            self.assertEqual(sum(result is None for result in results), 1)
+            self.assertEqual(
+                sum(
+                    isinstance(result, DaemonAlreadyRunningError)
+                    for result in results
+                ),
+                1,
+            )
+            winners = [
+                daemon
+                for daemon in (first_daemon, second_daemon)
+                if daemon.state is DaemonState.READY
+            ]
+            self.assertEqual(len(winners), 1)
+            client = await JsonClient.connect(self.socket_path)
+            try:
+                self.assertTrue((await client.request("ping"))["pong"])
+            finally:
+                await client.close()
+        finally:
+            open_gate.set()
+            await first_daemon.shutdown()
+            await second_daemon.shutdown()
+        self.assertFalse(self.socket_path.exists())
+
+    async def test_asyncio_receives_only_prebound_owned_socket(self) -> None:
+        original = asyncio.start_unix_server
+        with patch.object(
+            asyncio, "start_unix_server", wraps=original
+        ) as start_server:
+            await self.start()
+        kwargs = start_server.await_args.kwargs
+        self.assertIsInstance(kwargs["sock"], socket.socket)
+        self.assertNotIn("path", kwargs)
+        self.assertFalse(kwargs["cleanup_socket"])
+
+    async def test_asyncio_handoff_failure_removes_owned_listener(self) -> None:
+        with patch.object(
+            asyncio,
+            "start_unix_server",
+            side_effect=RuntimeError("handoff failed"),
+        ):
+            with self.assertRaises(SessionOperationError):
+                await self.daemon.start()
+        self.assertEqual(self.factory.calls, 1)
+        self.assertEqual(self.factory.session.open_calls, 1)
+        self.assertEqual(self.daemon.state, DaemonState.FAILED)
+        self.assertIsNone(self.daemon._server)
+        self.assertFalse(self.socket_path.exists())
+        await self.daemon.shutdown()
+        self.assertEqual(self.factory.session.close_calls, 1)
 
     async def test_owned_stale_socket_is_safely_replaced(self) -> None:
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -531,6 +694,18 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.socket_path.write_text("replacement")
         await self.daemon.shutdown()
         self.assertEqual(self.socket_path.read_text(), "replacement")
+
+    async def test_shutdown_does_not_remove_replacement_unix_socket(self) -> None:
+        await self.start()
+        self.socket_path.unlink()
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        replacement.bind(str(self.socket_path))
+        try:
+            await self.daemon.shutdown()
+            self.assertTrue(stat.S_ISSOCK(self.socket_path.lstat().st_mode))
+        finally:
+            replacement.close()
+            self.socket_path.unlink(missing_ok=True)
 
     async def test_uid_mismatch_is_rejected(self) -> None:
         self.daemon = AirPodsHubDaemon(
@@ -585,6 +760,8 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
             await self.daemon.start()
         self.assertEqual(self.daemon.state, DaemonState.FAILED)
         self.assertEqual(self.factory.calls, 1)
+        self.assertIsNone(self.daemon._server)
+        self.assertFalse(self.socket_path.exists())
         await self.daemon.shutdown()
         self.assertEqual(self.factory.session.close_calls, 1)
 
