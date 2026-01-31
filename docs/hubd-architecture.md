@@ -132,14 +132,35 @@ the original device and inode before unlinking. On Linux, each accepted peer
 is checked with `SO_PEERCRED` and its UID must equal the daemon UID. Unix user
 isolation is the Daemon serviceA security boundary.
 
-The daemon itself creates, binds, permissions, and starts listening on the
-Unix socket before constructing or opening the sensor session. A concurrent
-bind reports ownership failure without another unlink attempt. Only after the
-session opens does the daemon hand the already-bound socket to asyncio with
-automatic pathname cleanup disabled. This makes listener ownership the gate
-for session ownership and keeps pathname creation and removal under one policy.
+Daemon ownership has two separate layers. Process ownership uses a persistent
+kernel `flock` on the sibling `airpods-hubd.lock` file. The daemon safely opens
+that owned regular file without following symlinks, normalizes it to mode
+`0600`, and acquires an exclusive nonblocking lock before inspecting or
+changing the socket path. It holds the file descriptor throughout startup,
+READY and STREAMING operation, failure cleanup, and shutdown. Subscriber count
+does not affect this lock. Closing the descriptor after all owned resources
+are released lets the kernel release the lock. The regular lock file remains
+in the private runtime directory, so no unlink/recreation race or PID-based
+stale-lock policy exists.
+
+Socket-path ownership remains a separate defense. A Unix pathname alone is
+not an atomic process mutex because another process can observe the interval
+between `bind()` and `listen()`. While holding the process lock, the daemon
+performs the active/stale checks, creates and manually binds the stream socket,
+sets mode `0600`, and starts listening before constructing or opening the
+sensor session. A concurrent bind reports ownership failure without another
+unlink attempt. Only after the session opens does the daemon hand the
+already-bound socket to asyncio with automatic pathname cleanup disabled.
 If session open or asyncio handoff fails, the private listener is closed and
 only its recorded pathname identity is eligible for cleanup.
+
+Failures before session construction release the flock after cleaning any
+listener created by that attempt. Once session construction has been attempted,
+the daemon retains the flock in `FAILED` until explicit shutdown completes
+best-effort session and socket cleanup. This prevents a new owner while a
+possibly live or partially opened sensor session still exists. A failed
+session close likewise retains the flock and leaves the daemon `FAILED`; a
+later shutdown retry can release it only after close succeeds.
 
 ## Backpressure and failure behavior
 

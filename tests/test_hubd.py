@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import multiprocessing
 import os
 import socket
 import stat
@@ -12,6 +13,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -55,6 +57,7 @@ class FakeSession:
         self.open_error: BaseException | None = None
         self.start_error: BaseException | None = None
         self.stop_error: BaseException | None = None
+        self.close_error: BaseException | None = None
         self.open_gate: asyncio.Event | None = None
         self.start_gate: asyncio.Event | None = None
         self.stop_gate: asyncio.Event | None = None
@@ -95,6 +98,8 @@ class FakeSession:
     async def close(self) -> None:
         self.close_calls += 1
         self.events.append("close")
+        if self.close_error is not None:
+            raise self.close_error
 
     def inject(self, value: HeartRateReport | BaseException) -> None:
         self.reports.put_nowait(value)
@@ -126,6 +131,130 @@ class LazyFactory:
         session.open_gate = self.open_gate
         self.sessions.append(session)
         return session
+
+
+class ProcessSession:
+    def __init__(self, open_entered: Any, open_release: Any) -> None:
+        self.open_entered = open_entered
+        self.open_release = open_release
+        self.open_calls = 0
+        self.close_calls = 0
+
+    async def open(self) -> None:
+        self.open_calls += 1
+        self.open_entered.set()
+        released = await asyncio.to_thread(self.open_release.wait, 10.0)
+        if not released:
+            raise TimeoutError("process test open gate timed out")
+
+    async def start(self) -> None:
+        pass
+
+    async def receive_report(self) -> HeartRateReport:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def stop(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class ProcessFactory:
+    def __init__(self, open_entered: Any, open_release: Any) -> None:
+        self.open_entered = open_entered
+        self.open_release = open_release
+        self.calls = 0
+        self.sessions: list[ProcessSession] = []
+
+    @property
+    def open_calls(self) -> int:
+        return sum(session.open_calls for session in self.sessions)
+
+    @property
+    def close_calls(self) -> int:
+        return sum(session.close_calls for session in self.sessions)
+
+    def __call__(self) -> ProcessSession:
+        self.calls += 1
+        session = ProcessSession(self.open_entered, self.open_release)
+        self.sessions.append(session)
+        return session
+
+
+class BindPausedDaemon(AirPodsHubDaemon):
+    def __init__(self, *args: Any, bound: Any, release_bind: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._bound_event = bound
+        self._release_bind = release_bind
+
+    def _listener_bound(self) -> None:
+        self._bound_event.set()
+        if not self._release_bind.wait(10.0):
+            raise TimeoutError("process test bind gate timed out")
+
+
+def run_process_daemon(
+    socket_path: str,
+    open_entered: Any,
+    open_release: Any,
+    shutdown_requested: Any,
+    messages: Any,
+    bound: Any | None = None,
+    release_bind: Any | None = None,
+) -> None:
+    async def run() -> None:
+        factory = ProcessFactory(open_entered, open_release)
+        if bound is None:
+            daemon = AirPodsHubDaemon(factory, socket_path)
+        else:
+            daemon = BindPausedDaemon(
+                factory,
+                socket_path,
+                bound=bound,
+                release_bind=release_bind,
+            )
+        try:
+            await daemon.start()
+        except BaseException as error:
+            failed_state = daemon.state.value
+            await daemon.shutdown()
+            messages.put(
+                {
+                    "phase": "start_failed",
+                    "error": type(error).__name__,
+                    "state": failed_state,
+                    "factory_calls": factory.calls,
+                    "open_calls": factory.open_calls,
+                }
+            )
+            return
+
+        messages.put(
+            {
+                "phase": "ready",
+                "state": daemon.state.value,
+                "factory_calls": factory.calls,
+                "open_calls": factory.open_calls,
+                "lock_file_exists": daemon._lock_path.exists(),
+            }
+        )
+        requested = await asyncio.to_thread(shutdown_requested.wait, 10.0)
+        if not requested:
+            raise TimeoutError("process test shutdown gate timed out")
+        await daemon.shutdown()
+        messages.put(
+            {
+                "phase": "stopped",
+                "state": daemon.state.value,
+                "close_calls": factory.close_calls,
+                "lock_file_exists": daemon._lock_path.exists(),
+                "socket_exists": daemon.socket_path.exists(),
+            }
+        )
+
+    asyncio.run(run())
 
 
 class JsonClient:
@@ -196,6 +325,17 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(timeout):
             while not predicate():
                 await asyncio.sleep(0)
+
+    async def process_message(self, messages: Any) -> dict[str, Any]:
+        return await asyncio.wait_for(
+            asyncio.to_thread(messages.get, True, 10.0),
+            timeout=12.0,
+        )
+
+    async def join_process(self, process: Any) -> None:
+        await asyncio.to_thread(process.join, 10.0)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
 
     async def subscribe(self, client: JsonClient) -> dict[str, Any]:
         return await client.request("subscribe", stream="heart_rate")
@@ -428,6 +568,25 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.factory.session.events, ["open", "close"])
         self.assertEqual(self.daemon.state, DaemonState.STOPPED)
 
+    async def test_close_failure_retains_lock_until_shutdown_retry(self) -> None:
+        await self.start()
+        self.factory.session.close_error = RuntimeError("close failed")
+        await self.daemon.shutdown()
+        self.assertEqual(self.daemon.state, DaemonState.FAILED)
+        self.assertIsNotNone(self.daemon._lock_fd)
+        second_factory = LazyFactory()
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        with self.assertRaises(DaemonAlreadyRunningError):
+            await second_daemon.start()
+        self.assertEqual(second_factory.calls, 0)
+        await second_daemon.shutdown()
+
+        self.factory.session.close_error = None
+        await self.daemon.shutdown()
+        self.assertEqual(self.factory.session.close_calls, 2)
+        self.assertEqual(self.daemon.state, DaemonState.STOPPED)
+        self.assertIsNone(self.daemon._lock_fd)
+
     async def test_shutdown_streaming_stops_and_leaves_no_reader(self) -> None:
         await self.start()
         client = await self.client()
@@ -482,8 +641,51 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         socket_stat = self.socket_path.stat()
         self.assertTrue(stat.S_ISSOCK(socket_stat.st_mode))
         self.assertEqual(stat.S_IMODE(socket_stat.st_mode), 0o600)
+        lock_stat = self.daemon._lock_path.stat()
+        self.assertTrue(stat.S_ISREG(lock_stat.st_mode))
+        self.assertEqual(lock_stat.st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(lock_stat.st_mode), 0o600)
+        self.assertIsNotNone(self.daemon._lock_fd)
         await self.daemon.shutdown()
         self.assertFalse(self.socket_path.exists())
+        self.assertTrue(self.daemon._lock_path.exists())
+        self.assertIsNone(self.daemon._lock_fd)
+
+    async def test_process_lock_precedes_socket_checks_ready_and_streaming(
+        self,
+    ) -> None:
+        await self.start()
+        self.assertEqual(self.daemon.subscriber_count, 0)
+        self.assertEqual(self.daemon.state, DaemonState.READY)
+
+        ready_factory = LazyFactory()
+        ready_daemon = AirPodsHubDaemon(ready_factory, self.socket_path)
+        with patch.object(
+            hubd_server,
+            "_remove_safe_stale_socket",
+            side_effect=AssertionError("socket check must not run"),
+        ) as socket_check:
+            with self.assertRaises(DaemonAlreadyRunningError):
+                await ready_daemon.start()
+        socket_check.assert_not_awaited()
+        self.assertEqual(ready_factory.calls, 0)
+        await ready_daemon.shutdown()
+
+        client = await self.client()
+        await self.subscribe(client)
+        self.assertEqual(self.daemon.state, DaemonState.STREAMING)
+        streaming_factory = LazyFactory()
+        streaming_daemon = AirPodsHubDaemon(streaming_factory, self.socket_path)
+        with patch.object(
+            hubd_server,
+            "_remove_safe_stale_socket",
+            side_effect=AssertionError("socket check must not run"),
+        ) as socket_check:
+            with self.assertRaises(DaemonAlreadyRunningError):
+                await streaming_daemon.start()
+        socket_check.assert_not_awaited()
+        self.assertEqual(streaming_factory.calls, 0)
+        await streaming_daemon.shutdown()
 
     async def test_active_daemon_socket_cannot_be_stolen(self) -> None:
         await self.start()
@@ -511,6 +713,26 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.daemon.state, DaemonState.READY)
         finally:
             await second_daemon.shutdown()
+
+    async def test_active_listener_without_process_lock_is_not_removed(self) -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.socket_path))
+        listener.listen()
+        original = self.socket_path.lstat()
+        factory = LazyFactory()
+        daemon = AirPodsHubDaemon(factory, self.socket_path)
+        try:
+            with self.assertRaises(DaemonAlreadyRunningError):
+                await daemon.start()
+            self.assertEqual(factory.calls, 0)
+            current = self.socket_path.lstat()
+            self.assertEqual(
+                (current.st_dev, current.st_ino),
+                (original.st_dev, original.st_ino),
+            )
+        finally:
+            await daemon.shutdown()
+            listener.close()
 
     async def test_starting_daemon_owns_listener_before_session_open(self) -> None:
         open_gate = self.factory.session.open_gate = asyncio.Event()
@@ -561,7 +783,7 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         both_at_boundary = asyncio.Event()
         arrivals = 0
 
-        async def synchronized_prebind(_path: Path) -> None:
+        async def synchronized_prebind() -> None:
             nonlocal arrivals
             arrivals += 1
             if arrivals == 2:
@@ -570,8 +792,8 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             with patch.object(
-                hubd_server,
-                "_remove_safe_stale_socket",
+                AirPodsHubDaemon,
+                "_before_process_lock",
                 side_effect=synchronized_prebind,
             ):
                 starts = [
@@ -626,6 +848,212 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
             await second_daemon.shutdown()
         self.assertFalse(self.socket_path.exists())
 
+    async def test_cross_process_lock_exclusion_and_reuse(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        lock_path = self.socket_path.with_suffix(".lock")
+        processes: list[Any] = []
+        release_events: list[Any] = []
+        queues: list[Any] = []
+        try:
+            a_opened = context.Event()
+            a_release_open = context.Event()
+            a_shutdown = context.Event()
+            a_messages = context.Queue()
+            release_events.extend((a_release_open, a_shutdown))
+            queues.append(a_messages)
+            process_a = context.Process(
+                target=run_process_daemon,
+                args=(
+                    str(self.socket_path),
+                    a_opened,
+                    a_release_open,
+                    a_shutdown,
+                    a_messages,
+                ),
+            )
+            processes.append(process_a)
+            process_a.start()
+            self.assertTrue(await asyncio.to_thread(a_opened.wait, 10.0))
+            self.assertTrue(stat.S_ISSOCK(self.socket_path.lstat().st_mode))
+            self.assertTrue(stat.S_ISREG(lock_path.lstat().st_mode))
+
+            b_opened = context.Event()
+            b_release_open = context.Event()
+            b_release_open.set()
+            b_shutdown = context.Event()
+            b_messages = context.Queue()
+            queues.append(b_messages)
+            process_b = context.Process(
+                target=run_process_daemon,
+                args=(
+                    str(self.socket_path),
+                    b_opened,
+                    b_release_open,
+                    b_shutdown,
+                    b_messages,
+                ),
+            )
+            processes.append(process_b)
+            process_b.start()
+            rejected = await self.process_message(b_messages)
+            self.assertEqual(rejected["phase"], "start_failed")
+            self.assertEqual(rejected["error"], "DaemonAlreadyRunningError")
+            self.assertEqual(rejected["factory_calls"], 0)
+            self.assertEqual(rejected["open_calls"], 0)
+            await self.join_process(process_b)
+
+            a_release_open.set()
+            ready_a = await self.process_message(a_messages)
+            self.assertEqual(ready_a["phase"], "ready")
+            self.assertEqual(ready_a["state"], "ready")
+            self.assertEqual(ready_a["factory_calls"], 1)
+            self.assertEqual(ready_a["open_calls"], 1)
+            client_a = await JsonClient.connect(self.socket_path)
+            try:
+                self.assertTrue((await client_a.request("ping"))["pong"])
+            finally:
+                await client_a.close()
+            a_shutdown.set()
+            stopped_a = await self.process_message(a_messages)
+            self.assertEqual(stopped_a["phase"], "stopped")
+            self.assertEqual(stopped_a["close_calls"], 1)
+            self.assertTrue(stopped_a["lock_file_exists"])
+            self.assertFalse(stopped_a["socket_exists"])
+            await self.join_process(process_a)
+
+            c_opened = context.Event()
+            c_release_open = context.Event()
+            c_release_open.set()
+            c_shutdown = context.Event()
+            c_messages = context.Queue()
+            release_events.append(c_shutdown)
+            queues.append(c_messages)
+            process_c = context.Process(
+                target=run_process_daemon,
+                args=(
+                    str(self.socket_path),
+                    c_opened,
+                    c_release_open,
+                    c_shutdown,
+                    c_messages,
+                ),
+            )
+            processes.append(process_c)
+            process_c.start()
+            ready_c = await self.process_message(c_messages)
+            self.assertEqual(ready_c["phase"], "ready")
+            self.assertEqual(ready_c["factory_calls"], 1)
+            self.assertEqual(ready_c["open_calls"], 1)
+            client_c = await JsonClient.connect(self.socket_path)
+            try:
+                self.assertTrue((await client_c.request("ping"))["pong"])
+            finally:
+                await client_c.close()
+            c_shutdown.set()
+            stopped_c = await self.process_message(c_messages)
+            self.assertEqual(stopped_c["phase"], "stopped")
+            self.assertEqual(stopped_c["close_calls"], 1)
+            self.assertTrue(lock_path.exists())
+            self.assertFalse(self.socket_path.exists())
+            await self.join_process(process_c)
+        finally:
+            for event in release_events:
+                event.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                await asyncio.to_thread(process.join, 5.0)
+            for messages in queues:
+                messages.close()
+                messages.join_thread()
+
+    async def test_cross_process_lock_covers_bind_listen_window(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        processes: list[Any] = []
+        release_events: list[Any] = []
+        queues: list[Any] = []
+        try:
+            a_opened = context.Event()
+            a_release_open = context.Event()
+            a_release_open.set()
+            a_shutdown = context.Event()
+            a_bound = context.Event()
+            a_release_bind = context.Event()
+            a_messages = context.Queue()
+            release_events.extend((a_shutdown, a_release_bind))
+            queues.append(a_messages)
+            process_a = context.Process(
+                target=run_process_daemon,
+                args=(
+                    str(self.socket_path),
+                    a_opened,
+                    a_release_open,
+                    a_shutdown,
+                    a_messages,
+                    a_bound,
+                    a_release_bind,
+                ),
+            )
+            processes.append(process_a)
+            process_a.start()
+            self.assertTrue(await asyncio.to_thread(a_bound.wait, 10.0))
+            original = self.socket_path.lstat()
+
+            b_opened = context.Event()
+            b_release_open = context.Event()
+            b_release_open.set()
+            b_shutdown = context.Event()
+            b_messages = context.Queue()
+            queues.append(b_messages)
+            process_b = context.Process(
+                target=run_process_daemon,
+                args=(
+                    str(self.socket_path),
+                    b_opened,
+                    b_release_open,
+                    b_shutdown,
+                    b_messages,
+                ),
+            )
+            processes.append(process_b)
+            process_b.start()
+            rejected = await self.process_message(b_messages)
+            self.assertEqual(rejected["error"], "DaemonAlreadyRunningError")
+            self.assertEqual(rejected["factory_calls"], 0)
+            self.assertEqual(rejected["open_calls"], 0)
+            current = self.socket_path.lstat()
+            self.assertEqual(
+                (current.st_dev, current.st_ino),
+                (original.st_dev, original.st_ino),
+            )
+            await self.join_process(process_b)
+
+            a_release_bind.set()
+            ready = await self.process_message(a_messages)
+            self.assertEqual(ready["phase"], "ready")
+            self.assertEqual(ready["factory_calls"], 1)
+            self.assertEqual(ready["open_calls"], 1)
+            client = await JsonClient.connect(self.socket_path)
+            try:
+                self.assertTrue((await client.request("ping"))["pong"])
+            finally:
+                await client.close()
+            a_shutdown.set()
+            stopped = await self.process_message(a_messages)
+            self.assertEqual(stopped["phase"], "stopped")
+            self.assertFalse(stopped["socket_exists"])
+            await self.join_process(process_a)
+        finally:
+            for event in release_events:
+                event.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                await asyncio.to_thread(process.join, 5.0)
+            for messages in queues:
+                messages.close()
+                messages.join_thread()
+
     async def test_asyncio_receives_only_prebound_owned_socket(self) -> None:
         original = asyncio.start_unix_server
         with patch.object(
@@ -674,6 +1102,14 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(lambda: self.factory.session.stop_calls == 1)
         self.assertEqual(self.daemon.state, DaemonState.SHUTTING_DOWN)
         self.assertIsNone(self.daemon._server)
+        self.assertIsNotNone(self.daemon._lock_fd)
+
+        second_factory = LazyFactory()
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        with self.assertRaises(DaemonAlreadyRunningError):
+            await second_daemon.start()
+        self.assertEqual(second_factory.calls, 0)
+        await second_daemon.shutdown()
 
         with self.assertRaises(OSError):
             await asyncio.open_unix_connection(self.socket_path)
@@ -687,6 +1123,8 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.daemon._reader_task)
         self.assertEqual(self.factory.session.close_calls, 1)
         self.assertFalse(self.socket_path.exists())
+        self.assertIsNone(self.daemon._lock_fd)
+        self.assertTrue(self.daemon._lock_path.exists())
 
     async def test_shutdown_does_not_remove_replacement_regular_file(self) -> None:
         await self.start()
@@ -762,8 +1200,16 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.factory.calls, 1)
         self.assertIsNone(self.daemon._server)
         self.assertFalse(self.socket_path.exists())
+        self.assertIsNotNone(self.daemon._lock_fd)
+        second_factory = LazyFactory()
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        with self.assertRaises(DaemonAlreadyRunningError):
+            await second_daemon.start()
+        self.assertEqual(second_factory.calls, 0)
+        await second_daemon.shutdown()
         await self.daemon.shutdown()
         self.assertEqual(self.factory.session.close_calls, 1)
+        self.assertIsNone(self.daemon._lock_fd)
 
 
 class SocketPathSafetyTests(unittest.TestCase):
@@ -776,10 +1222,76 @@ class SocketPathSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hubd.sock"
             path.write_text("keep me")
-            daemon = AirPodsHubDaemon(FakeFactory(), path)
+            factory = FakeFactory()
+            daemon = AirPodsHubDaemon(factory, path)
             with self.assertRaises(UnsafeSocketPathError):
                 asyncio.run(daemon.start())
             self.assertEqual(path.read_text(), "keep me")
+            self.assertEqual(factory.calls, 0)
+            self.assertIsNone(daemon._lock_fd)
+
+    def test_lock_file_symlink_is_rejected_without_socket_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd.sock"
+            lock_path = socket_path.with_suffix(".lock")
+            target = Path(directory) / "target"
+            target.write_text("keep me")
+            lock_path.symlink_to(target)
+            factory = FakeFactory()
+            daemon = AirPodsHubDaemon(factory, socket_path)
+            with self.assertRaises(UnsafeSocketPathError):
+                asyncio.run(daemon.start())
+            self.assertEqual(factory.calls, 0)
+            self.assertFalse(socket_path.exists())
+            self.assertTrue(lock_path.is_symlink())
+            self.assertEqual(target.read_text(), "keep me")
+
+    def test_directory_at_lock_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd.sock"
+            lock_path = socket_path.with_suffix(".lock")
+            lock_path.mkdir()
+            factory = FakeFactory()
+            daemon = AirPodsHubDaemon(factory, socket_path)
+            with self.assertRaises(UnsafeSocketPathError):
+                asyncio.run(daemon.start())
+            self.assertEqual(factory.calls, 0)
+            self.assertTrue(lock_path.is_dir())
+            self.assertFalse(socket_path.exists())
+
+    def test_fifo_at_lock_path_is_rejected_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd.sock"
+            lock_path = socket_path.with_suffix(".lock")
+            os.mkfifo(lock_path, mode=0o600)
+            factory = FakeFactory()
+            daemon = AirPodsHubDaemon(factory, socket_path)
+            with self.assertRaises(UnsafeSocketPathError):
+                asyncio.run(daemon.start())
+            self.assertEqual(factory.calls, 0)
+            self.assertTrue(stat.S_ISFIFO(lock_path.lstat().st_mode))
+            self.assertFalse(socket_path.exists())
+
+    def test_foreign_owned_lock_stat_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd.sock"
+            daemon = AirPodsHubDaemon(FakeFactory(), socket_path)
+            real_fstat = os.fstat
+
+            def foreign_fstat(lock_fd: int) -> Any:
+                actual = real_fstat(lock_fd)
+                return SimpleNamespace(
+                    st_mode=actual.st_mode,
+                    st_uid=os.geteuid() + 1,
+                )
+
+            with patch.object(
+                hubd_server.os, "fstat", side_effect=foreign_fstat
+            ):
+                with self.assertRaises(UnsafeSocketPathError):
+                    daemon._acquire_process_lock()
+            self.assertIsNone(daemon._lock_fd)
+            self.assertFalse(socket_path.exists())
 
     def test_foreign_owned_socket_is_never_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

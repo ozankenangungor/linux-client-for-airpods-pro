@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import os
 import socket
 import stat
@@ -185,6 +186,8 @@ class AirPodsHubDaemon:
         self._reader_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._handler_tasks: set[asyncio.Task[None]] = set()
+        self._lock_path = self.socket_path.with_suffix(".lock")
+        self._lock_fd: int | None = None
         self._owned_socket_identity: tuple[int, int] | None = None
         self._hr_may_be_active = False
         self._start_attempted = False
@@ -211,10 +214,14 @@ class AirPodsHubDaemon:
             self._start_attempted = True
             self.state = DaemonState.STARTING
             owned_listener: socket.socket | None = None
+            session_factory_attempted = False
             try:
                 _validate_socket_path(self.socket_path)
+                await self._before_process_lock()
+                self._acquire_process_lock()
                 await _remove_safe_stale_socket(self.socket_path)
                 owned_listener = self._acquire_listener()
+                session_factory_attempted = True
                 self._session = self._session_factory()
                 await self._bounded(self._session.open())
                 self._server = await asyncio.start_unix_server(
@@ -229,6 +236,8 @@ class AirPodsHubDaemon:
                 if owned_listener is not None:
                     owned_listener.close()
                 self._remove_owned_socket()
+                if not session_factory_attempted:
+                    self._release_process_lock()
                 if isinstance(error, asyncio.CancelledError):
                     raise
                 if isinstance(
@@ -237,6 +246,55 @@ class AirPodsHubDaemon:
                     raise
                 raise SessionOperationError("daemon startup failed") from error
             self.state = DaemonState.READY
+
+    async def _before_process_lock(self) -> None:
+        """Run the private startup-boundary extension point."""
+
+    def _acquire_process_lock(self) -> None:
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(self._lock_path, flags, 0o600)
+        except OSError as error:
+            raise UnsafeSocketPathError("could not safely open daemon lock") from error
+
+        try:
+            lock_stat = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_stat.st_mode)
+                or lock_stat.st_uid != os.geteuid()
+            ):
+                raise UnsafeSocketPathError(
+                    "daemon lock must be an owned regular file"
+                )
+            os.fchmod(lock_fd, 0o600)
+            verified = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(verified.st_mode)
+                or verified.st_uid != os.geteuid()
+                or stat.S_IMODE(verified.st_mode) != 0o600
+            ):
+                raise UnsafeSocketPathError("daemon lock verification failed")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise DaemonAlreadyRunningError(
+                        "another daemon holds the process lock"
+                    ) from error
+                raise UnsafeSocketPathError(
+                    "could not acquire daemon process lock"
+                ) from error
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        self._lock_fd = lock_fd
+
+    def _release_process_lock(self) -> None:
+        lock_fd = self._lock_fd
+        self._lock_fd = None
+        if lock_fd is not None:
+            os.close(lock_fd)
 
     def _acquire_listener(self) -> socket.socket:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -261,6 +319,7 @@ class AirPodsHubDaemon:
                 socket_stat.st_dev,
                 socket_stat.st_ino,
             )
+            self._listener_bound()
             os.chmod(self.socket_path, 0o600)
             current = self.socket_path.lstat()
             if (
@@ -280,6 +339,9 @@ class AirPodsHubDaemon:
             listener.close()
             self._remove_owned_socket()
             raise
+
+    def _listener_bound(self) -> None:
+        """Run the private post-bind extension point before listening."""
 
     async def shutdown(self) -> None:
         async with self._shutdown_lock:
@@ -327,13 +389,18 @@ class AirPodsHubDaemon:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 self._background_tasks.difference_update(tasks)
+            session_closed = True
             if self._session is not None:
                 try:
                     await self._bounded(self._session.close())
                 except BaseException:
-                    pass
+                    session_closed = False
             self._remove_owned_socket()
-            self.state = DaemonState.STOPPED
+            if session_closed:
+                self._release_process_lock()
+                self.state = DaemonState.STOPPED
+            else:
+                self.state = DaemonState.FAILED
 
     async def _bounded(self, operation: Any) -> Any:
         return await asyncio.wait_for(operation, timeout=self._operation_timeout)
