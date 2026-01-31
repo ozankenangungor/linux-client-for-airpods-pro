@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import socket
@@ -15,6 +16,7 @@ from typing import Any
 from unittest.mock import patch
 
 import airpods_hr
+import airpods_hr._hubd.server as hubd_server
 from airpods_hr._hubd.protocol import (
     MAX_FRAME_SIZE,
     OUTBOUND_QUEUE_SIZE,
@@ -22,6 +24,7 @@ from airpods_hr._hubd.protocol import (
 )
 from airpods_hr._hubd.server import (
     AirPodsHubDaemon,
+    DaemonAlreadyRunningError,
     DaemonState,
     SessionOperationError,
     UnsafeSocketPathError,
@@ -461,14 +464,66 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         await self.daemon.shutdown()
         self.assertFalse(self.socket_path.exists())
 
+    async def test_active_daemon_socket_cannot_be_stolen(self) -> None:
+        await self.start()
+        first = await self.client()
+        self.assertTrue((await first.request("ping"))["pong"])
+        original = self.socket_path.lstat()
+
+        second_factory = FakeFactory()
+        second_daemon = AirPodsHubDaemon(second_factory, self.socket_path)
+        try:
+            with self.assertRaises(DaemonAlreadyRunningError):
+                await second_daemon.start()
+            self.assertEqual(second_daemon.state, DaemonState.FAILED)
+            self.assertEqual(second_factory.calls, 0)
+            self.assertEqual(second_factory.session.open_calls, 0)
+            current = self.socket_path.lstat()
+            self.assertEqual(
+                (current.st_dev, current.st_ino),
+                (original.st_dev, original.st_ino),
+            )
+
+            later = await self.client()
+            self.assertTrue((await later.request("ping"))["pong"])
+            self.assertEqual(self.daemon.state, DaemonState.READY)
+        finally:
+            await second_daemon.shutdown()
+
     async def test_owned_stale_socket_is_safely_replaced(self) -> None:
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(self.socket_path))
         stale.close()
-        old_inode = self.socket_path.stat().st_ino
         await self.start()
-        self.assertNotEqual(self.socket_path.stat().st_ino, old_inode)
         self.assertEqual(self.daemon.state, DaemonState.READY)
+        self.assertTrue(stat.S_ISSOCK(self.socket_path.lstat().st_mode))
+        client = await self.client()
+        self.assertTrue((await client.request("ping"))["pong"])
+        await self.daemon.shutdown()
+        self.assertFalse(self.socket_path.exists())
+
+    async def test_shutdown_disables_new_accepts_before_stop_finishes(self) -> None:
+        await self.start()
+        client = await self.client()
+        await self.subscribe(client)
+        stop_gate = self.factory.session.stop_gate = asyncio.Event()
+        shutdown_task = asyncio.create_task(self.daemon.shutdown())
+        await self.wait_for(lambda: self.factory.session.stop_calls == 1)
+        self.assertEqual(self.daemon.state, DaemonState.SHUTTING_DOWN)
+        self.assertIsNone(self.daemon._server)
+
+        with self.assertRaises(OSError):
+            await asyncio.open_unix_connection(self.socket_path)
+
+        stop_gate.set()
+        await shutdown_task
+        self.assertFalse(self.daemon._clients)
+        self.assertFalse(self.daemon._handler_tasks)
+        self.assertFalse(self.daemon._background_tasks)
+        self.assertFalse(self.daemon.report_reader_active)
+        self.assertIsNone(self.daemon._reader_task)
+        self.assertEqual(self.factory.session.close_calls, 1)
+        self.assertFalse(self.socket_path.exists())
 
     async def test_shutdown_does_not_remove_replacement_regular_file(self) -> None:
         await self.start()
@@ -548,6 +603,78 @@ class SocketPathSafetyTests(unittest.TestCase):
             with self.assertRaises(UnsafeSocketPathError):
                 asyncio.run(daemon.start())
             self.assertEqual(path.read_text(), "keep me")
+
+    def test_foreign_owned_socket_is_never_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hubd.sock"
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(path))
+            stale.close()
+            with patch.object(
+                hubd_server.os, "geteuid", return_value=os.geteuid() + 1
+            ):
+                with self.assertRaises(UnsafeSocketPathError):
+                    asyncio.run(hubd_server._remove_safe_stale_socket(path))
+            self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
+
+    def test_path_replacement_during_stale_probe_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hubd.sock"
+            moved = Path(directory) / "original.sock"
+            original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            original.bind(str(path))
+            replacements: list[socket.socket] = []
+
+            def replace_path(_path: Path) -> None:
+                path.rename(moved)
+                replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                replacement.bind(str(path))
+                replacements.append(replacement)
+
+            factory = FakeFactory()
+            daemon = AirPodsHubDaemon(factory, path)
+            try:
+                with patch.object(
+                    hubd_server,
+                    "_probe_existing_socket",
+                    side_effect=replace_path,
+                ):
+                    with self.assertRaisesRegex(UnsafeSocketPathError, "changed"):
+                        asyncio.run(daemon.start())
+                self.assertEqual(factory.calls, 0)
+                self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
+                self.assertTrue(stat.S_ISSOCK(moved.lstat().st_mode))
+            finally:
+                original.close()
+                for replacement in replacements:
+                    replacement.close()
+
+    def test_ambiguous_socket_probe_error_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hubd.sock"
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(path))
+            stale.close()
+
+            class AmbiguousProbe:
+                def settimeout(self, _timeout: float) -> None:
+                    pass
+
+                def connect(self, _path: str) -> None:
+                    raise PermissionError(errno.EACCES, "ambiguous")
+
+                def close(self) -> None:
+                    pass
+
+            async def attempt_removal() -> None:
+                with patch.object(
+                    hubd_server.socket, "socket", return_value=AmbiguousProbe()
+                ):
+                    await hubd_server._remove_safe_stale_socket(path)
+
+            with self.assertRaisesRegex(UnsafeSocketPathError, "proven stale"):
+                asyncio.run(attempt_removal())
+            self.assertTrue(stat.S_ISSOCK(path.lstat().st_mode))
 
     def test_symlinked_runtime_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as outer:

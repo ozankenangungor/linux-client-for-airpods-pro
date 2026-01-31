@@ -123,10 +123,14 @@ to `/tmp`, TCP, HTTP, WebSocket, or another browser-accessible listener. The
 runtime directory must be absolute, owned by the daemon UID, and have no group
 or other permissions. The socket is changed to mode `0600` immediately after
 bind. An existing path is removed only when it is an owned Unix socket inside
-that protected directory. Clean shutdown checks the original device and inode
-before unlinking. On Linux, each accepted peer is checked with `SO_PEERCRED`
-and its UID must equal the daemon UID. Unix user isolation is the Daemon serviceA
-security boundary.
+that protected directory and a bounded connection probe returns
+`ECONNREFUSED`. A successful connection proves another daemon is active and
+blocks startup before creating or opening a session. Timeouts and other
+ambiguous errors fail closed. The path's type, owner, device, and inode are
+checked again after the probe and before stale removal. Clean shutdown checks
+the original device and inode before unlinking. On Linux, each accepted peer
+is checked with `SO_PEERCRED` and its UID must equal the daemon UID. Unix user
+isolation is the Daemon serviceA security boundary.
 
 ## Backpressure and failure behavior
 
@@ -142,7 +146,10 @@ subscriptions, enters `FAILED`, and sends connected clients a generic service
 error without packet data. A STOP failure enters `FAILED` and never claims
 `READY`. Daemon serviceA does not retry, create another session or AAP channel,
 reconnect Bluetooth, or define recovery. Shutdown still performs bounded,
-best-effort cleanup of resources the daemon owns.
+best-effort cleanup of resources the daemon owns. Shutdown enters
+`SHUTTING_DOWN` and closes the listening server before waiting on HR or client
+cleanup, preventing new connections from entering while teardown is in
+progress.
 
 This foundation does not freeze a public IPC or client API. Later work may
 revise the protocol before release, add a Rust client crate, and define other

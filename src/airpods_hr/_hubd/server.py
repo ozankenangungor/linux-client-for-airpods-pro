@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import socket
 import stat
@@ -55,6 +56,10 @@ class SessionOperationError(HubDaemonError):
     """The injected session failed during a daemon lifecycle operation."""
 
 
+class DaemonAlreadyRunningError(HubDaemonError):
+    """An active daemon already owns the requested Unix socket."""
+
+
 PeerUidProvider = Callable[[Any], int]
 
 
@@ -95,7 +100,23 @@ def _validate_socket_path(path: Path) -> None:
         )
 
 
-def _remove_safe_stale_socket(path: Path) -> None:
+def _probe_existing_socket(path: Path) -> None:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.25)
+    try:
+        probe.connect(str(path))
+    except OSError as error:
+        if error.errno == errno.ECONNREFUSED:
+            return
+        raise UnsafeSocketPathError(
+            "existing socket state could not be proven stale"
+        ) from error
+    finally:
+        probe.close()
+    raise DaemonAlreadyRunningError("an active daemon already owns the socket")
+
+
+async def _remove_safe_stale_socket(path: Path) -> None:
     try:
         existing = path.lstat()
     except FileNotFoundError:
@@ -104,6 +125,22 @@ def _remove_safe_stale_socket(path: Path) -> None:
         raise UnsafeSocketPathError("cannot inspect existing socket path") from error
     if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.geteuid():
         raise UnsafeSocketPathError("existing socket path is not an owned socket")
+    identity = (existing.st_dev, existing.st_ino)
+    await asyncio.to_thread(_probe_existing_socket, path)
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise UnsafeSocketPathError(
+            "existing socket path changed during stale check"
+        ) from error
+    if (
+        not stat.S_ISSOCK(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or (current.st_dev, current.st_ino) != identity
+    ):
+        raise UnsafeSocketPathError(
+            "existing socket path changed during stale check"
+        )
     path.unlink()
 
 
@@ -175,7 +212,7 @@ class AirPodsHubDaemon:
             self.state = DaemonState.STARTING
             try:
                 _validate_socket_path(self.socket_path)
-                _remove_safe_stale_socket(self.socket_path)
+                await _remove_safe_stale_socket(self.socket_path)
                 self._session = self._session_factory()
                 await self._bounded(self._session.open())
                 self._server = await asyncio.start_unix_server(
@@ -192,7 +229,9 @@ class AirPodsHubDaemon:
                 self.state = DaemonState.FAILED
                 if isinstance(error, asyncio.CancelledError):
                     raise
-                if isinstance(error, UnsafeSocketPathError):
+                if isinstance(
+                    error, (DaemonAlreadyRunningError, UnsafeSocketPathError)
+                ):
                     raise
                 raise SessionOperationError("daemon startup failed") from error
             self.state = DaemonState.READY
@@ -203,6 +242,10 @@ class AirPodsHubDaemon:
                 return
             async with self._lifecycle_lock:
                 self.state = DaemonState.SHUTTING_DOWN
+                server = self._server
+                self._server = None
+                if server is not None:
+                    server.close()
                 if self._hr_may_be_active and self._session is not None:
                     try:
                         await self._bounded(self._session.stop())
@@ -231,15 +274,14 @@ class AirPodsHubDaemon:
             if handler_tasks:
                 await asyncio.gather(*handler_tasks, return_exceptions=True)
                 self._handler_tasks.difference_update(handler_tasks)
+            if server is not None:
+                await server.wait_closed()
             tasks = tuple(self._background_tasks)
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            if self._server is not None:
-                self._server.close()
-                await self._server.wait_closed()
-                self._server = None
+                self._background_tasks.difference_update(tasks)
             if self._session is not None:
                 try:
                     await self._bounded(self._session.close())
@@ -519,6 +561,7 @@ class AirPodsHubDaemon:
 
 __all__ = [
     "AirPodsHubDaemon",
+    "DaemonAlreadyRunningError",
     "DaemonState",
     "HubDaemonError",
     "SessionOperationError",
