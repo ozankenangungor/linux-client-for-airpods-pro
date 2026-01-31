@@ -9,7 +9,7 @@ import socket
 import stat
 import tempfile
 import unittest
-
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -28,6 +28,7 @@ from airpods_hr._hubd.server import (
     socket_path_from_environment,
 )
 from airpods_hr.heartrate import HeartRateReport
+from tools.probe_hubd import main as probe_main
 
 
 def report(bpm: int = 80, *, field_5: int = 1, sequence: int = 1) -> HeartRateReport:
@@ -585,3 +586,20 @@ class SocketPathSafetyTests(unittest.TestCase):
             self.assertNotIn("_airpods_aap_core", path.read_text(), str(path))
 
 
+class HubProbeTests(unittest.TestCase):
+    def test_private_probe_proves_one_session_fanout(self) -> None:
+        stream = StringIO()
+        self.assertEqual(probe_main(["--samples", "3"], stream=stream), 0)
+        output = stream.getvalue()
+        for expected in (
+            "session_objects_created=1",
+            "session_opens=1",
+            "session_starts=1",
+            "reports_read=3",
+            "client_a_reports=3",
+            "client_b_reports=3",
+            "session_stops=1",
+            "session_closes=1",
+            "HUBD PRIVATE PROBE PASS",
+        ):
+            self.assertIn(expected, output)
