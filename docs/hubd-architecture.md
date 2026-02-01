@@ -5,6 +5,15 @@ It uses injected fake sessions and never opens Bluetooth. The package lives at
 `airpods_hr._hubd`, remains private, and has no installed console script or
 public import from `airpods_hr`.
 
+## Daemon serviceA FINAL PASS
+
+Daemon serviceA is accepted at commit
+`7239172be6d3be4189f00970756f84cccd6b7e8b`. Hardware-independent validation
+proved one persistent injected session, subscriber-arbitrated HR lifecycle,
+one report reader with bounded multi-client fan-out, same-UID private Unix IPC,
+safe listener ownership, and a full-lifetime cross-process kernel lock. The
+accepted implementation performed no Bluetooth access and froze no public API.
+
 ## Why one daemon owns the AAP session
 
 Hardware validation found that one long-lived AAP PSM `0x1001` connection can
