@@ -134,6 +134,31 @@ addresses, keys, or credentials. It does not retry, create another production
 session or AAP channel, reconnect Bluetooth, bypass descriptors, continue from
 an ACK alone, or use a Bumble controller-handoff fallback.
 
+## Daemon serviceB FINAL PASS
+
+Testing ran the reviewed production probe from a fresh normal BlueZ
+reconnect with the AirPods normally connected, ordinary A2DP active, and music
+playing continuously. One production session was constructed, opened one
+transport, and completed one descriptor handshake. Two real Unix IPC clients
+simultaneously received the same five first-cycle samples: 169, 127, 83, 79,
+and 79 BPM, all with right source side. After both clients unsubscribed, one
+existing client restarted HR on the same production session and received 169,
+100, 71, 72, and 74 BPM.
+
+The final counters were one factory call, one production session object, one
+transport open, one descriptor handshake, two HR activations, two HR stops,
+and ten reports received. Client event counts were 5, 5, and 5. Clean shutdown
+reached `STOPPED`, removed the owned socket, and released the process lock. The
+human operator confirmed music remained uninterrupted from start to finish.
+Daemon serviceB is therefore FINAL PASS: the real production session composes with
+the daemon, preserves one persistent AAP channel across a zero-subscriber
+READY interval, and fans one sensor reader out to concurrent local clients
+without disrupting observed audio coexistence.
+
+This evidence does not establish systemd service lifecycle, login or session
+auto-start, daemon crash recovery, production restart behavior, or a stable
+public SDK/API. The experimental IPC remains subject to change.
+
 ## Lifecycle and arbitration
 
 The daemon creates exactly one session object and calls `open()` exactly once
