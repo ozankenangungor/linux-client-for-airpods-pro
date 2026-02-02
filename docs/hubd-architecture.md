@@ -53,14 +53,75 @@ The first daemon control plane is Python because the hardware-proven
 Rewriting that path in Rust would combine an architecture change with a
 transport migration. Daemon serviceA instead defines a small injected session
 boundary: `open()`, `start()`, `receive_report()`, `stop()`, and `close()`.
-Tests and the private probe supply fakes. No daemon module imports or creates
-the real production session; Daemon serviceB will add and validate that adapter.
+The accepted daemon core and its tests continue to use injected fakes.
+
+Daemon serviceB adds the separate private composition module
+`airpods_hr._hubd.production`. Its dependency points from hubd to the frozen
+`production_session` module. `InternalProductionSession` already satisfies the
+daemon session protocol, so the factory returns it directly and adds no BlueZ,
+L2CAP, descriptor, activation, parsing, STOP, or cleanup behavior. The
+production session remains authoritative. Neither the composition module nor
+the probe is exported from `airpods_hr`.
 
 Rust retains its Iteration 9.7 role. `airpods-aap-core` is the portable protocol
 core and `_airpods_aap_core` is the private PyO3 parity bridge. The Python
 parser remains authoritative, and no production parsing path changes. A
 future Rust client crate should speak to the daemon instead of opening another
 AAP connection.
+
+## Daemon serviceB private production probe
+
+The repository-private `tools/probe_hubd_production.py` composes exactly one
+production session with one daemon and exercises it only when the operator
+supplies `--execute`. Its default invocation is a deterministic dry run: it
+does not resolve a socket, construct the production factory, connect to BlueZ,
+or open Bluetooth. Daemon serviceB code completion is therefore not hardware
+validation and must not be marked FINAL PASS until testing runs the reviewed
+probe and records hardware evidence.
+
+The future execution uses
+`$XDG_RUNTIME_DIR/airpods-hubd-probe.sock`, including the accepted sibling
+process lock. Two real Unix JSONL clients ping the daemon and subscribe. The
+first subscription starts HR, the second shares the same activation, and both
+collect a bounded default target of five events with bounded client reads.
+Removing the first subscriber leaves HR streaming. Removing the last stops HR
+while keeping the production session and AAP channel open. After a five-second
+delay, one existing client starts a second activation on the same session,
+collects five events, and stops. Daemon shutdown then closes that session once,
+removes its owned socket inode, and releases the process lock.
+
+The production open path has several individually bounded operations. With
+the defaults, its conservative upper window is 90 seconds: nine 5-second
+D-Bus/profile/checkpoint windows, a 10-second L2CAP connect, a 5-second AAP ACK
+window, and a 30-second descriptor window. The calculated 130-second floor
+also covers the bounded cleanup windows following a late failure and adds a
+10-second outer margin. The private integration therefore uses a bounded
+150-second outer daemon operation timeout. It rejects values below the
+calculated production-operation floor so the daemon cannot silently cancel a
+legitimate inner handshake or its cleanup. Production timeouts remain
+unchanged.
+
+The expected acceptance counters after the two cycles are
+`transport_opens == 1`, `descriptor_handshakes == 1`,
+`hr_activations == 2`, and `hr_stops == 2`. `reports_received` may exceed the
+minimum useful target because the one reader can legally receive another
+sample before an unsubscribe completes. The probe does not filter, smooth,
+deduplicate, or require an exact report count. It also reports one factory call
+and one production session object.
+
+Before a future owner run, the operator must establish normal BlueZ ownership,
+perform a fresh normal AirPods disconnect and reconnect outside the probe,
+confirm the AirPods are normally connected with the ordinary A2DP profile, and
+play music. The probe performs no disconnect, reconnect, adapter power change,
+pairing operation, or fallback. The human operator must separately confirm
+whether music remained uninterrupted; software counters cannot establish
+audio continuity.
+
+Any execution failure follows the Daemon serviceA terminal failure model. The probe
+performs bounded cleanup and reports a safe category without packet bytes,
+addresses, keys, or credentials. It does not retry, create another production
+session or AAP channel, reconnect Bluetooth, bypass descriptors, continue from
+an ACK alone, or use a Bumble controller-handoff fallback.
 
 ## Lifecycle and arbitration
 
@@ -192,6 +253,6 @@ progress.
 
 This foundation does not freeze a public IPC or client API. Later work may
 revise the protocol before release, add a Rust client crate, and define other
-client bindings. Daemon serviceB is reserved for the explicit real
-`ProductionHeartRateSession` adapter and separately authorized hardware
-validation.
+client bindings. Daemon serviceB supplies only the private production composition and
+the separately authorized opt-in probe; it does not add a service installer or
+public client SDK.

@@ -2,32 +2,249 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import errno
+import fcntl
+import hashlib
 import json
+import os
+import socket
+import stat
 import tempfile
+import tomllib
 import unittest
+from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
+
 from airpods_hr._hubd import production as hubd_production
-from airpods_hr._hubd.production import DEFAULT_DAEMON_OPERATION_TIMEOUT, ProductionHubConfig, ProductionSessionFactory, minimum_daemon_operation_timeout
+from airpods_hr._hubd.production import (
+    DEFAULT_DAEMON_OPERATION_TIMEOUT,
+    ProductionHubConfig,
+    ProductionSessionFactory,
+    create_production_hub,
+    minimum_daemon_operation_timeout,
+)
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
-from tools.probe_hubd_production import ProbeClient, ProbeFailure
+from airpods_hr._hubd.server import DaemonState
+from airpods_hr.heartrate import HeartRateReport
+from airpods_hr.production_session import ProductionSessionCounters
+from tools import probe_hubd_production
+from tools.probe_hubd_production import ProbeClient, ProbeFailure, main, run_probe
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-
 PRODUCTION_SESSION_SHA256 = (
     "f4141c6372c9bda65b4aca1b09c40e2f024ec8fe1b75964e8cc5f26c2156371e"
 )
-
-
-
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
 )
 
+
+def report(index: int) -> HeartRateReport:
+    return HeartRateReport(
+        bpm=169 if index == 0 else 80 + index,
+        aux=20,
+        sequence=index,
+        field_5=1 if index % 2 == 0 else 2,
+        timestamp_ticks=100 + index,
+        flags=0x1000,
+    )
+
+
+class FakeProductionSession:
+    def __init__(self, *, open_error: BaseException | None = None) -> None:
+        self.open_error = open_error
+        self.open_calls = 0
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.close_calls = 0
+        self.reports_received = 0
+        self.reports: asyncio.Queue[HeartRateReport] = asyncio.Queue()
+
+    @property
+    def counters(self) -> ProductionSessionCounters:
+        return ProductionSessionCounters(
+            transport_opens=self.open_calls,
+            descriptor_handshakes=self.open_calls,
+            hr_activations=self.start_calls,
+            hr_stops=self.stop_calls,
+            reports_received=self.reports_received,
+        )
+
+    async def open(self) -> None:
+        self.open_calls += 1
+        if self.open_error is not None:
+            raise self.open_error
+
+    async def start(self) -> None:
+        self.start_calls += 1
+
+    async def receive_report(self) -> HeartRateReport:
+        value = await self.reports.get()
+        self.reports_received += 1
+        return value
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeBuilder:
+    def __init__(self, session: FakeProductionSession) -> None:
+        self.session = session
+        self.calls = 0
+        self.kwargs: dict[str, Any] = {}
+
+    def __call__(self, **kwargs: Any) -> FakeProductionSession:
+        self.calls += 1
+        self.kwargs = kwargs
+        return self.session
+
+
+def process_lock_is_held(lock_path: Path) -> bool:
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+class ProductionIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_two_real_clients_reuse_one_production_style_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd-production.sock"
+            lock_path = socket_path.with_suffix(".lock")
+            session = FakeProductionSession()
+            builder = FakeBuilder(session)
+            lock_during_restart: list[bool] = []
+
+            async def inject_cycle(cycle: int, active: Any) -> None:
+                self.assertIs(active, session)
+                self.assertTrue(process_lock_is_held(lock_path))
+                for index in range(3):
+                    session.reports.put_nowait(report(index))
+
+            async def restart_wait(delay: float) -> None:
+                self.assertEqual(delay, 0)
+                lock_during_restart.append(process_lock_is_held(lock_path))
+
+            output: list[str] = []
+            status = await run_probe(
+                execute=True,
+                socket_path=socket_path,
+                sample_target=2,
+                restart_delay=0,
+                client_timeout=2,
+                output=output.append,
+                session_builder=builder,
+                sleep=restart_wait,
+                cycle_ready=inject_cycle,
+            )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(builder.calls, 1)
+            self.assertEqual(session.open_calls, 1)
+            self.assertEqual(session.start_calls, 2)
+            self.assertEqual(session.stop_calls, 2)
+            self.assertEqual(session.close_calls, 1)
+            self.assertGreaterEqual(session.reports_received, 4)
+            self.assertEqual(lock_during_restart, [True])
+            self.assertFalse(process_lock_is_held(lock_path))
+            self.assertFalse(socket_path.exists())
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+            self.assertIn("factory_calls=1", output)
+            self.assertIn("client_event_counts=2,2,2", output)
+            self.assertIn("HUBD PRODUCTION PROBE PASS", output)
+            self.assertTrue(any("bpm=169" in line for line in output))
+
+    async def test_failure_does_not_retry_or_construct_another_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd-production.sock"
+            session = FakeProductionSession(open_error=RuntimeError("open failed"))
+            builder = FakeBuilder(session)
+            output: list[str] = []
+            status = await run_probe(
+                execute=True,
+                socket_path=socket_path,
+                restart_delay=0,
+                client_timeout=1,
+                output=output.append,
+                session_builder=builder,
+            )
+            self.assertEqual(status, 1)
+            self.assertEqual(builder.calls, 1)
+            self.assertEqual(session.open_calls, 1)
+            self.assertEqual(session.close_calls, 1)
+            self.assertFalse(socket_path.exists())
+            self.assertIn("factory_calls=1", output)
+            self.assertIn("  transport_opens=1", output)
+            self.assertTrue(any("PROBE FAIL category=" in line for line in output))
+
+    async def test_keyboard_interrupt_runs_bounded_owned_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd-production.sock"
+            session = FakeProductionSession()
+            builder = FakeBuilder(session)
+
+            async def interrupt(_cycle: int, _session: Any) -> None:
+                raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                await run_probe(
+                    execute=True,
+                    socket_path=socket_path,
+                    sample_target=1,
+                    restart_delay=0,
+                    client_timeout=1,
+                    output=lambda _line: None,
+                    session_builder=builder,
+                    cycle_ready=interrupt,
+                )
+            self.assertEqual(builder.calls, 1)
+            self.assertEqual(session.open_calls, 1)
+            self.assertEqual(session.start_calls, 1)
+            self.assertEqual(session.stop_calls, 1)
+            self.assertEqual(session.close_calls, 1)
+            self.assertFalse(socket_path.exists())
+            self.assertFalse(process_lock_is_held(socket_path.with_suffix(".lock")))
+
+    async def test_direct_composition_constructs_and_opens_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "hubd-production.sock"
+            session = FakeProductionSession()
+            builder = FakeBuilder(session)
+            hub = create_production_hub(
+                socket_path,
+                config=ProductionHubConfig(),
+                output=lambda _line: None,
+                builder=builder,
+            )
+            await hub.daemon.start()
+            self.assertEqual(hub.daemon.state, DaemonState.READY)
+            self.assertIs(hub.daemon.session, session)
+            self.assertIs(hub.factory.session, session)
+            self.assertEqual(hub.factory.calls, 1)
+            self.assertEqual(builder.calls, 1)
+            self.assertEqual(session.open_calls, 1)
+            self.assertTrue(process_lock_is_held(socket_path.with_suffix(".lock")))
+            await hub.daemon.shutdown()
+            self.assertEqual(session.close_calls, 1)
 
 
 class ProbeClientTests(unittest.IsolatedAsyncioTestCase):
@@ -93,7 +310,6 @@ class ProbeClientTests(unittest.IsolatedAsyncioTestCase):
                 await server.wait_closed()
 
 
-
 class ProductionFactoryTests(unittest.TestCase):
     def test_factory_delegates_to_existing_production_builder_once(self) -> None:
         config = ProductionHubConfig()
@@ -140,3 +356,147 @@ class ProductionFactoryTests(unittest.TestCase):
                 daemon_operation_timeout=150,
             )
 
+
+class ProductionProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dry_run_never_resolves_socket_or_constructs_session(
+        self,
+    ) -> None:
+        builder = Mock()
+        output: list[str] = []
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                probe_hubd_production,
+                "create_production_hub",
+                side_effect=AssertionError("production hub must not be created"),
+            ) as create_hub,
+            patch.object(
+                probe_hubd_production.asyncio,
+                "open_unix_connection",
+                side_effect=AssertionError("IPC must not be opened"),
+            ) as connect,
+        ):
+            status = await run_probe(
+                execute=False,
+                output=output.append,
+                session_builder=builder,
+            )
+        self.assertEqual(status, 0)
+        builder.assert_not_called()
+        create_hub.assert_not_called()
+        connect.assert_not_called()
+        self.assertIn(
+            "DRY RUN: no Bluetooth, BlueZ, or production session access.", output
+        )
+        self.assertIn("probe_performs_disconnect_or_reconnect=no", output)
+
+    async def test_execute_without_safe_runtime_fails_before_factory(self) -> None:
+        builder = Mock()
+        output: list[str] = []
+        with patch.dict(os.environ, {}, clear=True):
+            status = await run_probe(
+                execute=True,
+                output=output.append,
+                session_builder=builder,
+            )
+        self.assertEqual(status, 1)
+        builder.assert_not_called()
+        self.assertIn("factory_calls=0", output)
+        self.assertIn(
+            "HUBD PRODUCTION PROBE FAIL "
+            "category=safe_runtime_directory_unavailable",
+            output,
+        )
+
+    def test_default_socket_is_inside_xdg_runtime_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
+                selected = probe_hubd_production._probe_socket_path(None)
+        self.assertEqual(
+            selected,
+            Path(directory) / "airpods-hubd-probe.sock",
+        )
+
+    async def test_incompatible_outer_timeout_is_rejected_before_factory(
+        self,
+    ) -> None:
+        builder = Mock()
+        output: list[str] = []
+        status = await run_probe(
+            execute=True,
+            daemon_operation_timeout=129,
+            output=output.append,
+            session_builder=builder,
+        )
+        self.assertEqual(status, 2)
+        builder.assert_not_called()
+        self.assertIn(
+            "HUBD PRODUCTION PROBE FAIL category=invalid_timeout_configuration",
+            output,
+        )
+
+    def test_main_defaults_to_deterministic_dry_run(self) -> None:
+        first = StringIO()
+        second = StringIO()
+        self.assertEqual(main([], stream=first), 0)
+        self.assertEqual(main([], stream=second), 0)
+        self.assertEqual(first.getvalue(), second.getvalue())
+        self.assertIn("future execution requires explicit --execute", first.getvalue())
+
+
+class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
+    def test_integration_and_package_exports_remain_private(self) -> None:
+        import airpods_hr
+
+        self.assertEqual(hubd_production.__all__, [])
+        self.assertFalse(hasattr(airpods_hr, "create_production_hub"))
+        private_init = ROOT / "src/airpods_hr/_hubd/__init__.py"
+        self.assertNotIn("production", private_init.read_text())
+        self.assertEqual(
+            hashlib.sha256(
+                (ROOT / "src/airpods_hr/__init__.py").read_bytes()
+            ).hexdigest(),
+            PACKAGE_INIT_SHA256,
+        )
+
+    def test_production_session_is_frozen(self) -> None:
+        digest = hashlib.sha256(
+            (ROOT / "src/airpods_hr/production_session.py").read_bytes()
+        ).hexdigest()
+        self.assertEqual(digest, PRODUCTION_SESSION_SHA256)
+
+    def test_integration_duplicates_no_transport_or_protocol_logic(self) -> None:
+        integration = ROOT / "src/airpods_hr/_hubd/production.py"
+        tree = ast.parse(integration.read_text(encoding="utf-8"))
+        imports = {
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        self.assertNotIn("airpods_hr.bluez_coexistence", imports)
+        source = integration.read_text(encoding="utf-8")
+        for forbidden in (
+            "KernelL2CAPTransport",
+            "BlueZCompatibilityRegistration",
+            "AAPHandshakeSession",
+            "HeartRateCommand",
+            "_airpods_aap_core",
+        ):
+            self.assertNotIn(forbidden, source)
+
+    def test_no_public_daemon_script_or_systemd_unit_was_added(self) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertEqual(
+            project["project"]["scripts"],
+            {"airpods-hr": "airpods_hr.cli:main"},
+        )
+        self.assertFalse(list(ROOT.rglob("*.service")))
+        self.assertNotIn(
+            "_airpods_aap_core",
+            (ROOT / "src/airpods_hr/_hubd/production.py").read_text()
+            + (ROOT / "tools/probe_hubd_production.py").read_text(),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
