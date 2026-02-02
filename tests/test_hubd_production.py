@@ -30,9 +30,23 @@ from airpods_hr._hubd.production import (
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
 from airpods_hr._hubd.server import DaemonState
 from airpods_hr.heartrate import HeartRateReport
-from airpods_hr.production_session import ProductionSessionCounters
+from airpods_hr.production_session import (
+    DEFAULT_REPORT_TIMEOUT,
+    DEFAULT_START_TIMEOUT,
+    DEFAULT_STOP_TIMEOUT,
+    ProductionSessionCounters,
+)
 from tools import probe_hubd_production
-from tools.probe_hubd_production import ProbeClient, ProbeFailure, main, run_probe
+from tools.probe_hubd_production import (
+    CLIENT_TIMEOUT_MARGIN,
+    DEFAULT_CLIENT_TIMEOUT,
+    ProbeClient,
+    ProbeFailure,
+    build_parser,
+    main,
+    minimum_client_timeout,
+    run_probe,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,7 +163,7 @@ class ProductionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 socket_path=socket_path,
                 sample_target=2,
                 restart_delay=0,
-                client_timeout=2,
+                client_timeout=20,
                 output=output.append,
                 session_builder=builder,
                 sleep=restart_wait,
@@ -183,7 +197,7 @@ class ProductionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 execute=True,
                 socket_path=socket_path,
                 restart_delay=0,
-                client_timeout=1,
+                client_timeout=20,
                 output=output.append,
                 session_builder=builder,
             )
@@ -211,7 +225,7 @@ class ProductionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     socket_path=socket_path,
                     sample_target=1,
                     restart_delay=0,
-                    client_timeout=1,
+                    client_timeout=20,
                     output=lambda _line: None,
                     session_builder=builder,
                     cycle_ready=interrupt,
@@ -358,6 +372,79 @@ class ProductionFactoryTests(unittest.TestCase):
 
 
 class ProductionProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_and_exact_minimum_client_timeouts_are_accepted(
+        self,
+    ) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.client_timeout, 30)
+        self.assertEqual(DEFAULT_CLIENT_TIMEOUT, 30)
+        self.assertGreater(DEFAULT_CLIENT_TIMEOUT, DEFAULT_START_TIMEOUT)
+        self.assertGreater(DEFAULT_CLIENT_TIMEOUT, DEFAULT_STOP_TIMEOUT)
+        self.assertGreater(DEFAULT_CLIENT_TIMEOUT, DEFAULT_REPORT_TIMEOUT)
+        minimum = minimum_client_timeout(
+            start_timeout=DEFAULT_START_TIMEOUT,
+            stop_timeout=DEFAULT_STOP_TIMEOUT,
+        )
+        self.assertEqual(CLIENT_TIMEOUT_MARGIN, 5)
+        self.assertEqual(minimum, 20)
+        self.assertEqual(
+            await run_probe(
+                execute=False,
+                client_timeout=minimum,
+                output=lambda _line: None,
+            ),
+            0,
+        )
+
+    async def test_incompatible_client_timeout_precedes_all_owned_access(
+        self,
+    ) -> None:
+        cases = (
+            {"client_timeout": 19.999},
+            {"start_timeout": 30, "client_timeout": 15},
+            {"stop_timeout": 30, "client_timeout": 15},
+            {"start_timeout": 1, "stop_timeout": 1, "client_timeout": 1},
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                builder = Mock()
+                output: list[str] = []
+                with (
+                    patch.object(
+                        probe_hubd_production,
+                        "_probe_socket_path",
+                        side_effect=AssertionError("socket must not be resolved"),
+                    ) as resolve_socket,
+                    patch.object(
+                        probe_hubd_production,
+                        "create_production_hub",
+                        side_effect=AssertionError("hub must not be created"),
+                    ) as create_hub,
+                    patch.object(
+                        probe_hubd_production.asyncio,
+                        "open_unix_connection",
+                        side_effect=AssertionError("IPC must not be opened"),
+                    ) as connect,
+                ):
+                    status = await run_probe(
+                        execute=True,
+                        output=output.append,
+                        session_builder=builder,
+                        **arguments,
+                    )
+                self.assertEqual(status, 2)
+                builder.assert_not_called()
+                resolve_socket.assert_not_called()
+                create_hub.assert_not_called()
+                connect.assert_not_called()
+                self.assertEqual(
+                    output,
+                    [
+                        "HUBD PRODUCTION PROBE FAIL "
+                        "category=invalid_client_timeout_configuration"
+                    ],
+                )
+
     async def test_dry_run_never_resolves_socket_or_constructs_session(
         self,
     ) -> None:
@@ -442,6 +529,26 @@ class ProductionProbeDryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main([], stream=second), 0)
         self.assertEqual(first.getvalue(), second.getvalue())
         self.assertIn("future execution requires explicit --execute", first.getvalue())
+
+    def test_main_rejects_incompatible_cli_timeout_combinations(self) -> None:
+        cases = (
+            ["--execute", "--start-timeout", "30", "--client-timeout", "15"],
+            ["--execute", "--stop-timeout", "30", "--client-timeout", "15"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                stream = StringIO()
+                with patch.object(
+                    probe_hubd_production,
+                    "create_production_hub",
+                    side_effect=AssertionError("hub must not be created"),
+                ) as create_hub:
+                    self.assertEqual(main(arguments, stream=stream), 2)
+                create_hub.assert_not_called()
+                self.assertIn(
+                    "invalid_client_timeout_configuration",
+                    stream.getvalue(),
+                )
 
 
 class ProductionIntegrationStaticSafetyTests(unittest.TestCase):

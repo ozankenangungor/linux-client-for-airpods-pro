@@ -22,6 +22,7 @@ from airpods_hr._hubd.production import (
 from airpods_hr._hubd.protocol import MAX_FRAME_SIZE, PROTOCOL_VERSION
 from airpods_hr._hubd.server import DaemonState
 from airpods_hr.production_session import (
+    DEFAULT_REPORT_TIMEOUT,
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
 )
@@ -29,7 +30,8 @@ from airpods_hr.production_session import (
 
 DEFAULT_SAMPLE_TARGET = 5
 DEFAULT_RESTART_DELAY = 5.0
-DEFAULT_CLIENT_TIMEOUT = 15.0
+CLIENT_TIMEOUT_MARGIN = 5.0
+DEFAULT_CLIENT_TIMEOUT = 30.0
 PROBE_SOCKET_NAME = "airpods-hubd-probe.sock"
 MAX_BUFFERED_EVENTS = 32
 
@@ -44,6 +46,17 @@ class ProbeFailure(RuntimeError):
     def __init__(self, category: str) -> None:
         self.category = category
         super().__init__(category)
+
+
+def minimum_client_timeout(
+    *,
+    start_timeout: float,
+    stop_timeout: float,
+    report_timeout: float = DEFAULT_REPORT_TIMEOUT,
+) -> float:
+    """Return the inclusive lower bound for probe IPC response waits."""
+
+    return max(start_timeout, stop_timeout, report_timeout) + CLIENT_TIMEOUT_MARGIN
 
 
 def _bounded_int(minimum: int, maximum: int) -> Callable[[str], int]:
@@ -245,8 +258,18 @@ async def run_probe(
 ) -> int:
     """Run the private lifecycle once, or describe it without hardware access."""
 
-    if sample_target <= 0 or restart_delay < 0 or client_timeout <= 0:
+    if sample_target <= 0 or restart_delay < 0:
         output("HUBD PRODUCTION PROBE FAIL category=invalid_probe_configuration")
+        return 2
+    required_client_timeout = minimum_client_timeout(
+        start_timeout=start_timeout,
+        stop_timeout=stop_timeout,
+    )
+    if client_timeout < required_client_timeout:
+        output(
+            "HUBD PRODUCTION PROBE FAIL "
+            "category=invalid_client_timeout_configuration"
+        )
         return 2
     try:
         config = ProductionHubConfig(
@@ -270,6 +293,10 @@ async def run_probe(
         output(
             f"descriptor_timeout={descriptor_timeout:g}s; "
             f"daemon_operation_timeout={daemon_operation_timeout:g}s"
+        )
+        output(
+            f"client_timeout={client_timeout:g}s; "
+            f"minimum_client_timeout={required_client_timeout:g}s"
         )
         output(
             "operator_precondition=normal BlueZ ownership; fresh normal "

@@ -101,6 +101,17 @@ calculated production-operation floor so the daemon cannot silently cancel a
 legitimate inner handshake or its cleanup. Production timeouts remain
 unchanged.
 
+The daemon operation timeout and probe IPC timeout protect different layers.
+The 150-second daemon timeout bounds production session lifecycle operations.
+The probe client timeout bounds the wait for the resulting JSONL response or
+heart-rate event, so it must outlast the production operation or report window
+being observed. Its inclusive minimum is `max(start_timeout, stop_timeout,
+DEFAULT_REPORT_TIMEOUT) + 5 seconds`. With the frozen production defaults of
+15, 5, and 5 seconds, the minimum is 20 seconds and the probe default is a
+bounded 30 seconds. Custom combinations below that relationship fail before
+socket resolution, production factory construction, Unix IPC, or hardware
+access.
+
 The expected acceptance counters after the two cycles are
 `transport_opens == 1`, `descriptor_handshakes == 1`,
 `hr_activations == 2`, and `hr_stops == 2`. `reports_received` may exceed the
