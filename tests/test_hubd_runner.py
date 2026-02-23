@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import math
 import os
 import shutil
 import signal
@@ -28,7 +29,11 @@ from airpods_hr._hubd.main import (
     main,
     run_daemon,
 )
-from airpods_hr._hubd.production import ProductionHubConfig, create_production_hub
+from airpods_hr._hubd.production import (
+    DEFAULT_DAEMON_OPERATION_TIMEOUT,
+    ProductionHubConfig,
+    create_production_hub,
+)
 from airpods_hr._hubd.server import (
     AirPodsHubDaemon,
     DaemonState,
@@ -464,6 +469,20 @@ class RunnerStaticSafetyTests(unittest.TestCase):
         self.assertNotIn("Restart=always", unit)
         for forbidden in ("bluetoothctl", "reconnect", "reset", "power cycle"):
             self.assertNotIn(forbidden, unit.lower())
+
+    def test_systemd_stop_timeout_covers_two_daemon_cleanup_windows(self) -> None:
+        unit = (ROOT / "packaging/systemd/airpods-hubd.service").read_text()
+        timeout_line = next(
+            line for line in unit.splitlines() if line.startswith("TimeoutStopSec=")
+        )
+        timeout = float(timeout_line.partition("=")[2])
+        shutdown_margin = 30.0
+        self.assertTrue(math.isfinite(timeout))
+        self.assertGreater(timeout, 2 * DEFAULT_DAEMON_OPERATION_TIMEOUT)
+        self.assertGreaterEqual(
+            timeout,
+            2 * DEFAULT_DAEMON_OPERATION_TIMEOUT + shutdown_margin,
+        )
 
     def test_systemd_unit_verifies_when_systemd_analyze_is_available(self) -> None:
         analyzer = shutil.which("systemd-analyze")

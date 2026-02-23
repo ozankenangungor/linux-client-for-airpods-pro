@@ -8,7 +8,7 @@ ExecStart=/usr/bin/env airpods-hubd
 Restart=no
 KillSignal=SIGTERM
 SuccessExitStatus=130 143
-TimeoutStopSec=180
+TimeoutStopSec=330
 UMask=0077
 NoNewPrivileges=yes
 

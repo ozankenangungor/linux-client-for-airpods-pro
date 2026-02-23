@@ -199,6 +199,16 @@ new AAP channel on the same BlueZ connection, where descriptor bootstrap is
 known to be unreliable. The unit never reconnects Bluetooth or resets an
 adapter.
 
+The unit sets `TimeoutStopSec=330`. Shutdown from STREAMING can consume two
+independent daemon operation windows in sequence: up to 150 seconds for
+`session.stop()`, followed by ordinary reader, client, and listener cleanup,
+then up to 150 seconds for `session.close()`. The extra 30 seconds gives the
+outer systemd supervisor scheduling and IPC-cleanup margin without making its
+ultimate kill boundary unbounded. This service value is tied by a regression
+test to twice `DEFAULT_DAEMON_OPERATION_TIMEOUT` plus that margin. If a future
+service configuration raises the runner's private `--operation-timeout`, its
+`TimeoutStopSec` must be raised to preserve the same relationship.
+
 For a manual development installation from the conventional clone location:
 
 ```console
