@@ -1,3 +1,7 @@
 [workspace]
-members = ["crates/airpods-aap-core", "crates/airpods-aap-py"]
+members = [
+    "crates/airpods-aap-core",
+    "crates/airpods-aap-py",
+    "crates/airpods-client",
+]
 resolver = "3"

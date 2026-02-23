@@ -278,7 +278,11 @@ class BindingBoundaryTests(unittest.TestCase):
         workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(
             workspace["workspace"]["members"],
-            ["crates/airpods-aap-core", "crates/airpods-aap-py"],
+            [
+                "crates/airpods-aap-core",
+                "crates/airpods-aap-py",
+                "crates/airpods-client",
+            ],
         )
 
         core_manifest = tomllib.loads(
