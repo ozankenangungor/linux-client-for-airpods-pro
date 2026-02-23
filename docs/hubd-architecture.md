@@ -228,6 +228,27 @@ the service. Distribution packaging, systemd lifecycle evidence, login
 auto-start, crash/restart policy, stable public IPC, and public Rust/Python
 client SDKs remain future work.
 
+## Daemon service FINAL PASS
+
+Testing subsequently validated Daemon serviceC with real AirPods Pro 3 hardware
+through the systemd user service. The service started successfully, accepted a
+real IPC heart-rate subscription, returned to `READY` after unsubscribe, and
+shut down gracefully on `SIGTERM`. Shutdown removed the socket and released
+the process flock while BlueZ `Device1.Connected` remained true.
+
+The systemd IPC run observed 169 BPM from the left source, followed by 99, 75,
+75, and 74 BPM with the final sample from the right source. The client and
+daemon preserved 169 as ordinary unfiltered data. Normal A2DP music remained
+uninterrupted throughout the service lifecycle. Together with the Daemon serviceB
+evidence, this proves one persistent production session, one transport open,
+one descriptor bootstrap, repeated HR START/STOP on the same AAP channel, two
+simultaneous IPC clients, one sensor reader with multiple consumers, and an
+open session at zero subscribers. Tasks 9.8B and 9.8C, and therefore Daemon service
+as a whole, are FINAL PASS.
+
+This closure does not freeze the experimental IPC, promise a stable public
+client API, or establish automatic daemon restart behavior.
+
 ## Lifecycle and arbitration
 
 The daemon creates exactly one session object and calls `open()` exactly once
