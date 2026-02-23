@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
-
+import argparse
 import asyncio
 import logging
-
+import math
 import signal
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from airpods_hr._hubd.production import ProductionHub, ProductionHubConfig, create_production_hub
-
-
-from airpods_hr._hubd.server import DaemonAlreadyRunningError, DaemonState, HubDaemonError, UnsafeSocketPathError
+from airpods_hr._hubd.production import (
+    DEFAULT_DAEMON_OPERATION_TIMEOUT,
+    ProductionHub,
+    ProductionHubConfig,
+    create_production_hub,
+)
+from airpods_hr._hubd.server import (
+    DaemonAlreadyRunningError,
+    DaemonState,
+    HubDaemonError,
+    UnsafeSocketPathError,
+    socket_path_from_environment,
+)
 
 
 EXIT_SUCCESS = 0
@@ -165,6 +174,66 @@ async def run_daemon(
     return exit_code
 
 
-__all__ = []
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="airpods-hubd",
+        description="Run the private local AirPods sensor daemon.",
+    )
+    parser.add_argument(
+        "--socket-path",
+        type=Path,
+        help="private Unix socket path (default: $XDG_RUNTIME_DIR/airpods-hubd.sock)",
+    )
+    parser.add_argument(
+        "--operation-timeout",
+        type=float,
+        default=DEFAULT_DAEMON_OPERATION_TIMEOUT,
+        help="bounded outer production operation timeout in seconds",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="include safe failure type details",
+    )
+    return parser
 
 
+def _configure_logging(verbose: bool) -> logging.Logger:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s airpods-hubd: %(message)s",
+    )
+    return logging.getLogger(LOGGER_NAME)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logger = _configure_logging(args.verbose)
+    try:
+        if not math.isfinite(args.operation_timeout):
+            raise ValueError("operation timeout must be finite")
+        config = ProductionHubConfig(
+            daemon_operation_timeout=args.operation_timeout
+        )
+        socket_path = args.socket_path or socket_path_from_environment()
+    except (ValueError, UnsafeSocketPathError) as error:
+        logger.error("configuration failed: %s", _safe_failure_name(error))
+        return EXIT_CONFIGURATION
+    try:
+        return asyncio.run(
+            run_daemon(
+                socket_path,
+                config,
+                logger=logger,
+                verbose=args.verbose,
+            )
+        )
+    except KeyboardInterrupt:
+        return 128 + int(signal.SIGINT)
+
+
+__all__: list[str] = []
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
