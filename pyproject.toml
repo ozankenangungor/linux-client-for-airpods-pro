@@ -32,6 +32,7 @@ handoff-probe = [
 
 [project.scripts]
 airpods-hr = "airpods_hr.cli:main"
+airpods-hubd = "airpods_hr._hubd.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

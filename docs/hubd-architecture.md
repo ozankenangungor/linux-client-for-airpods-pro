@@ -159,6 +159,65 @@ This evidence does not establish systemd service lifecycle, login or session
 auto-start, daemon crash recovery, production restart behavior, or a stable
 public SDK/API. The experimental IPC remains subject to change.
 
+## Daemon serviceC production runner and user service
+
+Daemon serviceC adds the installed `airpods-hubd` process entrypoint in the private
+`airpods_hr._hubd.main` module. The runner is composition only: it resolves the
+accepted `$XDG_RUNTIME_DIR/airpods-hubd.sock` default, creates the accepted
+`ProductionHubConfig`, and calls `create_production_hub`. It contains no BlueZ,
+L2CAP, descriptor, HR parsing, subscription, or IPC implementation. The daemon
+therefore retains its process lock, manual Unix listener ownership, one
+production factory, one session object, and one session open. A second runner
+loses at the accepted lock before a second production session is constructed.
+
+The runner installs asyncio-native handlers for `SIGINT` and `SIGTERM`. The
+synchronous callback only records the first signal and sets an asynchronous
+shutdown event. The async runner then invokes the daemon's existing bounded
+shutdown exactly once, including HR STOP when needed, client and listener
+closure, production session close, owned socket removal, and flock release. A
+signal received during startup cancels the startup task so its existing
+owned-resource cleanup completes before shutdown. Clean programmatic shutdown
+returns 0, SIGINT returns 130, SIGTERM returns 143, invalid configuration
+returns 2, and startup or service failure returns 1. Expected operational
+failures produce a concise safe category without a traceback by default.
+
+Normal logging records process startup, READY, shutdown request, and final
+STOPPED state. Existing production lifecycle messages are routed through the
+same logger because they contain only bounded state descriptions. Heart-rate
+values, reports, raw AAP/HCI data, Bluetooth addresses, keys, and encryption
+material are not logged by the runner. `--verbose` adds only the safe exception
+type for operator diagnosis; it does not enable packet or BPM logging.
+
+The repository unit at `packaging/systemd/airpods-hubd.service` is a user
+service and runs the installed `airpods-hubd` entrypoint from the development
+virtual environment through a bounded PATH. Its restrictive `UMask=0077` and
+`NoNewPrivileges=yes` do not block the existing runtime-directory, D-Bus, or
+Bluetooth socket requirements. More aggressive filesystem, address-family,
+or D-Bus sandboxing is deferred until it can be validated with the real
+production lifecycle. `Restart=no` is deliberate: blind restart could open a
+new AAP channel on the same BlueZ connection, where descriptor bootstrap is
+known to be unreliable. The unit never reconnects Bluetooth or resets an
+adapter.
+
+For a manual development installation from the conventional clone location:
+
+```console
+cd ~/airpods-hr-linux
+.venv/bin/python -m pip install -e .
+mkdir -p ~/.config/systemd/user
+cp packaging/systemd/airpods-hubd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start airpods-hubd
+systemctl --user status airpods-hubd
+journalctl --user -u airpods-hubd
+```
+
+If the checkout is elsewhere, edit the unit's PATH entry before copying it.
+Daemon serviceC implementation does not install, enable, start, or hardware-validate
+the service. Distribution packaging, systemd lifecycle evidence, login
+auto-start, crash/restart policy, stable public IPC, and public Rust/Python
+client SDKs remain future work.
+
 ## Lifecycle and arbitration
 
 The daemon creates exactly one session object and calls `open()` exactly once

@@ -591,13 +591,19 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_no_public_daemon_script_or_systemd_unit_was_added(self) -> None:
+    def test_only_process_entrypoint_and_user_unit_are_added(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         self.assertEqual(
             project["project"]["scripts"],
-            {"airpods-hr": "airpods_hr.cli:main"},
+            {
+                "airpods-hr": "airpods_hr.cli:main",
+                "airpods-hubd": "airpods_hr._hubd.main:main",
+            },
         )
-        self.assertFalse(list(ROOT.rglob("*.service")))
+        self.assertEqual(
+            list(ROOT.rglob("*.service")),
+            [ROOT / "packaging/systemd/airpods-hubd.service"],
+        )
         self.assertNotIn(
             "_airpods_aap_core",
             (ROOT / "src/airpods_hr/_hubd/production.py").read_text()

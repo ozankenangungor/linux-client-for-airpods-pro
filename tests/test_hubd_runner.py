@@ -6,11 +6,11 @@ import ast
 import asyncio
 import logging
 import os
-
+import shutil
 import signal
-
+import subprocess
 import tempfile
-
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -29,9 +29,10 @@ from airpods_hr._hubd.main import (
     run_daemon,
 )
 from airpods_hr._hubd.production import ProductionHubConfig, create_production_hub
-from airpods_hr._hubd.server import DaemonState
-
-
+from airpods_hr._hubd.server import (
+    AirPodsHubDaemon,
+    DaemonState,
+)
 from airpods_hr.heartrate import HeartRateReport
 from tools.probe_hubd_runner import run_probe as run_runner_probe
 
@@ -441,6 +442,45 @@ class RunnerStaticSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_console_entrypoint_is_installed_metadata_only(self) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertEqual(
+            project["project"]["scripts"]["airpods-hubd"],
+            "airpods_hr._hubd.main:main",
+        )
+        import airpods_hr
+
+        self.assertFalse(hasattr(airpods_hr, "run_daemon"))
+        self.assertEqual(hubd_main.__all__, [])
+
+    def test_systemd_unit_is_nonaggressive_user_service(self) -> None:
+        unit = (ROOT / "packaging/systemd/airpods-hubd.service").read_text()
+        self.assertIn("ExecStart=/usr/bin/env airpods-hubd", unit)
+        self.assertIn("%h/airpods-hr-linux/.venv/bin", unit)
+        self.assertIn("Restart=no", unit)
+        self.assertIn("WantedBy=default.target", unit)
+        self.assertIn("UMask=0077", unit)
+        self.assertNotIn("User=root", unit)
+        self.assertNotIn("Restart=always", unit)
+        for forbidden in ("bluetoothctl", "reconnect", "reset", "power cycle"):
+            self.assertNotIn(forbidden, unit.lower())
+
+    def test_systemd_unit_verifies_when_systemd_analyze_is_available(self) -> None:
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer is None:
+            self.skipTest("systemd-analyze is unavailable")
+        result = subprocess.run(
+            [
+                analyzer,
+                "verify",
+                "--user",
+                str(ROOT / "packaging/systemd/airpods-hubd.service"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_asyncio_signal_registrar_delegates_to_loop(self) -> None:
         loop = Mock()
@@ -452,3 +492,5 @@ class RunnerStaticSafetyTests(unittest.TestCase):
         loop.remove_signal_handler.assert_called_once_with(signal.SIGTERM)
 
 
+if __name__ == "__main__":
+    unittest.main()
