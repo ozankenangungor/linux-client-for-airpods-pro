@@ -5,23 +5,23 @@
 //! version 1 has no request IDs, so requests on one client are serialized while
 //! a single reader routes responses and heart-rate events.
 
-use serde_json :: { Map , Value } ;
-
+use serde_json :: { Map , Value , json } ;
+use std :: env ;
 use std :: fmt ;
 use std :: io ;
-use std :: path :: { PathBuf } ;
-
-
-use tokio :: io :: { AsyncBufReadExt , AsyncWriteExt } ;
-
-
-
+use std :: path :: { Path , PathBuf } ;
+use std :: sync :: atomic :: { AtomicBool , Ordering } ;
+use std :: sync :: { Arc , Mutex as StdMutex , MutexGuard as StdMutexGuard , Weak } ;
+use tokio :: io :: { AsyncBufReadExt , AsyncWriteExt , BufReader } ;
+use tokio :: net :: UnixStream ;
+use tokio :: net :: unix :: OwnedWriteHalf ;
+use tokio :: sync :: { Mutex , OwnedMutexGuard , broadcast , oneshot } ;
 
 /// Experimental daemon protocol version supported by this crate.
 pub const PROTOCOL_VERSION: u64 = 1;
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_SIZE: usize = 4096;
-
+const DEFAULT_SOCKET_NAME: &str = "airpods-hubd.sock";
 
 
 /// Errors produced by the client boundary.
@@ -169,6 +169,132 @@ pub struct Status {
     pub subscriber_count: u64,
 }
 
+struct PendingRequest {
+    response: oneshot::Sender<Result<Value, Error>>,
+    _request_guard: OwnedMutexGuard<()>,
+}
+
+struct Inner {
+    writer: Mutex<OwnedWriteHalf>,
+    request_gate: Arc<Mutex<()>>,
+    pending: StdMutex<Option<PendingRequest>>,
+    events: StdMutex<Option<broadcast::Sender<Result<HeartRateSample, Error>>>>,
+    closed: AtomicBool,
+}
+
+impl Inner {
+    fn pending(&self) -> StdMutexGuard<'_, Option<PendingRequest>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn events(
+        &self,
+    ) -> StdMutexGuard<'_, Option<broadcast::Sender<Result<HeartRateSample, Error>>>> {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn fail(&self, error: Error) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(pending) = self.pending().take() {
+            let _ = pending.response.send(Err(error.clone()));
+        }
+        if let Some(events) = self.events().take() {
+            let _ = events.send(Err(error));
+        }
+    }
+}
+
+/// A connection to one running `airpods-hubd` instance.
+pub struct AirPodsClient {
+    inner: Arc<Inner>,
+}
+
+impl AirPodsClient {
+    /// Resolves `$XDG_RUNTIME_DIR/airpods-hubd.sock`.
+    pub fn default_socket_path() -> Result<PathBuf, Error> {
+        let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::XdgRuntimeDirMissing)?;
+        if runtime.is_empty() {
+            return Err(Error::XdgRuntimeDirMissing);
+        }
+        Ok(PathBuf::from(runtime).join(DEFAULT_SOCKET_NAME))
+    }
+
+    /// Connects to the default daemon socket without starting or retrying it.
+    pub async fn connect() -> Result<Self, Error> {
+        Self::connect_to(Self::default_socket_path()?).await
+    }
+
+    /// Connects to an explicit Unix socket path for tests and development.
+    pub async fn connect_to(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|error| Error::Connect {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+                message: error.to_string(),
+            })?;
+        let (reader, writer) = stream.into_split();
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(writer),
+            request_gate: Arc::new(Mutex::new(())),
+            pending: StdMutex::new(None),
+            events: StdMutex::new(None),
+            closed: AtomicBool::new(false),
+        });
+        tokio::spawn(read_loop(reader, Arc::downgrade(&inner)));
+        Ok(Self { inner })
+    }
+
+    pub async fn hello(&self) -> Result<Hello, Error> {
+        let response = request(&self.inner, "hello", None).await?;
+        let object = success_object(&response, "hello")?;
+        let service = required_string(object, "service")?;
+        let experimental = required_bool(object, "experimental")?;
+        Ok(Hello {
+            service: service.to_owned(),
+            experimental,
+        })
+    }
+
+    pub async fn status(&self) -> Result<Status, Error> {
+        let response = request(&self.inner, "status", None).await?;
+        let object = success_object(&response, "status")?;
+        let state = match required_string(object, "state")? {
+            "stopped" => DaemonState::Stopped,
+            "starting" => DaemonState::Starting,
+            "ready" => DaemonState::Ready,
+            "starting_hr" => DaemonState::StartingHeartRate,
+            "streaming" => DaemonState::Streaming,
+            "stopping_hr" => DaemonState::StoppingHeartRate,
+            "failed" => DaemonState::Failed,
+            "shutting_down" => DaemonState::ShuttingDown,
+            other => DaemonState::Unknown(other.to_owned()),
+        };
+        Ok(Status {
+            state,
+            subscriber_count: required_u64(object, "subscriber_count")?,
+        })
+    }
+
+    pub async fn ping(&self) -> Result<(), Error> {
+        let response = request(&self.inner, "ping", None).await?;
+        let object = success_object(&response, "ping")?;
+        if required_bool(object, "pong")? {
+            Ok(())
+        } else {
+            Err(unexpected("ping response did not contain pong=true"))
+        }
+    }
+
+    
+}
 
 
 
@@ -180,20 +306,113 @@ pub struct Status {
 
 
 
+async fn request(
+    inner: &Arc<Inner>,
+    operation: &'static str,
+    stream: Option<&'static str>,
+) -> Result<Value, Error> {
+    if inner.closed.load(Ordering::SeqCst) {
+        return Err(Error::ConnectionClosed);
+    }
+    let mut message = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "operation": operation,
+    });
+    if let Some(stream) = stream {
+        message["stream"] = Value::String(stream.to_owned());
+    }
+    let mut frame = serde_json::to_vec(&message).map_err(|error| Error::InvalidJson {
+        message: error.to_string(),
+    })?;
+    if frame.len() > MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            limit: MAX_FRAME_SIZE,
+        });
+    }
+    frame.push(b'\n');
 
+    let request_guard = Arc::clone(&inner.request_gate).lock_owned().await;
+    if inner.closed.load(Ordering::SeqCst) {
+        return Err(Error::ConnectionClosed);
+    }
+    let (response, receiver) = oneshot::channel();
+    *inner.pending() = Some(PendingRequest {
+        response,
+        _request_guard: request_guard,
+    });
 
+    let writer_inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        if let Err(error) = write_frame(&writer_inner, &frame).await {
+            writer_inner.fail(error);
+        }
+    });
+    receiver.await.unwrap_or(Err(Error::ConnectionClosed))
+}
 
+async fn write_frame(inner: &Inner, frame: &[u8]) -> Result<(), Error> {
+    let mut writer = inner.writer.lock().await;
+    writer
+        .write_all(frame)
+        .await
+        .map_err(|error| io_error("writing daemon request", error))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| io_error("flushing daemon request", error))
+}
 
-
-
-
-
-
-
-
-
-
-
+async fn read_loop(reader: tokio::net::unix::OwnedReadHalf, inner: Weak<Inner>) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                if let Some(inner) = inner.upgrade() {
+                    inner.fail(Error::ConnectionClosed);
+                }
+                return;
+            }
+            Err(error) => {
+                if let Some(inner) = inner.upgrade() {
+                    inner.fail(error);
+                }
+                return;
+            }
+        };
+        let inbound = match parse_inbound(&frame) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                if let Some(inner) = inner.upgrade() {
+                    inner.fail(error);
+                }
+                return;
+            }
+        };
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        match inbound {
+            Inbound::Event(sample) => {
+                if let Some(events) = inner.events().as_ref() {
+                    let _ = events.send(Ok(sample));
+                }
+            }
+            Inbound::Response(response) => {
+                if let Some(pending) = inner.pending().take() {
+                    let _ = pending.response.send(Ok(response));
+                } else if let Ok(error) = daemon_error(&response) {
+                    if let Some(events) = inner.events().take() {
+                        let _ = events.send(Err(error));
+                    }
+                } else {
+                    inner.fail(unexpected("response arrived without a pending request"));
+                    return;
+                }
+            }
+        }
+    }
+}
 
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -275,9 +494,40 @@ fn parse_inbound(frame: &[u8]) -> Result<Inbound, Error> {
     }
 }
 
+fn success_object<'a>(
+    value: &'a Value,
+    expected_operation: &'static str,
+) -> Result<&'a Map<String, Value>, Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| unexpected("response must be a JSON object"))?;
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(false) => return Err(daemon_error(value)?),
+        Some(true) => {}
+        None => return Err(unexpected("response is missing a boolean ok field")),
+    }
+    if required_string(object, "operation")? != expected_operation {
+        return Err(unexpected("response operation does not match the request"));
+    }
+    Ok(object)
+}
 
-
-
+fn daemon_error(value: &Value) -> Result<Error, Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| unexpected("error response must be a JSON object"))?;
+    if object.get("ok").and_then(Value::as_bool) != Some(false) {
+        return Err(unexpected("response is not a daemon error"));
+    }
+    let error = object
+        .get("error")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unexpected("daemon error response is missing error details"))?;
+    Ok(Error::DaemonError {
+        code: required_string(error, "code")?.to_owned(),
+        message: required_string(error, "message")?.to_owned(),
+    })
+}
 
 fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, Error> {
     object
@@ -286,7 +536,12 @@ fn required_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'
         .ok_or_else(|| unexpected(format!("{field} must be a string")))
 }
 
-
+fn required_bool(object: &Map<String, Value>, field: &str) -> Result<bool, Error> {
+    object
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| unexpected(format!("{field} must be a boolean")))
+}
 
 fn required_u64(object: &Map<String, Value>, field: &str) -> Result<u64, Error> {
     object
