@@ -35,6 +35,11 @@ Working:
   L2CAP `FLUSH_TIMEOUT` negotiation without editing `site-packages`.
 - A reusable, signaling-only AAP channel session has opened PSM `0x1001` on
   test hardware using the project-owned FLUSH_TIMEOUT compatibility layer.
+- A persistent `airpods-hubd` user service owns one production session and
+  fans heart-rate events out over private Unix JSONL IPC. Its repeated
+  START/STOP and graceful systemd lifecycle have passed real hardware tests.
+- The unpublished experimental `airpods-client` Rust crate consumes protocol
+  version 1 without opening Bluetooth or starting the daemon.
 - A minimal temporary SDP compatibility profile and bounded AAP-handshake layer
   have passed a controlled live validation.
 - The complete bounded one-shot path has passed one controlled end-to-end
@@ -50,7 +55,7 @@ Not yet implemented:
 
 - Reconnect and recovery handling.
 - Suspend and resume recovery.
-- Daemon operation and API/SDK integration.
+- A supported, stable SDK/API and additional language clients.
 - A user-friendly installer.
 
 ## Experimental BlueZ coexistence probe
@@ -171,6 +176,12 @@ golden corpus. Python remains authoritative and no production path calls Rust.
 Adds a separate private development binding for real FFI parity
 testing without changing the setuptools package or production parser.
 See [docs/rust-core-architecture.md](docs/rust-core-architecture.md).
+
+Adds the persistent local `airpods-hubd` service, and Client SDKA adds
+the first experimental Rust client crate over its Unix IPC. Applications do
+not acquire Bluetooth through this client boundary. See
+[docs/hubd-architecture.md](docs/hubd-architecture.md) and
+[docs/client-sdk-architecture.md](docs/client-sdk-architecture.md).
 
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program
