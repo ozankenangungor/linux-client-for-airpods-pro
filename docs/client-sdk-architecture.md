@@ -85,6 +85,24 @@ cancels its request future, so a late response cannot be correlated with a
 newer request. Events may arrive before, between, or after responses without
 being consumed as responses or reordered.
 
+Subscription transitions have a separate serialized lifecycle and monotonic
+local generations. A generation installs its event route while holding the
+lifecycle gate. Successful activation releases the gate but retains generation
+ownership in `HeartRateSubscription`. Teardown marks that generation as
+cleaning before it sends `unsubscribe`, and a later generation waits until the
+response is consumed and the old event route is removed. Cleanup from an old
+generation therefore cannot unsubscribe a newer subscription or deliver its
+queued events through the newer route.
+
+Cancelling subscribe while it waits for request serialization, or after its
+request is sent, drops a provisional generation owner. That owner transfers
+the lifecycle gate to a cleanup task. An idempotent unsubscribe waits behind
+the cancelled request, so the late subscribe response is consumed first.
+Cancelling explicit unsubscribe follows the same rule: the subscription keeps
+cleanup ownership across the await and transfers it on cancellation. A
+fail-safe guard invalidates the connection if an internally scheduled cleanup
+task is cancelled before it can establish a deterministic remote state.
+
 ## Heart-rate subscription and data
 
 `subscribe_heart_rate()` creates one `HeartRateSubscription` on the connection.
@@ -101,10 +119,18 @@ typed lag error instead of allowing memory to grow without limit.
 
 `HeartRateSubscription::unsubscribe()` is the reliable lifecycle endpoint: it
 waits for the daemon response and releases the local event route. `Drop` never
-blocks. When a Tokio runtime is available it schedules a best-effort
-unsubscribe; applications that require confirmed cleanup must call the async
-method explicitly. No subscription operation opens a second socket or sensor
-path.
+performs blocking network I/O. Inside a current Tokio context it schedules a
+best-effort unsubscribe and keeps the generation in its cleaning state until
+that operation finishes. A replacement subscription waits for this teardown.
+
+Outside a current Tokio context, `Drop` cannot guarantee that an async cleanup
+task will run. It therefore marks the whole client connection closed and calls
+nonblocking Unix `shutdown` on a cloned socket handle. All later client methods
+return `ConnectionClosed`, the daemon observes disconnection and performs its
+normal subscriber cleanup, and the client never appears reusable with an
+orphaned subscription. Applications that require a confirmed unsubscribe
+response must call the async method explicitly. No subscription operation opens
+a second socket or sensor path.
 
 ## Error model
 

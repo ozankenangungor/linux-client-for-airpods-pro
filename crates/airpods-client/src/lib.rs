@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use std::env;
 use std::fmt;
 use std::io;
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
@@ -174,11 +175,33 @@ struct PendingRequest {
     _request_guard: OwnedMutexGuard<()>,
 }
 
+struct EventRoute {
+    generation: u64,
+    sender: broadcast::Sender<Result<HeartRateSample, Error>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionPhase {
+    Idle,
+    Subscribing(u64),
+    Active(u64),
+    Cleaning(u64),
+}
+
+struct SubscriptionState {
+    phase: SubscriptionPhase,
+    next_generation: u64,
+}
+
 struct Inner {
     writer: Mutex<OwnedWriteHalf>,
+    shutdown_stream: StdMutex<Option<std::os::unix::net::UnixStream>>,
     request_gate: Arc<Mutex<()>>,
     pending: StdMutex<Option<PendingRequest>>,
-    events: StdMutex<Option<broadcast::Sender<Result<HeartRateSample, Error>>>>,
+    subscription_gate: Arc<Mutex<()>>,
+    subscription: StdMutex<SubscriptionState>,
+    subscription_changed: tokio::sync::Notify,
+    events: StdMutex<Option<EventRoute>>,
     closed: AtomicBool,
 }
 
@@ -189,24 +212,78 @@ impl Inner {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn events(
-        &self,
-    ) -> StdMutexGuard<'_, Option<broadcast::Sender<Result<HeartRateSample, Error>>>> {
+    fn shutdown_stream(&self) -> StdMutexGuard<'_, Option<std::os::unix::net::UnixStream>> {
+        self.shutdown_stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn subscription(&self) -> StdMutexGuard<'_, SubscriptionState> {
+        self.subscription
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn events(&self) -> StdMutexGuard<'_, Option<EventRoute>> {
         self.events
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn start_cleanup(&self, generation: u64) {
+        let mut subscription = self.subscription();
+        if matches!(
+            subscription.phase,
+            SubscriptionPhase::Subscribing(current) | SubscriptionPhase::Active(current)
+                if current == generation
+        ) {
+            subscription.phase = SubscriptionPhase::Cleaning(generation);
+        }
+    }
+
+    fn finish_subscription(&self, generation: u64) {
+        {
+            let mut events = self.events();
+            if events
+                .as_ref()
+                .is_some_and(|route| route.generation == generation)
+            {
+                events.take();
+            }
+        }
+        let changed = {
+            let mut subscription = self.subscription();
+            let owns_phase = match subscription.phase {
+                SubscriptionPhase::Subscribing(current)
+                | SubscriptionPhase::Active(current)
+                | SubscriptionPhase::Cleaning(current) => current == generation,
+                SubscriptionPhase::Idle => false,
+            };
+            if owns_phase {
+                subscription.phase = SubscriptionPhase::Idle;
+            }
+            owns_phase
+        };
+        if changed {
+            self.subscription_changed.notify_waiters();
+        }
     }
 
     fn fail(&self, error: Error) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(stream) = self.shutdown_stream().take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         if let Some(pending) = self.pending().take() {
             let _ = pending.response.send(Err(error.clone()));
         }
         if let Some(events) = self.events().take() {
-            let _ = events.send(Err(error));
+            let _ = events.sender.send(Err(error));
         }
+        self.subscription().phase = SubscriptionPhase::Idle;
+        self.subscription_changed.notify_waiters();
     }
 }
 
@@ -240,11 +317,26 @@ impl AirPodsClient {
                 kind: error.kind(),
                 message: error.to_string(),
             })?;
+        let stream = stream
+            .into_std()
+            .map_err(|error| io_error("preparing daemon connection", error))?;
+        let shutdown_stream = stream
+            .try_clone()
+            .map_err(|error| io_error("preparing daemon shutdown handle", error))?;
+        let stream = UnixStream::from_std(stream)
+            .map_err(|error| io_error("preparing asynchronous daemon connection", error))?;
         let (reader, writer) = stream.into_split();
         let inner = Arc::new(Inner {
             writer: Mutex::new(writer),
+            shutdown_stream: StdMutex::new(Some(shutdown_stream)),
             request_gate: Arc::new(Mutex::new(())),
             pending: StdMutex::new(None),
+            subscription_gate: Arc::new(Mutex::new(())),
+            subscription: StdMutex::new(SubscriptionState {
+                phase: SubscriptionPhase::Idle,
+                next_generation: 1,
+            }),
+            subscription_changed: tokio::sync::Notify::new(),
             events: StdMutex::new(None),
             closed: AtomicBool::new(false),
         });
@@ -294,28 +386,12 @@ impl AirPodsClient {
     }
 
     pub async fn subscribe_heart_rate(&self) -> Result<HeartRateSubscription, Error> {
-        let (sender, receiver) = broadcast::channel(EVENT_BUFFER_SIZE);
-        {
-            let mut events = self.inner.events();
-            if events.is_some() {
-                return Err(Error::SubscriptionActive);
-            }
-            *events = Some(sender);
-        }
-
-        let response = match request(&self.inner, "subscribe", Some("heart_rate")).await {
-            Ok(response) => response,
-            Err(error) => {
-                self.inner.events().take();
-                return Err(error);
-            }
-        };
-        if let Err(error) = validate_subscription_response(&response, "subscribe", true) {
-            self.inner.events().take();
-            return Err(error);
-        }
+        let (mut owner, receiver) = begin_subscription(&self.inner).await?;
+        let response = request(&self.inner, "subscribe", Some("heart_rate")).await?;
+        validate_subscription_response(&response, "subscribe", true)?;
+        owner.activate()?;
         Ok(HeartRateSubscription {
-            inner: Some(Arc::clone(&self.inner)),
+            owner,
             receiver,
             finished: false,
         })
@@ -325,10 +401,12 @@ impl AirPodsClient {
 /// An active heart-rate subscription on its parent client's connection.
 ///
 /// [`unsubscribe`](Self::unsubscribe) is the reliable cleanup path. Dropping an
-/// active value schedules a best-effort unsubscribe when a Tokio runtime is
-/// available and never blocks in `Drop`.
+/// active value inside a Tokio runtime schedules a best-effort unsubscribe and
+/// never blocks in `Drop`. Dropping it outside a current Tokio context closes
+/// and invalidates the client connection so no orphaned local subscription can
+/// make the client appear reusable.
 pub struct HeartRateSubscription {
-    inner: Option<Arc<Inner>>,
+    owner: SubscriptionOwner,
     receiver: broadcast::Receiver<Result<HeartRateSample, Error>>,
     finished: bool,
 }
@@ -356,33 +434,195 @@ impl HeartRateSubscription {
     }
 
     /// Unsubscribes and waits for the daemon response.
+    ///
+    /// If this future is cancelled, its lifecycle owner schedules the same
+    /// best-effort cleanup before another subscription generation may start.
     pub async fn unsubscribe(mut self) -> Result<(), Error> {
-        let inner = self.inner.take().ok_or(Error::ConnectionClosed)?;
-        let result = unsubscribe(&inner).await;
-        inner.events().take();
+        self.owner.start_cleanup();
+        self.owner.acquire_lifecycle_gate().await;
+        let result = unsubscribe_request(&self.owner.inner).await;
+        if let Err(error) = &result {
+            self.owner.inner.fail(error.clone());
+        }
+        self.owner.complete();
         self.finished = true;
         result
     }
 }
 
-impl Drop for HeartRateSubscription {
+struct SubscriptionOwner {
+    inner: Arc<Inner>,
+    generation: u64,
+    lifecycle_guard: Option<OwnedMutexGuard<()>>,
+    armed: bool,
+}
+
+impl SubscriptionOwner {
+    fn activate(&mut self) -> Result<(), Error> {
+        let mut subscription = self.inner.subscription();
+        if subscription.phase != SubscriptionPhase::Subscribing(self.generation) {
+            if self.inner.closed.load(Ordering::SeqCst) {
+                return Err(Error::ConnectionClosed);
+            }
+            return Err(unexpected(
+                "subscription lifecycle changed before activation",
+            ));
+        }
+        subscription.phase = SubscriptionPhase::Active(self.generation);
+        drop(subscription);
+        self.lifecycle_guard.take();
+        Ok(())
+    }
+
+    fn start_cleanup(&self) {
+        self.inner.start_cleanup(self.generation);
+    }
+
+    async fn acquire_lifecycle_gate(&mut self) {
+        if self.lifecycle_guard.is_none() {
+            self.lifecycle_guard =
+                Some(Arc::clone(&self.inner.subscription_gate).lock_owned().await);
+        }
+    }
+
+    fn complete(&mut self) {
+        self.inner.finish_subscription(self.generation);
+        self.armed = false;
+        self.lifecycle_guard.take();
+    }
+}
+
+impl Drop for SubscriptionOwner {
     fn drop(&mut self) {
-        if self.finished {
+        if !self.armed {
             return;
         }
-        let Some(inner) = self.inner.take() else {
+        self.start_cleanup();
+        if self.inner.closed.load(Ordering::SeqCst) {
+            self.inner.finish_subscription(self.generation);
             return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = unsubscribe(&inner).await;
-                inner.events().take();
-            });
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let generation = self.generation;
+        let lifecycle_guard = self.lifecycle_guard.take();
+        self.armed = false;
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(cleanup_subscription(
+                    CleanupFailSafe {
+                        inner,
+                        generation,
+                        complete: false,
+                    },
+                    lifecycle_guard,
+                ));
+            }
+            Err(_) => {
+                inner.fail(Error::ConnectionClosed);
+                inner.finish_subscription(generation);
+            }
         }
     }
 }
 
-async fn unsubscribe(inner: &Arc<Inner>) -> Result<(), Error> {
+struct CleanupFailSafe {
+    inner: Arc<Inner>,
+    generation: u64,
+    complete: bool,
+}
+
+impl Drop for CleanupFailSafe {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.inner.fail(Error::ConnectionClosed);
+            self.inner.finish_subscription(self.generation);
+        }
+    }
+}
+
+async fn cleanup_subscription(
+    mut fail_safe: CleanupFailSafe,
+    lifecycle_guard: Option<OwnedMutexGuard<()>>,
+) {
+    let inner = Arc::clone(&fail_safe.inner);
+    let generation = fail_safe.generation;
+    let _lifecycle_guard = match lifecycle_guard {
+        Some(guard) => guard,
+        None => Arc::clone(&inner.subscription_gate).lock_owned().await,
+    };
+    if !inner.closed.load(Ordering::SeqCst)
+        && let Err(error) = unsubscribe_request(&inner).await
+    {
+        inner.fail(error);
+    }
+    inner.finish_subscription(generation);
+    fail_safe.complete = true;
+}
+
+async fn begin_subscription(
+    inner: &Arc<Inner>,
+) -> Result<
+    (
+        SubscriptionOwner,
+        broadcast::Receiver<Result<HeartRateSample, Error>>,
+    ),
+    Error,
+> {
+    enum Decision {
+        Begin(u64),
+        Active,
+        Wait,
+    }
+
+    loop {
+        if inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionClosed);
+        }
+        let changed = inner.subscription_changed.notified();
+        let lifecycle_guard = Arc::clone(&inner.subscription_gate).lock_owned().await;
+        if inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionClosed);
+        }
+        let decision = {
+            let mut subscription = inner.subscription();
+            match subscription.phase {
+                SubscriptionPhase::Idle => {
+                    let generation = subscription.next_generation;
+                    subscription.next_generation = subscription.next_generation.wrapping_add(1);
+                    subscription.phase = SubscriptionPhase::Subscribing(generation);
+                    Decision::Begin(generation)
+                }
+                SubscriptionPhase::Active(_) | SubscriptionPhase::Subscribing(_) => {
+                    Decision::Active
+                }
+                SubscriptionPhase::Cleaning(_) => Decision::Wait,
+            }
+        };
+        let generation = match decision {
+            Decision::Begin(generation) => generation,
+            Decision::Active => return Err(Error::SubscriptionActive),
+            Decision::Wait => {
+                drop(lifecycle_guard);
+                changed.await;
+                continue;
+            }
+        };
+        let (sender, receiver) = broadcast::channel(EVENT_BUFFER_SIZE);
+        *inner.events() = Some(EventRoute { generation, sender });
+        return Ok((
+            SubscriptionOwner {
+                inner: Arc::clone(inner),
+                generation,
+                lifecycle_guard: Some(lifecycle_guard),
+                armed: true,
+            },
+            receiver,
+        ));
+    }
+}
+
+async fn unsubscribe_request(inner: &Arc<Inner>) -> Result<(), Error> {
     let response = request(inner, "unsubscribe", Some("heart_rate")).await?;
     validate_subscription_response(&response, "unsubscribe", false)
 }
@@ -497,7 +737,7 @@ async fn read_loop(reader: tokio::net::unix::OwnedReadHalf, inner: Weak<Inner>) 
         match inbound {
             Inbound::Event(sample) => {
                 if let Some(events) = inner.events().as_ref() {
-                    let _ = events.send(Ok(sample));
+                    let _ = events.sender.send(Ok(sample));
                 }
             }
             Inbound::Response(response) => {
@@ -505,7 +745,7 @@ async fn read_loop(reader: tokio::net::unix::OwnedReadHalf, inner: Weak<Inner>) 
                     let _ = pending.response.send(Ok(response));
                 } else if let Ok(error) = daemon_error(&response) {
                     if let Some(events) = inner.events().take() {
-                        let _ = events.send(Err(error));
+                        let _ = events.sender.send(Err(error));
                     }
                 } else {
                     inner.fail(unexpected("response arrived without a pending request"));

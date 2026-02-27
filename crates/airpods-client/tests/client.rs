@@ -7,9 +7,11 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +61,51 @@ async fn write_value(writer: &mut tokio::net::unix::OwnedWriteHalf, value: Value
 
 fn success(operation: &str) -> Value {
     json!({"protocol_version": 1, "ok": true, "operation": operation})
+}
+
+async fn write_ping_response(writer: &mut tokio::net::unix::OwnedWriteHalf) {
+    let mut response = success("ping");
+    response["pong"] = json!(true);
+    write_value(writer, response).await;
+}
+
+async fn write_status_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &str,
+    subscriber_count: u64,
+) {
+    write_value(
+        writer,
+        json!({
+            "protocol_version": 1,
+            "ok": true,
+            "operation": "status",
+            "state": state,
+            "subscriber_count": subscriber_count
+        }),
+    )
+    .await;
+}
+
+async fn write_subscription_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    operation: &str,
+) {
+    let subscribing = operation == "subscribe";
+    let mut response = json!({
+        "protocol_version": 1,
+        "ok": true,
+        "operation": operation,
+        "stream": "heart_rate",
+        "subscribed": subscribing,
+    });
+    let idempotence_field = if subscribing {
+        "already_subscribed"
+    } else {
+        "already_unsubscribed"
+    };
+    response[idempotence_field] = json!(false);
+    write_value(writer, response).await;
 }
 
 #[test]
@@ -249,7 +296,288 @@ async fn events_interleave_with_response_and_preserve_values_and_order() {
 }
 
 #[tokio::test]
+async fn lifecycle_cancelled_request_cannot_steal_the_next_response() {
+    let (first_seen_tx, first_seen_rx) = oneshot::channel();
+    let (release_first_tx, release_first_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "ping");
+        first_seen_tx.send(()).unwrap();
+        release_first_rx.await.unwrap();
+        write_ping_response(&mut writer).await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "status");
+        write_status_response(&mut writer, "ready", 0).await;
+    })
+    .await;
+
+    let client = Arc::new(AirPodsClient::connect_to(&server.path).await.unwrap());
+    let first_client = Arc::clone(&client);
+    let first_request = tokio::spawn(async move { first_client.ping().await });
+    first_seen_rx.await.unwrap();
+    first_request.abort();
+    assert!(first_request.await.unwrap_err().is_cancelled());
+
+    let (second_started_tx, second_started_rx) = oneshot::channel();
+    let second_client = Arc::clone(&client);
+    let second_request = tokio::spawn(async move {
+        second_started_tx.send(()).unwrap();
+        second_client.status().await
+    });
+    second_started_rx.await.unwrap();
+    release_first_tx.send(()).unwrap();
+    assert_eq!(
+        second_request.await.unwrap().unwrap().state,
+        DaemonState::Ready
+    );
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn lifecycle_cancelled_subscribe_waiting_for_request_gate_is_cleaned() {
+    let (ping_seen_tx, ping_seen_rx) = oneshot::channel();
+    let (release_ping_tx, release_ping_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "ping");
+        ping_seen_tx.send(()).unwrap();
+        release_ping_rx.await.unwrap();
+        write_ping_response(&mut writer).await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":77,"source_side":"right"}),
+        )
+        .await;
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+    })
+    .await;
+
+    let client = Arc::new(AirPodsClient::connect_to(&server.path).await.unwrap());
+    let ping_client = Arc::clone(&client);
+    let ping = tokio::spawn(async move { ping_client.ping().await });
+    ping_seen_rx.await.unwrap();
+
+    let mut cancelled = Box::pin(client.subscribe_heart_rate());
+    tokio::select! {
+        biased;
+        _ = &mut cancelled => panic!("subscribe unexpectedly completed"),
+        () = std::future::ready(()) => {}
+    }
+    drop(cancelled);
+
+    let replacement_client = Arc::clone(&client);
+    let replacement = tokio::spawn(async move { replacement_client.subscribe_heart_rate().await });
+    release_ping_tx.send(()).unwrap();
+    ping.await.unwrap().unwrap();
+
+    let mut subscription = replacement.await.unwrap().unwrap();
+    assert_eq!(
+        subscription.next().await.unwrap(),
+        Some(HeartRateSample {
+            bpm: 77,
+            source_side: SourceSide::Right,
+        })
+    );
+    subscription.unsubscribe().await.unwrap();
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn lifecycle_cancelled_subscribe_after_send_cleans_before_replacement() {
+    let (subscribe_seen_tx, subscribe_seen_rx) = oneshot::channel();
+    let (release_subscribe_tx, release_subscribe_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        subscribe_seen_tx.send(()).unwrap();
+        release_subscribe_rx.await.unwrap();
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":169,"source_side":"left"}),
+        )
+        .await;
+        write_subscription_response(&mut writer, "subscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":170,"source_side":"left"}),
+        )
+        .await;
+        write_subscription_response(&mut writer, "unsubscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":88,"source_side":"right"}),
+        )
+        .await;
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+    })
+    .await;
+
+    let client = Arc::new(AirPodsClient::connect_to(&server.path).await.unwrap());
+    let cancelled_client = Arc::clone(&client);
+    let cancelled = tokio::spawn(async move { cancelled_client.subscribe_heart_rate().await });
+    subscribe_seen_rx.await.unwrap();
+    cancelled.abort();
+    assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+
+    let replacement_client = Arc::clone(&client);
+    let replacement = tokio::spawn(async move { replacement_client.subscribe_heart_rate().await });
+    release_subscribe_tx.send(()).unwrap();
+    let mut subscription = replacement.await.unwrap().unwrap();
+    assert_eq!(
+        subscription.next().await.unwrap(),
+        Some(HeartRateSample {
+            bpm: 88,
+            source_side: SourceSide::Right,
+        })
+    );
+    subscription.unsubscribe().await.unwrap();
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn lifecycle_cancelled_explicit_unsubscribe_converges_before_replacement() {
+    let (unsubscribe_seen_tx, unsubscribe_seen_rx) = oneshot::channel();
+    let (release_unsubscribe_tx, release_unsubscribe_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        unsubscribe_seen_tx.send(()).unwrap();
+        release_unsubscribe_rx.await.unwrap();
+        write_subscription_response(&mut writer, "unsubscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":93,"source_side":"left"}),
+        )
+        .await;
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+    })
+    .await;
+
+    let client = Arc::new(AirPodsClient::connect_to(&server.path).await.unwrap());
+    let subscription = client.subscribe_heart_rate().await.unwrap();
+    let cancelled = tokio::spawn(async move { subscription.unsubscribe().await });
+    unsubscribe_seen_rx.await.unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+
+    let replacement_client = Arc::clone(&client);
+    let replacement = tokio::spawn(async move { replacement_client.subscribe_heart_rate().await });
+    release_unsubscribe_tx.send(()).unwrap();
+    let mut subscription = replacement.await.unwrap().unwrap();
+    assert_eq!(
+        subscription.next().await.unwrap(),
+        Some(HeartRateSample {
+            bpm: 93,
+            source_side: SourceSide::Left,
+        })
+    );
+    subscription.unsubscribe().await.unwrap();
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn lifecycle_drop_is_nonblocking_and_cleans_before_replacement() {
+    let (unsubscribe_seen_tx, unsubscribe_seen_rx) = oneshot::channel();
+    let (release_unsubscribe_tx, release_unsubscribe_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        unsubscribe_seen_tx.send(()).unwrap();
+        release_unsubscribe_rx.await.unwrap();
+        write_subscription_response(&mut writer, "unsubscribe").await;
+
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":84,"source_side":"right"}),
+        )
+        .await;
+        assert_eq!(read_request(&mut reader).await["operation"], "unsubscribe");
+        write_subscription_response(&mut writer, "unsubscribe").await;
+    })
+    .await;
+
+    let client = Arc::new(AirPodsClient::connect_to(&server.path).await.unwrap());
+    let subscription = client.subscribe_heart_rate().await.unwrap();
+    drop(subscription);
+    unsubscribe_seen_rx.await.unwrap();
+
+    let replacement_client = Arc::clone(&client);
+    let replacement = tokio::spawn(async move { replacement_client.subscribe_heart_rate().await });
+    release_unsubscribe_tx.send(()).unwrap();
+    let mut subscription = replacement.await.unwrap().unwrap();
+    assert_eq!(subscription.next().await.unwrap().unwrap().bpm, 84);
+    subscription.unsubscribe().await.unwrap();
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn lifecycle_drop_outside_runtime_closes_client_and_socket() {
+    let (eof_seen_tx, eof_seen_rx) = oneshot::channel();
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_subscription_response(&mut writer, "subscribe").await;
+        let mut line = Vec::new();
+        assert_eq!(reader.read_until(b'\n', &mut line).await.unwrap(), 0);
+        eof_seen_tx.send(()).unwrap();
+    })
+    .await;
+
+    let client = AirPodsClient::connect_to(&server.path).await.unwrap();
+    let subscription = client.subscribe_heart_rate().await.unwrap();
+    std::thread::spawn(move || drop(subscription))
+        .join()
+        .unwrap();
+    eof_seen_rx.await.unwrap();
+    assert_eq!(client.ping().await.unwrap_err(), Error::ConnectionClosed);
+    assert!(matches!(
+        client.subscribe_heart_rate().await,
+        Err(Error::ConnectionClosed)
+    ));
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
 async fn connection_closure_terminates_subscription() {
+    let (close_tx, close_rx) = oneshot::channel();
     let server = spawn_server(|stream| async move {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -262,10 +590,12 @@ async fn connection_closure_terminates_subscription() {
             }),
         )
         .await;
+        close_rx.await.unwrap();
     })
     .await;
     let client = AirPodsClient::connect_to(&server.path).await.unwrap();
     let mut subscription = client.subscribe_heart_rate().await.unwrap();
+    close_tx.send(()).unwrap();
     assert_eq!(
         subscription.next().await.unwrap_err(),
         Error::ConnectionClosed

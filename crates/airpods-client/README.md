@@ -26,3 +26,10 @@ The default socket is `$XDG_RUNTIME_DIR/airpods-hubd.sock`. Use
 `AirPodsClient::connect_to` to select an explicit socket in tests or during
 development. Missing `XDG_RUNTIME_DIR` and an absent daemon are returned as
 errors; the client has no `/tmp`, TCP, or service-start fallback.
+
+Heart-rate subscription transitions are serialized. Cancelling subscribe or
+unsubscribe cannot release its generation for reuse until cleanup completes.
+Dropping an active subscription inside a Tokio runtime schedules a nonblocking
+best-effort unsubscribe. If it is dropped outside a current Tokio context, the
+client closes and becomes unusable so it cannot retain a silently orphaned
+subscription. Call `unsubscribe().await` when confirmed cleanup is required.
