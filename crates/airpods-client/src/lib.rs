@@ -5,24 +5,24 @@
 //! version 1 has no request IDs, so requests on one client are serialized while
 //! a single reader routes responses and heart-rate events.
 
-use serde_json :: { Map , Value , json } ;
-use std :: env ;
-use std :: fmt ;
-use std :: io ;
-use std :: path :: { Path , PathBuf } ;
-use std :: sync :: atomic :: { AtomicBool , Ordering } ;
-use std :: sync :: { Arc , Mutex as StdMutex , MutexGuard as StdMutexGuard , Weak } ;
-use tokio :: io :: { AsyncBufReadExt , AsyncWriteExt , BufReader } ;
-use tokio :: net :: UnixStream ;
-use tokio :: net :: unix :: OwnedWriteHalf ;
-use tokio :: sync :: { Mutex , OwnedMutexGuard , broadcast , oneshot } ;
+use serde_json::{Map, Value, json};
+use std::env;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 
 /// Experimental daemon protocol version supported by this crate.
 pub const PROTOCOL_VERSION: u64 = 1;
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_SIZE: usize = 4096;
 const DEFAULT_SOCKET_NAME: &str = "airpods-hubd.sock";
-
+const EVENT_BUFFER_SIZE: usize = 32;
 
 /// Errors produced by the client boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,18 +293,120 @@ impl AirPodsClient {
         }
     }
 
-    
+    pub async fn subscribe_heart_rate(&self) -> Result<HeartRateSubscription, Error> {
+        let (sender, receiver) = broadcast::channel(EVENT_BUFFER_SIZE);
+        {
+            let mut events = self.inner.events();
+            if events.is_some() {
+                return Err(Error::SubscriptionActive);
+            }
+            *events = Some(sender);
+        }
+
+        let response = match request(&self.inner, "subscribe", Some("heart_rate")).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.inner.events().take();
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_subscription_response(&response, "subscribe", true) {
+            self.inner.events().take();
+            return Err(error);
+        }
+        Ok(HeartRateSubscription {
+            inner: Some(Arc::clone(&self.inner)),
+            receiver,
+            finished: false,
+        })
+    }
 }
 
+/// An active heart-rate subscription on its parent client's connection.
+///
+/// [`unsubscribe`](Self::unsubscribe) is the reliable cleanup path. Dropping an
+/// active value schedules a best-effort unsubscribe when a Tokio runtime is
+/// available and never blocks in `Drop`.
+pub struct HeartRateSubscription {
+    inner: Option<Arc<Inner>>,
+    receiver: broadcast::Receiver<Result<HeartRateSample, Error>>,
+    finished: bool,
+}
 
+impl HeartRateSubscription {
+    /// Returns the next event, preserving daemon order and duplicates.
+    pub async fn next(&mut self) -> Result<Option<HeartRateSample>, Error> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self.receiver.recv().await {
+            Ok(Ok(sample)) => Ok(Some(sample)),
+            Ok(Err(error)) => {
+                self.finished = true;
+                Err(error)
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                self.finished = true;
+                Err(Error::ConnectionClosed)
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(Error::EventLagged { skipped })
+            }
+        }
+    }
 
+    /// Unsubscribes and waits for the daemon response.
+    pub async fn unsubscribe(mut self) -> Result<(), Error> {
+        let inner = self.inner.take().ok_or(Error::ConnectionClosed)?;
+        let result = unsubscribe(&inner).await;
+        inner.events().take();
+        self.finished = true;
+        result
+    }
+}
 
+impl Drop for HeartRateSubscription {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = unsubscribe(&inner).await;
+                inner.events().take();
+            });
+        }
+    }
+}
 
+async fn unsubscribe(inner: &Arc<Inner>) -> Result<(), Error> {
+    let response = request(inner, "unsubscribe", Some("heart_rate")).await?;
+    validate_subscription_response(&response, "unsubscribe", false)
+}
 
-
-
-
-
+fn validate_subscription_response(
+    response: &Value,
+    operation: &'static str,
+    subscribed: bool,
+) -> Result<(), Error> {
+    let object = success_object(response, operation)?;
+    if required_string(object, "stream")? != "heart_rate" {
+        return Err(unexpected("subscription response has an invalid stream"));
+    }
+    if required_bool(object, "subscribed")? != subscribed {
+        return Err(unexpected("subscription response has an invalid state"));
+    }
+    let idempotence_field = if subscribed {
+        "already_subscribed"
+    } else {
+        "already_unsubscribed"
+    };
+    required_bool(object, idempotence_field)?;
+    Ok(())
+}
 
 async fn request(
     inner: &Arc<Inner>,
@@ -571,8 +673,8 @@ fn io_error(context: &'static str, error: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super :: * ;
-    use tokio :: io :: BufReader ;
+    use super::*;
+    use tokio::io::BufReader;
 
     #[tokio::test]
     async fn bounded_reader_accepts_the_daemon_limit() {

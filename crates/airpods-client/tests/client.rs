@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
-use airpods_client :: { AirPodsClient , DaemonState , Error , MAX_FRAME_SIZE } ;
-use serde_json :: { Value , json } ;
-use std :: future :: Future ;
-use std :: path :: PathBuf ;
-use std :: process :: Command ;
-use std :: sync :: atomic :: { AtomicU64 , Ordering } ;
-use tokio :: io :: { AsyncBufReadExt , AsyncWriteExt , BufReader } ;
-use tokio :: net :: { UnixListener , UnixStream } ;
-use tokio :: task :: JoinHandle ;
+use airpods_client::{
+    AirPodsClient, DaemonState, Error, HeartRateSample, MAX_FRAME_SIZE, SourceSide,
+};
+use serde_json::{Value, json};
+use std::future::Future;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinHandle;
 
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
@@ -161,9 +163,117 @@ async fn ready_and_streaming_status_parse() {
     server.finish().await;
 }
 
+#[tokio::test]
+async fn events_interleave_with_response_and_preserve_values_and_order() {
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let request = read_request(&mut reader).await;
+        assert_eq!(request["operation"], "subscribe");
+        assert_eq!(request["stream"], "heart_rate");
 
+        write_value(
+            &mut writer,
+            json!({"protocol_version":1,"event":"heart_rate","bpm":169,"source_side":"left"}),
+        )
+        .await;
+        write_value(
+            &mut writer,
+            json!({
+                "protocol_version":1,"ok":true,"operation":"subscribe",
+                "stream":"heart_rate","subscribed":true,"already_subscribed":false
+            }),
+        )
+        .await;
+        for event in [
+            json!({"protocol_version":1,"event":"heart_rate","bpm":169,"source_side":"left"}),
+            json!({"protocol_version":1,"event":"heart_rate","bpm":91,"source_side":"right"}),
+            json!({"protocol_version":1,"event":"heart_rate","bpm":72,"source_side":"unknown","source_side_raw":37}),
+        ] {
+            write_value(&mut writer, event).await;
+        }
 
+        let request = read_request(&mut reader).await;
+        assert_eq!(request["operation"], "unsubscribe");
+        write_value(
+            &mut writer,
+            json!({
+                "protocol_version":1,"ok":true,"operation":"unsubscribe",
+                "stream":"heart_rate","subscribed":false,"already_unsubscribed":false
+            }),
+        )
+        .await;
+        assert_eq!(read_request(&mut reader).await["operation"], "status");
+        write_value(
+            &mut writer,
+            json!({
+                "protocol_version":1,"ok":true,"operation":"status",
+                "state":"ready","subscriber_count":0
+            }),
+        )
+        .await;
+    })
+    .await;
 
+    let client = AirPodsClient::connect_to(&server.path).await.unwrap();
+    let mut subscription = client.subscribe_heart_rate().await.unwrap();
+    let mut samples = Vec::new();
+    for _ in 0..4 {
+        samples.push(subscription.next().await.unwrap().unwrap());
+    }
+    assert_eq!(
+        samples,
+        vec![
+            HeartRateSample {
+                bpm: 169,
+                source_side: SourceSide::Left
+            },
+            HeartRateSample {
+                bpm: 169,
+                source_side: SourceSide::Left
+            },
+            HeartRateSample {
+                bpm: 91,
+                source_side: SourceSide::Right
+            },
+            HeartRateSample {
+                bpm: 72,
+                source_side: SourceSide::Unknown(37)
+            },
+        ]
+    );
+    subscription.unsubscribe().await.unwrap();
+    assert_eq!(client.status().await.unwrap().state, DaemonState::Ready);
+    drop(client);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn connection_closure_terminates_subscription() {
+    let server = spawn_server(|stream| async move {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        write_value(
+            &mut writer,
+            json!({
+                "protocol_version":1,"ok":true,"operation":"subscribe",
+                "stream":"heart_rate","subscribed":true,"already_subscribed":false
+            }),
+        )
+        .await;
+    })
+    .await;
+    let client = AirPodsClient::connect_to(&server.path).await.unwrap();
+    let mut subscription = client.subscribe_heart_rate().await.unwrap();
+    assert_eq!(
+        subscription.next().await.unwrap_err(),
+        Error::ConnectionClosed
+    );
+    assert_eq!(subscription.next().await.unwrap(), None);
+    drop(client);
+    server.finish().await;
+}
 
 async fn request_receives_frame(frame: Vec<u8>) -> Error {
     let server = spawn_server(move |stream| async move {
