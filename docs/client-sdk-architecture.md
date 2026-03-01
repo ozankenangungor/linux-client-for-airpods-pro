@@ -195,6 +195,23 @@ The hardware-independent cross-language suite passed three consecutive runs.
 It proved one real daemon and one fake session across the basic, two-client,
 Drop/resubscribe, and active-disconnect scenarios, including deterministic
 event/response interleaving. The complete Python suite passed 698 tests and the
-Rust workspace retained its 41 passing tests. Client SDKB is therefore FINAL PASS
-for source-level Rust client compatibility with the Python daemon. This is not
-real AirPods or production-service validation.
+Rust workspace retained its 41 passing tests.
+
+Testing subsequently built the real `heart_rate` Rust example and ran it
+against the production daemon through the systemd user service with real
+AirPods Pro 3. The service reached `READY` after BlueZ preflight, profile
+registration, transport open, and descriptor handshake while
+`Device1.Connected` remained true. The Rust client reported daemon state
+`Ready` and received 169, 137, 93, 75, 72, 71, 71, 71, 71, and 70 BPM, all
+from the right source, before exiting successfully. This preserved BPM 169 and
+the repeated 71 BPM samples without filtering or deduplication.
+
+Stopping the user service delivered `SIGTERM`, completed production cleanup,
+removed the socket, released the process lock, and left BlueZ reachable, the
+adapter powered, and `Device1.Connected` true. The human operator confirmed
+that normal A2DP music remained uninterrupted throughout. Client SDKB is
+therefore FINAL PASS across the real Rust application, Rust client, Unix IPC,
+systemd daemon, production session, and AirPods hardware stack.
+
+This evidence does not freeze the Rust API or IPC version 1, publish the crate,
+or add automatic daemon reconnect. Those surfaces remain experimental.
