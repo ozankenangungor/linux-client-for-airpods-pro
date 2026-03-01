@@ -5,6 +5,18 @@ application boundary for `airpods-hubd`. Its API and IPC compatibility remain
 experimental. This task does not promise semantic-version stability, a 1.0
 release, or permanent protocol version 1 support.
 
+## Client SDKA FINAL PASS
+
+Client SDKA is accepted at commit
+`e71a253b931e555bae47e0917975ce9e2d9410b3`. Hardware-independent validation
+proved bounded protocol-v1 framing, response/event multiplexing, exact event
+ordering and duplicates, typed failures, and a cancellation-safe generated
+subscription lifecycle. Cleanup of one generation completes or invalidates the
+connection before a replacement can activate. The Rust workspace passed 41
+tests, including 28 client tests, and the cancellation suite passed ten
+consecutive runs. The complete 692-test Python suite also passed. The crate
+remains experimental and unpublished.
+
 ## Boundary and ownership
 
 Applications talk to the daemon because the proven AirPods path depends on one
