@@ -152,3 +152,49 @@ protocol versions, unexpected message shapes, structured daemon errors,
 connection closure, an already-active subscription, and bounded-channel lag.
 Daemon error codes and safe messages remain available without exposing daemon
 session or Bluetooth implementation objects.
+
+## Client SDKB real daemon integration
+
+Client SDKB adds a repository-only cross-language gate. Python instantiates the
+actual `AirPodsHubDaemon` with one injected `FakeSensorSession` in a temporary
+private directory, builds the Rust probe once, and launches it with an explicit
+Unix socket path. The probe at
+`crates/airpods-client/examples/integration_probe.rs` uses only the public
+experimental client API. It is test infrastructure, not a stable user CLI.
+
+The basic scenario sends `hello`, `ping`, `status`, `subscribe`, and
+`unsubscribe` through the real daemon. Fake `HeartRateReport` objects pass
+through the daemon's existing event encoder and arrive in Rust as 169 left, 88
+right, a duplicate 88 right, and 73 unknown with raw source 37. A test-only
+subclass wraps the real status dispatch with asyncio barriers and observes the
+real outbound enqueue operation. This makes an event precede an in-flight
+status response deterministically and proves that the Rust reader loses or
+misclassifies neither message across the language boundary. The subclass calls
+the accepted daemon implementation for framing, dispatch, encoding, and client
+lifecycle behavior; it does not implement alternate protocol semantics.
+
+A second scenario connects two independent Rust clients to the same daemon.
+Both subscriptions share one fake-session START and receive the same reports.
+Removing client A leaves client B streaming without STOP; removing B performs
+the single STOP and returns the daemon to `READY` while the fake session remains
+open. Additional scenarios prove that Rust's nonblocking Drop cleanup permits a
+later generation on the same connection and that an active outside-runtime
+Drop closes the connection, causing the real daemon to remove the last
+subscriber and stop HR without closing the sensor session.
+
+All subprocesses use explicit argument arrays, bounded waits and output, and
+failure cleanup. The harness never constructs the production session, calls
+BlueZ or systemd, or opens Bluetooth. The accepted Client SDKA external types did
+not expose an ownership blocker during this review and remain unchanged. The
+crate and IPC are still experimental. Real AirPods validation of the Rust
+client remains pending after source review.
+
+### Client SDKB FINAL PASS
+
+The hardware-independent cross-language suite passed three consecutive runs.
+It proved one real daemon and one fake session across the basic, two-client,
+Drop/resubscribe, and active-disconnect scenarios, including deterministic
+event/response interleaving. The complete Python suite passed 698 tests and the
+Rust workspace retained its 41 passing tests. Client SDKB is therefore FINAL PASS
+for source-level Rust client compatibility with the Python daemon. This is not
+real AirPods or production-service validation.
