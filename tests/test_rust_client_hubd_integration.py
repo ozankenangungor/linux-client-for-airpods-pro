@@ -20,6 +20,38 @@ PROBE_SOURCE = (
     ROOT / "crates/airpods-client/examples/integration_probe.rs"
 )
 TEST_TIMEOUT = 10.0
+_PROBE_BINARY: Path | None = None
+
+
+def build_probe() -> Path:
+    """Build the repository probe once per Python test process."""
+
+    global _PROBE_BINARY
+    if _PROBE_BINARY is not None:
+        return _PROBE_BINARY
+    build = subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "-p",
+            "airpods-client",
+            "--example",
+            "integration_probe",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+    if build.returncode != 0:
+        stderr = build.stderr.decode("utf-8", errors="replace")[-4000:]
+        raise AssertionError(f"Rust integration probe build failed: {stderr}")
+    binary = ROOT / "target/debug/examples/integration_probe"
+    if not binary.is_file():
+        raise AssertionError("Rust integration probe binary was not produced")
+    _PROBE_BINARY = binary
+    return binary
 
 
 def report(bpm: int, *, field_5: int, sequence: int) -> HeartRateReport:
@@ -110,29 +142,7 @@ class RustClientHubdIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        build = subprocess.run(
-            [
-                "cargo",
-                "build",
-                "--locked",
-                "-p",
-                "airpods-client",
-                "--example",
-                "integration_probe",
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            check=False,
-            timeout=120,
-        )
-        if build.returncode != 0:
-            stderr = build.stderr.decode("utf-8", errors="replace")[-4000:]
-            raise AssertionError(f"Rust integration probe build failed: {stderr}")
-        cls.probe_binary = (
-            ROOT / "target/debug/examples/integration_probe"
-        )
-        if not cls.probe_binary.is_file():
-            raise AssertionError("Rust integration probe binary was not produced")
+        cls.probe_binary = build_probe()
 
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

@@ -39,8 +39,36 @@ async fn run() -> ProbeResult {
         "two-clients" => two_clients(&socket_path).await,
         "drop-resubscribe" => drop_resubscribe(&socket_path).await,
         "disconnect" => disconnect(&socket_path).await,
+        "mixed" => mixed(&socket_path).await,
         _ => Err(invalid("unknown probe mode").into()),
     }
+}
+
+async fn mixed(socket_path: &PathBuf) -> ProbeResult {
+    let client = AirPodsClient::connect_to(socket_path).await?;
+    let mut subscription = client.subscribe_heart_rate().await?;
+    emit(json!({"phase": "rust_subscribed"}))?;
+    emit(json!({"phase": "shared_events_ready"}))?;
+
+    let first = required_sample(subscription.next().await?)?;
+    let second = required_sample(subscription.next().await?)?;
+    require_sample(first, 169, SourceSide::Left)?;
+    require_sample(second, 88, SourceSide::Right)?;
+    subscription.unsubscribe().await?;
+    require_status(&client, DaemonState::Streaming, 1).await?;
+    emit(json!({
+        "phase": "rust_unsubscribed",
+        "bpm": [first.bpm, second.bpm]
+    }))?;
+
+    wait_for_go()?;
+    require_status(&client, DaemonState::Ready, 0).await?;
+    drop(client);
+    emit(json!({
+        "phase": "pass",
+        "scenario": "mixed",
+        "event_count": 2
+    }))
 }
 
 async fn basic(socket_path: &PathBuf) -> ProbeResult {

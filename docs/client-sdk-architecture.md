@@ -1,4 +1,4 @@
-# Experimental Rust client SDK foundation
+# Experimental client SDK architecture
 
 Client SDKA adds the unpublished `airpods-client` crate as the first reusable
 application boundary for `airpods-hubd`. Its API and IPC compatibility remain
@@ -45,8 +45,8 @@ application / game
                         AirPods
 ```
 
-Future language bindings should use the same daemon boundary instead of
-linking to Bluetooth ownership code. A Python client can be added later, and
+Language SDKs use the same daemon boundary instead of linking to Bluetooth
+ownership code. Client SDKC adds the first Python client beside the Rust crate.
 Unity, C#, or JavaScript consumers can implement or wrap the local IPC after a
 supported SDK surface is selected.
 
@@ -215,3 +215,75 @@ systemd daemon, production session, and AirPods hardware stack.
 
 This evidence does not freeze the Rust API or IPC version 1, publish the crate,
 or add automatic daemon reconnect. Those surfaces remain experimental.
+
+## Client SDKC Python SDK foundation
+
+Client SDKC adds the separate `airpods_client` Python package. It is a
+stdlib-only asyncio client for the daemon's Unix JSONL socket. It does not
+import `airpods_hr`, hubd implementation modules, Bumble, D-Bus, BlueZ, or the
+production session, and it never starts or reconnects the daemon. The default
+socket is exactly `$XDG_RUNTIME_DIR/airpods-hubd.sock`; tests and development
+can provide an explicit Unix path. Missing runtime configuration and an absent
+daemon produce distinct client exceptions without `/tmp` or TCP fallback.
+
+```python
+from airpods_client import AirPodsClient
+
+async with await AirPodsClient.connect() as client:
+    async with await client.subscribe_heart_rate() as heart_rate:
+        async for sample in heart_rate:
+            print(sample.bpm, sample.source_side.value)
+```
+
+The Python connection has one bounded reader task and one serialized request
+path. Protocol version 1 has no request IDs, so a shielded request transaction
+retains the request lock until its response arrives even when the calling
+coroutine is cancelled. Heart-rate events use a separate bounded route and can
+arrive before or between responses without satisfying a request. JSON payloads
+are limited to 4096 bytes and validated as UTF-8 protocol-v1 objects before
+typed models are constructed.
+
+Python subscriptions use the same externally visible lifecycle rule as Rust:
+
+```text
+IDLE -> SUBSCRIBING(generation) -> ACTIVE(generation)
+                                  |
+                                  v
+                         CLEANING(generation) -> IDLE
+```
+
+Cancelling subscribe transfers its provisional generation to an asyncio
+cleanup task. Cancelling an explicit close does not cancel that task. A later
+subscription waits for the old subscribe response, idempotent unsubscribe
+response, and event-route removal. If confirmed cleanup fails, the client
+connection becomes terminal. An old unsubscribe therefore cannot affect a new
+generation, and events queued for a cancelled generation cannot appear in its
+replacement. `HeartRateSubscription.close()` and `unsubscribe()` are explicit,
+idempotent async cleanup methods; the async context managers call them without
+depending on Python finalizers. Closing the client with an active subscription
+closes the socket, allowing hubd to remove that client and stop HR when it was
+the final subscriber.
+
+`DaemonState`, `Hello`, `Status`, `SourceSide`, and `HeartRateSample` preserve
+the same protocol meanings as the Rust SDK. Both keep event order and
+duplicates, accept BPM 169 as ordinary data, map left and right exactly, and
+retain raw value 37 for an unknown source side. Both report structured daemon
+errors and terminal disconnects through client-specific typed errors. The
+internal task and ownership structures differ because Rust and asyncio have
+different cancellation models; behavioral parity applies to these observable
+results.
+
+Repository integration tests connect Python clients to the actual
+`AirPodsHubDaemon` with one injected `FakeSensorSession`. They cover protocol
+operations, real daemon event encoding, response/event interleaving,
+disconnect cleanup, and two Python clients sharing one sensor START. A mixed
+scenario connects one Rust client and one Python client to that same daemon.
+Both receive the same ordered reports; removing Rust leaves Python streaming,
+and removing Python performs the single final STOP while the fake session stays
+open until daemon shutdown. These tests construct no production session and do
+no Bluetooth or systemd work.
+
+The Rust and Python SDK APIs and IPC version 1 remain experimental and
+unpublished. Automatic reconnect is still deferred. Client SDKC is a source and
+fake-session integration gate; a later gate must review and validate the SDK
+surface before any public API freeze.
