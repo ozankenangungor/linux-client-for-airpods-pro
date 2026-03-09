@@ -287,3 +287,25 @@ The Rust and Python SDK APIs and IPC version 1 remain experimental and
 unpublished. Automatic reconnect is still deferred. Client SDKC is a source and
 fake-session integration gate; a later gate must review and validate the SDK
 surface before any public API freeze.
+
+### Client SDKC FINAL PASS
+
+Testing installed the standalone experimental Python SDK in the development
+environment and ran `examples/python_heart_rate.py` against the production
+daemon through the systemd user service with real AirPods Pro 3. The daemon
+reached `READY` after BlueZ preflight, profile registration, transport open,
+and descriptor handshake while `Device1.Connected` remained true. The Python
+client reported daemon state `ready` and received 169, 125, 65, 66, 66, 65,
+65, 65, 65, and 64 BPM from the left source before exiting successfully. BPM
+169 and duplicate samples remained ordinary unfiltered data.
+
+Stopping the service delivered `SIGTERM`, completed production cleanup,
+removed the socket, released the process lock, and left BlueZ reachable, the
+adapter powered, and `Device1.Connected` true. The human operator confirmed
+that A2DP music remained uninterrupted throughout. Client SDKC is therefore
+FINAL PASS across the real Python application, standalone Python client, Unix
+IPC, systemd daemon, production session, and AirPods hardware stack.
+
+This evidence does not publish or freeze a 1.0 API, promise permanent IPC
+version 1 compatibility, add automatic reconnect, or make the SDK responsible
+for starting the daemon.
