@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Experimental asynchronous client for the local `airpods-hubd` Unix socket.
+//! Version 0.1 asynchronous client for the local `airpods-hubd` Unix socket.
 //!
 //! This crate owns no Bluetooth resources and never starts the daemon. Protocol
 //! version 1 has no request IDs, so requests on one client are serialized while
@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, oneshot};
 
-/// Experimental daemon protocol version supported by this crate.
+/// Daemon protocol version supported by this v0.1 crate.
 pub const PROTOCOL_VERSION: u64 = 1;
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_SIZE: usize = 4096;

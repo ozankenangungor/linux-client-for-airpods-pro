@@ -3,8 +3,9 @@ name = "airpods-client"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Experimental Rust client for the local airpods-hubd service"
-publish = false
+description = "Async Unix-socket client for the local airpods-hubd service"
+readme = "README.md"
+exclude = ["examples/integration_probe.rs"]
 
 [dependencies]
 serde_json = "1.0"
