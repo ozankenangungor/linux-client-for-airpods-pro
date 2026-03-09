@@ -9,9 +9,21 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
-from airpods_client import AirPodsClient, ConnectionFailed, DaemonError, DaemonState, FrameTooLarge, InvalidMessage, ProtocolVersionError, SourceSide, XdgRuntimeDirMissing
+from airpods_client import (
+    AirPodsClient,
+    ConnectionClosed,
+    ConnectionFailed,
+    DaemonError,
+    DaemonState,
+    FrameTooLarge,
+    InvalidMessage,
+    ProtocolVersionError,
+    SourceSide,
+    SubscriptionActive,
+    XdgRuntimeDirMissing,
+)
 
 
 Handler = Callable[
@@ -29,6 +41,31 @@ def message(**fields: object) -> bytes:
 
 def success(operation: str, **fields: object) -> bytes:
     return message(ok=True, operation=operation, **fields)
+
+
+def subscription_response(operation: str, subscribed: bool) -> bytes:
+    idempotence = (
+        {"already_subscribed": False}
+        if subscribed
+        else {"already_unsubscribed": False}
+    )
+    return success(
+        operation,
+        stream="heart_rate",
+        subscribed=subscribed,
+        **idempotence,
+    )
+
+
+def event(bpm: int, side: str, raw: int | None = None) -> bytes:
+    fields: dict[str, object] = {
+        "event": "heart_rate",
+        "bpm": bpm,
+        "source_side": side,
+    }
+    if raw is not None:
+        fields["source_side_raw"] = raw
+    return message(**fields)
 
 
 async def read_operation(reader: asyncio.StreamReader, expected: str) -> None:
@@ -184,6 +221,71 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(streaming.state, DaemonState.STREAMING)
         self.assertEqual(streaming.subscriber_count, 2)
 
+    async def test_events_interleave_and_preserve_order_duplicates_and_sides(
+        self,
+    ) -> None:
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await read_operation(reader, "subscribe")
+            writer.write(event(169, "left"))
+            writer.write(subscription_response("subscribe", True))
+            writer.write(event(88, "right"))
+            writer.write(event(88, "right"))
+            writer.write(event(73, "unknown", 37))
+            await writer.drain()
+            await read_operation(reader, "status")
+            writer.write(
+                event(72, "left")
+                + success("status", state="streaming", subscriber_count=1)
+            )
+            await writer.drain()
+            await read_operation(reader, "unsubscribe")
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            await reader.read()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        first = [await subscription.__anext__() for _ in range(4)]
+        status_task = asyncio.create_task(client.status())
+        fifth = await subscription.__anext__()
+        status = await status_task
+        self.assertEqual([sample.bpm for sample in first], [169, 88, 88, 73])
+        self.assertEqual(
+            [sample.source_side for sample in first],
+            [
+                SourceSide.LEFT,
+                SourceSide.RIGHT,
+                SourceSide.RIGHT,
+                SourceSide.UNKNOWN,
+            ],
+        )
+        self.assertEqual(first[3].source_side_raw, 37)
+        self.assertEqual((fifth.bpm, fifth.source_side), (72, SourceSide.LEFT))
+        self.assertEqual(status.state, DaemonState.STREAMING)
+        await subscription.unsubscribe()
+        self.assertIsNone(await subscription.next())
+
+    async def test_second_live_subscription_is_rejected(self) -> None:
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await read_operation(reader, "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            await read_operation(reader, "unsubscribe")
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            await reader.read()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        with self.assertRaises(SubscriptionActive):
+            await client.subscribe_heart_rate()
+        await subscription.close()
 
     async def assert_reader_error(
         self,
@@ -236,6 +338,26 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.code, "service_unavailable")
         self.assertEqual(error.message, "unavailable")
 
+    async def test_connection_close_fails_request_and_subscription(self) -> None:
+        close_now = asyncio.Event()
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await read_operation(reader, "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            await close_now.wait()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        waiting = asyncio.create_task(subscription.__anext__())
+        close_now.set()
+        with self.assertRaises(ConnectionClosed):
+            await waiting
+        with self.assertRaises(ConnectionClosed):
+            await client.status()
 
     async def test_cancelled_request_cannot_steal_later_response(self) -> None:
         first_seen = asyncio.Event()
@@ -284,4 +406,169 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(request_b_arrived_early)
         self.assertEqual(status.state, DaemonState.READY)
 
+    async def test_cancelled_subscribe_cleans_before_replacement(self) -> None:
+        first_seen = asyncio.Event()
+        cleanup_seen = asyncio.Event()
+        release_first = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        wire: list[str] = []
 
+        async def operation(reader: asyncio.StreamReader) -> str:
+            request = json.loads(await reader.readline())
+            value = request["operation"]
+            wire.append(value)
+            return value
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            self.assertEqual(await operation(reader), "subscribe")
+            first_seen.set()
+            await release_first.wait()
+            writer.write(event(40, "left"))
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "unsubscribe")
+            cleanup_seen.set()
+            await release_cleanup.wait()
+            writer.write(event(41, "right"))
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            writer.write(event(99, "unknown", 37))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "unsubscribe")
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            await reader.read()
+
+        client = await self.connect(handler)
+        cancelled = asyncio.create_task(client.subscribe_heart_rate())
+        await first_seen.wait()
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        replacement_task = asyncio.create_task(client.subscribe_heart_rate())
+        release_first.set()
+        await cleanup_seen.wait()
+        self.assertFalse(replacement_task.done())
+        release_cleanup.set()
+        replacement = await replacement_task
+        sample = await replacement.__anext__()
+        self.assertEqual((sample.bpm, sample.source_side_raw), (99, 37))
+        await replacement.close()
+        self.assertEqual(
+            wire,
+            ["subscribe", "unsubscribe", "subscribe", "unsubscribe"],
+        )
+
+    async def test_cancelled_unsubscribe_finishes_before_replacement(self) -> None:
+        unsubscribe_seen = asyncio.Event()
+        release_unsubscribe = asyncio.Event()
+        wire: list[str] = []
+
+        async def operation(reader: asyncio.StreamReader) -> str:
+            request = json.loads(await reader.readline())
+            value = request["operation"]
+            wire.append(value)
+            return value
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            self.assertEqual(await operation(reader), "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "unsubscribe")
+            unsubscribe_seen.set()
+            await release_unsubscribe.wait()
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            writer.write(event(77, "left"))
+            await writer.drain()
+            self.assertEqual(await operation(reader), "unsubscribe")
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            await reader.read()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        close_caller = asyncio.create_task(subscription.close())
+        await unsubscribe_seen.wait()
+        close_caller.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_caller
+        replacement_task = asyncio.create_task(client.subscribe_heart_rate())
+        self.assertFalse(replacement_task.done())
+        release_unsubscribe.set()
+        replacement = await replacement_task
+        self.assertEqual((await replacement.__anext__()).bpm, 77)
+        await replacement.close()
+        self.assertEqual(
+            wire,
+            ["subscribe", "unsubscribe", "subscribe", "unsubscribe"],
+        )
+
+    async def test_subscription_close_is_idempotent(self) -> None:
+        unsubscribe_calls = 0
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            nonlocal unsubscribe_calls
+            await read_operation(reader, "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            await read_operation(reader, "unsubscribe")
+            unsubscribe_calls += 1
+            writer.write(subscription_response("unsubscribe", False))
+            await writer.drain()
+            await reader.read()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        iterator_started = asyncio.Event()
+
+        async def wait_for_sample() -> object:
+            iterator_started.set()
+            return await subscription.__anext__()
+
+        waiting = asyncio.create_task(wait_for_sample())
+        await iterator_started.wait()
+        await asyncio.gather(subscription.close(), subscription.close())
+        with self.assertRaises(StopAsyncIteration):
+            await waiting
+        await subscription.close()
+        self.assertEqual(unsubscribe_calls, 1)
+
+    async def test_client_close_with_active_subscription_is_idempotent(
+        self,
+    ) -> None:
+        disconnected = asyncio.Event()
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await read_operation(reader, "subscribe")
+            writer.write(subscription_response("subscribe", True))
+            await writer.drain()
+            await reader.read()
+            disconnected.set()
+
+        client = await self.connect(handler)
+        subscription = await client.subscribe_heart_rate()
+        await asyncio.gather(client.close(), client.close())
+        await disconnected.wait()
+        with self.assertRaises(ConnectionClosed):
+            await subscription.__anext__()
+
+
+if __name__ == "__main__":
+    unittest.main()

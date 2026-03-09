@@ -7,7 +7,7 @@ starts or reconnects the daemon.
 from __future__ import annotations
 
 import asyncio
-
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -226,6 +226,50 @@ class AirPodsClient:
             subscriber_count=_non_negative_integer(message, "subscriber_count"),
         )
 
+    async def subscribe_heart_rate(self) -> HeartRateSubscription:
+        """Subscribe, retaining cancellation cleanup until this generation ends."""
+
+        while True:
+            await self._subscription_lock.acquire()
+            if self._subscription_phase is not _SubscriptionPhase.CLEANING:
+                break
+            changed = self._subscription_changed
+            self._subscription_lock.release()
+            await changed.wait()
+
+        generation: int | None = None
+        try:
+            self._ensure_open()
+            if self._subscription_phase is not _SubscriptionPhase.IDLE:
+                raise SubscriptionActive(
+                    "this client already has a heart-rate subscription"
+                )
+            generation = self._next_generation
+            self._next_generation += 1
+            self._subscription_phase = _SubscriptionPhase.SUBSCRIBING
+            self._subscription_generation = generation
+            self._subscription_changed.clear()
+            route = _EventRoute(
+                generation,
+                asyncio.Queue(maxsize=EVENT_BUFFER_SIZE),
+            )
+            self._event_route = route
+
+            try:
+                response = await self._request(
+                    "subscribe",
+                    stream="heart_rate",
+                )
+                _validate_subscription_response(response, "subscribe", True)
+            except BaseException:
+                self._subscription_phase = _SubscriptionPhase.CLEANING
+                self._schedule_cleanup(generation)
+                raise
+
+            self._subscription_phase = _SubscriptionPhase.ACTIVE
+            return HeartRateSubscription(self, generation, route.queue)
+        finally:
+            self._subscription_lock.release()
 
     async def close(self) -> None:
         """Close this connection. Repeated calls are safe."""
@@ -357,6 +401,48 @@ class AirPodsClient:
         except asyncio.QueueFull:
             self._fail(EventBufferFull("heart-rate event buffer is full"))
 
+    def _schedule_cleanup(self, generation: int) -> asyncio.Task[None]:
+        return self._spawn(self._cleanup_subscription(generation))
+
+    async def _cleanup_subscription(self, generation: int) -> None:
+        async with self._subscription_lock:
+            if self._subscription_generation != generation:
+                return
+            self._subscription_phase = _SubscriptionPhase.CLEANING
+            self._subscription_changed.clear()
+            if not self._closed:
+                try:
+                    response = await self._request(
+                        "unsubscribe",
+                        stream="heart_rate",
+                    )
+                    _validate_subscription_response(
+                        response,
+                        "unsubscribe",
+                        False,
+                    )
+                except asyncio.CancelledError:
+                    self._fail(
+                        ConnectionClosed(
+                            "subscription cleanup was cancelled"
+                        )
+                    )
+                    raise
+                except AirPodsClientError as error:
+                    self._fail(error)
+                    raise
+            if (
+                self._event_route is not None
+                and self._event_route.generation == generation
+            ):
+                if self._event_route.queue.full():
+                    self._event_route.queue.get_nowait()
+                self._event_route.queue.put_nowait(StopAsyncIteration())
+                self._event_route = None
+            if self._subscription_generation == generation:
+                self._subscription_generation = None
+                self._subscription_phase = _SubscriptionPhase.IDLE
+                self._subscription_changed.set()
 
     def _spawn(self, awaitable: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(awaitable)
@@ -395,6 +481,66 @@ class AirPodsClient:
             )
 
 
+class HeartRateSubscription(AsyncIterator[HeartRateSample]):
+    """One generation-scoped heart-rate event subscription."""
+
+    def __init__(
+        self,
+        client: AirPodsClient,
+        generation: int,
+        queue: asyncio.Queue[HeartRateSample | BaseException],
+    ) -> None:
+        self._client = client
+        self._generation = generation
+        self._queue = queue
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        _error_type: type[BaseException] | None,
+        _error: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        await self.close()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> HeartRateSample:
+        if self._closed:
+            raise StopAsyncIteration
+        value = await self._queue.get()
+        if isinstance(value, BaseException):
+            self._closed = True
+            raise value
+        return value
+
+    async def next(self) -> HeartRateSample | None:
+        """Return the next sample, or `None` after explicit close."""
+
+        try:
+            return await self.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    async def unsubscribe(self) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Idempotently unsubscribe; cancellation leaves cleanup running."""
+
+        if self._cleanup_task is None:
+            self._closed = True
+            self._cleanup_task = self._client._schedule_cleanup(
+                self._generation
+            )
+        await asyncio.shield(self._cleanup_task)
+
+
 def _success(
     response: dict[str, Any],
     expected_operation: str,
@@ -417,6 +563,22 @@ def _daemon_error(response: dict[str, Any]) -> DaemonError:
         _string(error, "code"),
         _string(error, "message"),
     )
+
+
+def _validate_subscription_response(
+    response: dict[str, Any],
+    operation: str,
+    subscribed: bool,
+) -> None:
+    message = _success(response, operation)
+    if _string(message, "stream") != "heart_rate":
+        raise InvalidMessage("subscription response stream is invalid")
+    if _boolean(message, "subscribed") is not subscribed:
+        raise InvalidMessage("subscription response state is invalid")
+    idempotence_field = (
+        "already_subscribed" if subscribed else "already_unsubscribed"
+    )
+    _boolean(message, idempotence_field)
 
 
 def _heart_rate_sample(message: dict[str, Any]) -> HeartRateSample:
