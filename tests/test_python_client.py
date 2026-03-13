@@ -11,6 +11,8 @@ import unittest
 from unittest import mock
 from typing import Any, Awaitable, Callable
 
+from tests.client_sdk_test_support import PYTHON_CLIENT_SRC
+
 from airpods_client import (
     AirPodsClient,
     ConnectionClosed,
@@ -80,10 +82,17 @@ async def read_operation(reader: asyncio.StreamReader, expected: str) -> None:
 
 
 class PackageBoundaryTests(unittest.TestCase):
+    def test_tests_use_the_standalone_authoritative_source(self) -> None:
+        import airpods_client
+
+        self.assertTrue(
+            Path(airpods_client.__file__).is_relative_to(PYTHON_CLIENT_SRC)
+        )
+
     def test_package_is_stdlib_only_and_has_no_autostart_or_bluetooth_path(
         self,
     ) -> None:
-        package = Path(__file__).parents[1] / "src/airpods_client"
+        package = PYTHON_CLIENT_SRC / "airpods_client"
         source = "\n".join(
             path.read_text() for path in sorted(package.glob("*.py"))
         )

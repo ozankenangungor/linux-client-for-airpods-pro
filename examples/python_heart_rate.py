@@ -1,4 +1,4 @@
-"""Experimental Python SDK example for an already-running airpods-hubd."""
+"""Python SDK v0.1 example for an already-running airpods-hubd."""
 
 from __future__ import annotations
 

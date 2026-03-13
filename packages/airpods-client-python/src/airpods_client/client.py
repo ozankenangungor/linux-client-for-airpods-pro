@@ -1,7 +1,8 @@
 """Bounded protocol-v1 Unix client for airpods-hubd.
 
-The API is experimental. This module owns no Bluetooth resources and never
-starts or reconnects the daemon.
+The v0.1 SDK surface is supported while protocol v1 remains experimental.
+This module owns no Bluetooth resources and never starts or reconnects the
+daemon.
 """
 
 from __future__ import annotations
@@ -134,7 +135,7 @@ class _EventRoute:
 
 
 class AirPodsClient:
-    """One experimental asyncio connection to a running airpods-hubd."""
+    """One v0.1 asyncio connection to a running airpods-hubd."""
 
     def __init__(
         self,

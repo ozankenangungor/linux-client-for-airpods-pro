@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from typing import Any
 
+from tests.client_sdk_test_support import PYTHON_CLIENT_SRC as _CLIENT_SRC
+
 from airpods_client import AirPodsClient, DaemonState, SourceSide
 from airpods_hr._hubd.server import DaemonState as HubDaemonState
 from tests.test_rust_client_hubd_integration import (

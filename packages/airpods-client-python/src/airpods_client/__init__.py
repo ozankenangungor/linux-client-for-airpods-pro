@@ -1,4 +1,4 @@
-"""Experimental asyncio client for the local airpods-hubd service."""
+"""Version 0.1 asyncio client for the local airpods-hubd service."""
 
 from airpods_client.client import (
     AirPodsClient,

@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from tests.client_sdk_test_support import PYTHON_CLIENT_SRC as _CLIENT_SRC
+
 from airpods_client import (
     AirPodsClient,
     ConnectionClosed,
