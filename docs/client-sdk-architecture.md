@@ -309,3 +309,39 @@ IPC, systemd daemon, production session, and AirPods hardware stack.
 This evidence does not publish or freeze a 1.0 API, promise permanent IPC
 version 1 compatibility, add automatic reconnect, or make the SDK responsible
 for starting the daemon.
+
+## Client SDKD v0.1 SDK surface and packaging
+
+Client SDKD freezes the supported first client surface documented in
+`docs/sdk-v0.1-api.md`. The existing hardware-proven connection, request,
+event, error, and subscription behavior remains intact. Patch releases in the
+v0.1 line should not intentionally break that documented surface. A future
+v0.2 may make deliberate breaking changes. This is not a 1.0 promise, and IPC
+protocol version 1 remains experimental and subject to coordinated daemon/SDK
+versioning.
+
+The authoritative Python source moves to
+`packages/airpods-client-python/src/airpods_client`. Its independent
+`airpods-client` distribution is version 0.1.0, uses setuptools packaging, and
+has no runtime dependencies. The root `airpods-hr-linux` production
+distribution continues to discover `src/airpods_hr` and retain its daemon and
+Bluetooth dependencies; it does not package a second client copy. Repository
+tests add the standalone source directory explicitly rather than relying on
+the production distribution.
+
+The Rust `airpods-client` crate remains version 0.1.0 with the accepted public
+API and dependency set. Its package metadata now identifies its README and
+excludes the repository-only cross-language integration probe. Local Cargo
+packaging and an external consumer compile validate it without publishing.
+
+Both release-candidate SDK packages require `airpods-hubd` to be running and
+own no Bluetooth or daemon lifecycle. Their hardware evidence is already
+complete: Client SDKB proved the Rust SDK through the real production stack, and
+Client SDKC proved the Python SDK through the same boundary while A2DP remained
+uninterrupted. Client SDKD performs no additional hardware or production-service
+run.
+
+Before public release, maintainers must separately choose and verify registry
+names, perform the publication gate, and package the daemon and production
+systemd paths. Automatic reconnect, a deliberate request-timeout policy, and
+future IPC compatibility remain outside this SDK packaging gate.

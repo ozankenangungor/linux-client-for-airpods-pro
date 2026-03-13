@@ -1,9 +1,10 @@
 # airpods-client
 
-`airpods-client` is an experimental Rust client for the local
-`airpods-hubd` Unix JSONL interface. It does not open Bluetooth, start the
-daemon, or reconnect automatically. The API and protocol compatibility are
-not yet stable, and the crate is not published.
+`airpods-client` 0.1 is the supported first Rust SDK surface for the local
+`airpods-hubd` Unix JSONL interface. `airpods-hubd` must already be running.
+The crate does not open Bluetooth, start the daemon, call systemd, or reconnect
+automatically. It is packaging-ready in this repository but has not been
+published, and no external registry-name availability is claimed.
 
 ```rust,no_run
 use airpods_client::AirPodsClient;
@@ -33,3 +34,9 @@ Dropping an active subscription inside a Tokio runtime schedules a nonblocking
 best-effort unsubscribe. If it is dropped outside a current Tokio context, the
 client closes and becomes unusable so it cannot retain a silently orphaned
 subscription. Call `unsubscribe().await` when confirmed cleanup is required.
+
+Patch releases in the v0.1 line should not intentionally break the documented
+surface. A future v0.2 may make deliberate breaking changes. Protocol version
+1 remains experimental and may evolve through coordinated daemon and SDK
+versioning; compatibility with arbitrary future daemon versions is not
+promised.
