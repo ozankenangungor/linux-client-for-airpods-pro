@@ -345,3 +345,24 @@ Before public release, maintainers must separately choose and verify registry
 names, perform the publication gate, and package the daemon and production
 systemd paths. Automatic reconnect, a deliberate request-timeout policy, and
 future IPC compatibility remain outside this SDK packaging gate.
+
+### Client SDKD and Client SDK FINAL PASS
+
+Client SDKD is accepted at repository commit
+`1514a01d2b2234569d5f80d80f491ef72f4a96b7`. The accepted repository ZIP has
+SHA-256 `e3cb874f93a756adbc10e3596f5713ebf9f487bca62177d9f9eebf7bcdff1ea2`.
+
+The standalone Python `airpods-client` 0.1.0 release candidate has no runtime
+dependencies. Its accepted wheel SHA-256 is
+`7beaf02ac14fda947a1cf308886b9cde4a8d174987955b4bd44291a9c2274cac`, and its
+accepted sdist SHA-256 is
+`45313422fe09d3aefe2e44aeb01e8cefbfbcbd406e1843a11c88cfb223b199b1`. The
+accepted Rust `airpods-client` 0.1.0 crate SHA-256 is
+`33bb9f5015042363050e587a8ff339cebce13542fa92e0d4f1045903226b872a`.
+
+Tasks 9.9A, 9.9B, 9.9C, and 9.9D, and therefore Client SDK as a whole, are FINAL
+PASS. The Rust and Python SDK release candidates remain unpublished. This
+closure freezes the documented v0.1 application surface without making a 1.0
+stability promise, stabilizing IPC protocol version 1, or adding automatic
+reconnect, Bluetooth ownership, daemon startup, or systemd control to either
+SDK.
