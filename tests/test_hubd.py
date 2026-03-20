@@ -1390,9 +1390,11 @@ class SocketPathSafetyTests(unittest.TestCase):
         )
         self.assertFalse(any("hub" in name.lower() for name in airpods_hr.__all__))
 
-    def test_production_modules_do_not_import_hubd(self) -> None:
+    def test_bluetooth_production_modules_do_not_import_hubd(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src" / "airpods_hr"
-        production_files = [path for path in root.glob("*.py")]
+        production_files = [
+            path for path in root.glob("*.py") if path.name != "service_installer.py"
+        ]
         for path in production_files:
             self.assertNotIn("airpods_hr._hubd", path.read_text(), path.name)
 

@@ -188,16 +188,21 @@ values, reports, raw AAP/HCI data, Bluetooth addresses, keys, and encryption
 material are not logged by the runner. `--verbose` adds only the safe exception
 type for operator diagnosis; it does not enable packet or BPM logging.
 
-The repository unit at `packaging/systemd/airpods-hubd.service` is a user
-service and runs the installed `airpods-hubd` entrypoint from the development
-virtual environment through a bounded PATH. Its restrictive `UMask=0077` and
-`NoNewPrivileges=yes` do not block the existing runtime-directory, D-Bus, or
-Bluetooth socket requirements. More aggressive filesystem, address-family,
-or D-Bus sandboxing is deferred until it can be validated with the real
-production lifecycle. `Restart=no` is deliberate: blind restart could open a
-new AAP channel on the same BlueZ connection, where descriptor bootstrap is
-known to be unreliable. The unit never reconnects Bluetooth or resets an
-adapter.
+Iteration 9.10A replaces the repository-specific development unit with the
+`airpods-hubd-service` installer in the production Python distribution. The
+package-owned generator in `airpods_hr.service_installer` is the sole
+authoritative unit definition. It renders a direct `ExecStart` using the
+absolute Python interpreter of the environment running the installer and
+`-m airpods_hr._hubd.main`; daemon startup does not depend on a checkout,
+working directory, shell wrapper, or runtime `PATH` lookup.
+
+The generated unit's restrictive `UMask=0077` and `NoNewPrivileges=yes` do not
+block the existing runtime-directory, D-Bus, or Bluetooth socket requirements.
+More aggressive filesystem, address-family, or D-Bus sandboxing is deferred
+until it can be validated with the real production lifecycle. `Restart=no` is
+deliberate: blind restart could open a new AAP channel on the same BlueZ
+connection, where descriptor bootstrap is known to be unreliable. The unit
+never reconnects Bluetooth or resets an adapter.
 
 The unit sets `TimeoutStopSec=330`. Shutdown from STREAMING can consume two
 independent daemon operation windows in sequence: up to 150 seconds for
@@ -209,24 +214,20 @@ test to twice `DEFAULT_DAEMON_OPERATION_TIMEOUT` plus that margin. If a future
 service configuration raises the runner's private `--operation-timeout`, its
 `TimeoutStopSec` must be raised to preserve the same relationship.
 
-For a manual development installation from the conventional clone location:
+Install the production distribution into an isolated Python environment, then
+install its systemd user unit without starting the daemon:
 
 ```console
-cd ~/airpods-hr-linux
-.venv/bin/python -m pip install -e .
-mkdir -p ~/.config/systemd/user
-cp packaging/systemd/airpods-hubd.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user start airpods-hubd
-systemctl --user status airpods-hubd
-journalctl --user -u airpods-hubd
+airpods-hubd-service install
 ```
 
-If the checkout is elsewhere, edit the unit's PATH entry before copying it.
-Daemon serviceC implementation does not install, enable, start, or hardware-validate
-the service. Distribution packaging, systemd lifecycle evidence, login
-auto-start, crash/restart policy, stable public IPC, and public Rust/Python
-client SDKs remain future work.
+The installer writes the XDG user-unit destination atomically, identifies its
+own units before replacement or removal, and invokes only the requested
+bounded `systemctl --user` operations. `install --dry-run` performs no writes
+or systemctl calls. `install --enable` enables login activation but does not
+start the daemon. See `docs/daemon-installation.md` for the complete RC
+workflow. Iteration 9.10A performs no new hardware validation; the real installed
+service remains the separate SDK packaging gate.
 
 ## Daemon service FINAL PASS
 

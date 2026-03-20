@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -10,29 +11,19 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-from collections.abc import Mapping
 
 
 UNIT_NAME = "airpods-hubd.service"
-
-
-
 OWNERSHIP_MARKER = "# X-AirPods-HR-Linux-Managed: 1"
-
-
-
 SYSTEMCTL_TIMEOUT = 15.0
-
 
 
 class ServiceInstallerError(RuntimeError):
     """Base error for safe service installation failures."""
 
 
-
 class ForeignUnitError(ServiceInstallerError):
     """The destination contains a unit not owned by this project."""
-
 
 
 class SystemctlError(ServiceInstallerError):
@@ -44,14 +35,12 @@ class SystemctlError(ServiceInstallerError):
         super().__init__(f"{' '.join(argv)} failed: {detail}")
 
 
-
 class SystemctlBoundary(Protocol):
     """The one command boundary used by service actions."""
 
     def argv_for(self, operation: str) -> list[str]: ...
 
     def run(self, operation: str) -> None: ...
-
 
 
 class Systemctl:
@@ -104,7 +93,6 @@ class Systemctl:
             raise SystemctlError(argv, detail)
 
 
-
 @dataclass(frozen=True)
 class InstallationState:
     unit_path: Path
@@ -117,7 +105,6 @@ class InstallationState:
     @property
     def valid(self) -> bool:
         return self.exists and self.owned and self.exec_start_matches
-
 
 
 def user_unit_path(environment: Mapping[str, str] | None = None) -> Path:
@@ -139,7 +126,6 @@ def user_unit_path(environment: Mapping[str, str] | None = None) -> Path:
     return base / "systemd" / "user" / UNIT_NAME
 
 
-
 def installed_python(executable: str | os.PathLike[str] | None = None) -> Path:
     """Return the absolute interpreter path without resolving a venv symlink."""
 
@@ -152,7 +138,6 @@ def installed_python(executable: str | os.PathLike[str] | None = None) -> Path:
     if executable is None and not path.is_file():
         raise ServiceInstallerError(f"current Python executable does not exist: {path}")
     return path
-
 
 
 def systemd_quote_argument(value: str) -> str:
@@ -173,12 +158,10 @@ def systemd_quote_argument(value: str) -> str:
     return f'"{escaped}"'
 
 
-
 def exec_start_for(python: Path) -> str:
     if not python.is_absolute():
         raise ServiceInstallerError("daemon Python executable must be absolute")
     return f"{systemd_quote_argument(os.fspath(python))} -m airpods_hr._hubd.main"
-
 
 
 def render_unit(python: Path) -> str:
@@ -205,15 +188,12 @@ WantedBy=default.target
 """
 
 
-
 def is_project_owned(contents: str) -> bool:
     return contents.startswith(f"{OWNERSHIP_MARKER}\n")
 
 
-
 def _path_exists(path: Path) -> bool:
     return os.path.lexists(path)
-
 
 
 def _installed_exec_start(contents: str) -> str | None:
@@ -225,7 +205,6 @@ def _installed_exec_start(contents: str) -> str | None:
     if len(values) != 1:
         return None
     return values[0]
-
 
 
 def inspect_installation(unit_path: Path, python: Path) -> InstallationState:
@@ -247,7 +226,6 @@ def inspect_installation(unit_path: Path, python: Path) -> InstallationState:
         expected,
         installed,
     )
-
 
 
 def atomic_write_unit(path: Path, contents: str) -> None:
@@ -284,7 +262,6 @@ def atomic_write_unit(path: Path, contents: str) -> None:
                 pass
 
 
-
 def install_service(
     unit_path: Path,
     python: Path,
@@ -310,7 +287,6 @@ def install_service(
     systemctl.run("daemon-reload")
     if enable:
         systemctl.run("enable")
-
 
 
 def uninstall_service(
@@ -341,3 +317,129 @@ def uninstall_service(
             ) from error
     systemctl.run("daemon-reload")
 
+
+def _print_plan(
+    *,
+    unit_path: Path,
+    python: Path,
+    operations: Sequence[str],
+    systemctl: SystemctlBoundary,
+    output: Callable[[str], None],
+) -> None:
+    output(f"unit_path={unit_path}")
+    output(f"exec_start={exec_start_for(python)}")
+    for operation in operations:
+        output(f"would_run={' '.join(systemctl.argv_for(operation))}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="airpods-hubd-service",
+        description="Manage the airpods-hubd systemd user-service definition.",
+    )
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    install = subparsers.add_parser(
+        "install", help="install the user-service unit"
+    )
+    install.add_argument(
+        "--enable", action="store_true", help="enable at login without starting now"
+    )
+    install.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an unrecognized unit at the destination",
+    )
+    install.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the unit destination and actions without changes",
+    )
+
+    uninstall = subparsers.add_parser(
+        "uninstall", help="remove the owned user-service unit"
+    )
+    uninstall.add_argument(
+        "--disable",
+        action="store_true",
+        help="disable the unit before removing it",
+    )
+    uninstall.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the destination and actions without changes",
+    )
+
+    subparsers.add_parser(
+        "verify", help="inspect the installed unit without running the daemon"
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    systemctl: SystemctlBoundary | None = None,
+    output: Callable[[str], None] = print,
+) -> int:
+    args = build_parser().parse_args(argv)
+    command = systemctl or Systemctl()
+    try:
+        path = user_unit_path(environment)
+        python = installed_python()
+        if args.action == "install":
+            operations = ["daemon-reload", *(["enable"] if args.enable else [])]
+            if args.dry_run:
+                _print_plan(
+                    unit_path=path,
+                    python=python,
+                    operations=operations,
+                    systemctl=command,
+                    output=output,
+                )
+            else:
+                install_service(
+                    path,
+                    python,
+                    systemctl=command,
+                    enable=args.enable,
+                    force=args.force,
+                )
+                output(f"installed={path}")
+            return 0
+        if args.action == "uninstall":
+            operations = [*(["disable"] if args.disable else []), "daemon-reload"]
+            if args.dry_run:
+                if _path_exists(path) and not is_project_owned(
+                    path.read_text(encoding="utf-8")
+                ):
+                    raise ForeignUnitError(
+                        f"refusing to remove unrecognized service unit: {path}"
+                    )
+                _print_plan(
+                    unit_path=path,
+                    python=python,
+                    operations=operations,
+                    systemctl=command,
+                    output=output,
+                )
+            else:
+                uninstall_service(path, systemctl=command, disable=args.disable)
+                output(f"uninstalled={path}")
+            return 0
+
+        state = inspect_installation(path, python)
+        output(f"unit_path={state.unit_path}")
+        output(f"exists={str(state.exists).lower()}")
+        output(f"project_owned={str(state.owned).lower()}")
+        output(f"exec_start_matches={str(state.exec_start_matches).lower()}")
+        output(f"expected_exec_start={state.expected_exec_start}")
+        return 0 if state.valid else 1
+    except (OSError, ServiceInstallerError) as error:
+        print(f"airpods-hubd-service: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

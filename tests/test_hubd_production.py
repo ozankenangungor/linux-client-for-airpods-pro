@@ -591,19 +591,17 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_only_process_entrypoint_and_user_unit_are_added(self) -> None:
+    def test_production_and_service_entrypoints_are_metadata_only(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         self.assertEqual(
             project["project"]["scripts"],
             {
                 "airpods-hr": "airpods_hr.cli:main",
                 "airpods-hubd": "airpods_hr._hubd.main:main",
+                "airpods-hubd-service": "airpods_hr.service_installer:main",
             },
         )
-        self.assertEqual(
-            list(ROOT.rglob("*.service")),
-            [ROOT / "packaging/systemd/airpods-hubd.service"],
-        )
+        self.assertEqual(list(ROOT.rglob("*.service")), [])
         self.assertNotIn(
             "_airpods_aap_core",
             (ROOT / "src/airpods_hr/_hubd/production.py").read_text()

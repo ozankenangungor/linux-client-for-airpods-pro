@@ -6,16 +6,34 @@ import os
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 from airpods_hr import service_installer
-from airpods_hr.service_installer import ForeignUnitError, OWNERSHIP_MARKER, SYSTEMCTL_TIMEOUT, ServiceInstallerError, Systemctl, SystemctlError, atomic_write_unit, exec_start_for, inspect_installation, install_service, installed_python, render_unit, systemd_quote_argument, uninstall_service, user_unit_path
-from airpods_hr.service_installer import OWNERSHIP_MARKER, ServiceInstallerError, exec_start_for, installed_python, render_unit, systemd_quote_argument, user_unit_path
+from airpods_hr.service_installer import (
+    ForeignUnitError,
+    OWNERSHIP_MARKER,
+    SYSTEMCTL_TIMEOUT,
+    ServiceInstallerError,
+    Systemctl,
+    SystemctlError,
+    atomic_write_unit,
+    exec_start_for,
+    inspect_installation,
+    install_service,
+    installed_python,
+    render_unit,
+    systemd_quote_argument,
+    uninstall_service,
+    user_unit_path,
+)
 
 
 REPOSITORY = "/home/kenan/airpods-hr-linux"
-
 
 
 class FakeSystemctl(Systemctl):
@@ -25,7 +43,6 @@ class FakeSystemctl(Systemctl):
 
     def run(self, operation: str) -> None:
         self.operations.append(operation)
-
 
 
 class DestinationTests(unittest.TestCase):
@@ -52,7 +69,6 @@ class DestinationTests(unittest.TestCase):
         path = installed_python("/opt/pipx/venvs/airpods-hr-linux/bin/python")
         self.assertEqual(path, Path("/opt/pipx/venvs/airpods-hr-linux/bin/python"))
         self.assertNotIn(REPOSITORY, os.fspath(path))
-
 
 
 class UnitRenderingTests(unittest.TestCase):
@@ -112,7 +128,6 @@ class UnitRenderingTests(unittest.TestCase):
         self.assertGreaterEqual(int(line.partition("=")[2]), 330)
 
 
-
 class AtomicInstallTests(unittest.TestCase):
     def test_atomic_write_installs_complete_restrictive_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -137,7 +152,6 @@ class AtomicInstallTests(unittest.TestCase):
                     )
             self.assertEqual(path.read_text(encoding="utf-8"), previous)
             self.assertEqual(list(path.parent.glob(f".{path.name}.*")), [])
-
 
 
 class InstallActionTests(unittest.TestCase):
@@ -186,6 +200,28 @@ class InstallActionTests(unittest.TestCase):
             self.path.read_text(encoding="utf-8").startswith(OWNERSHIP_MARKER)
         )
 
+    def test_dry_run_mutates_nothing_and_calls_no_systemctl(self) -> None:
+        output: list[str] = []
+        environment_python = Path(self.temporary.name) / "installed env/bin/python"
+        environment_python.parent.mkdir(parents=True)
+        environment_python.touch()
+        with patch.object(
+            service_installer.sys, "executable", os.fspath(environment_python)
+        ):
+            status = service_installer.main(
+                ["install", "--dry-run", "--enable"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.path.parents[2])},
+                systemctl=self.systemctl,
+                output=output.append,
+            )
+        self.assertEqual(status, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.systemctl.operations, [])
+        self.assertIn(f"unit_path={self.path}", output)
+        self.assertIn(
+            f'exec_start="{environment_python}" -m airpods_hr._hubd.main', output
+        )
+        self.assertEqual(sum(line.startswith("would_run=") for line in output), 2)
 
 
 class VerifyAndUninstallTests(unittest.TestCase):
@@ -246,7 +282,6 @@ class VerifyAndUninstallTests(unittest.TestCase):
         self.assertEqual(self.systemctl.operations, ["daemon-reload"])
 
 
-
 class SystemctlBoundaryTests(unittest.TestCase):
     def test_subprocess_uses_argv_no_shell_and_bounded_timeout(self) -> None:
         runner = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
@@ -282,3 +317,35 @@ class SystemctlBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemctlError, "timed out"):
             systemctl.run("disable")
 
+    def test_verify_cli_is_hardware_independent(self) -> None:
+        output: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"XDG_CONFIG_HOME": directory}
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                status = service_installer.main(
+                    ["verify"],
+                    environment=environment,
+                    systemctl=FakeSystemctl(),
+                    output=output.append,
+                )
+        self.assertEqual(status, 1)
+        self.assertIn("exists=false", output)
+        self.assertEqual(stderr.getvalue(), "")
+
+
+class PackageBoundaryTests(unittest.TestCase):
+    def test_production_distribution_excludes_standalone_python_sdk(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            project["tool"]["setuptools"]["packages"]["find"]["where"], ["src"]
+        )
+        self.assertFalse((root / "src/airpods_client").exists())
+        self.assertTrue(
+            (root / "packages/airpods-client-python/src/airpods_client").is_dir()
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

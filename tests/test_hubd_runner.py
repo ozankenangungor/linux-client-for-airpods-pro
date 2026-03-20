@@ -39,6 +39,7 @@ from airpods_hr._hubd.server import (
     DaemonState,
 )
 from airpods_hr.heartrate import HeartRateReport
+from airpods_hr.service_installer import installed_python, render_unit
 from tools.probe_hubd_runner import run_probe as run_runner_probe
 
 
@@ -459,9 +460,11 @@ class RunnerStaticSafetyTests(unittest.TestCase):
         self.assertEqual(hubd_main.__all__, [])
 
     def test_systemd_unit_is_nonaggressive_user_service(self) -> None:
-        unit = (ROOT / "packaging/systemd/airpods-hubd.service").read_text()
-        self.assertIn("ExecStart=/usr/bin/env airpods-hubd", unit)
-        self.assertIn("%h/airpods-hr-linux/.venv/bin", unit)
+        unit = render_unit(installed_python())
+        self.assertIn("ExecStart=", unit)
+        self.assertIn(" -m airpods_hr._hubd.main", unit)
+        self.assertNotIn("Environment=PATH", unit)
+        self.assertNotIn("/usr/bin/env", unit)
         self.assertIn("Restart=no", unit)
         self.assertIn("WantedBy=default.target", unit)
         self.assertIn("UMask=0077", unit)
@@ -471,7 +474,7 @@ class RunnerStaticSafetyTests(unittest.TestCase):
             self.assertNotIn(forbidden, unit.lower())
 
     def test_systemd_stop_timeout_covers_two_daemon_cleanup_windows(self) -> None:
-        unit = (ROOT / "packaging/systemd/airpods-hubd.service").read_text()
+        unit = render_unit(installed_python())
         timeout_line = next(
             line for line in unit.splitlines() if line.startswith("TimeoutStopSec=")
         )
@@ -488,17 +491,15 @@ class RunnerStaticSafetyTests(unittest.TestCase):
         analyzer = shutil.which("systemd-analyze")
         if analyzer is None:
             self.skipTest("systemd-analyze is unavailable")
-        result = subprocess.run(
-            [
-                analyzer,
-                "verify",
-                "--user",
-                str(ROOT / "packaging/systemd/airpods-hubd.service"),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            unit_path = Path(directory) / "airpods-hubd.service"
+            unit_path.write_text(render_unit(installed_python()), encoding="utf-8")
+            result = subprocess.run(
+                [analyzer, "verify", "--user", str(unit_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_asyncio_signal_registrar_delegates_to_loop(self) -> None:

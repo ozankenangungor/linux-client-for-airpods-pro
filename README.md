@@ -38,8 +38,13 @@ Working:
 - A persistent `airpods-hubd` user service owns one production session and
   fans heart-rate events out over private Unix JSONL IPC. Its repeated
   START/STOP and graceful systemd lifecycle have passed real hardware tests.
-- The unpublished experimental `airpods-client` Rust crate consumes protocol
-  version 1 without opening Bluetooth or starting the daemon.
+- The unpublished v0.1 Rust and Python `airpods-client` release candidates
+  consume protocol version 1 without opening Bluetooth or starting the daemon.
+  Both clients have passed real AirPods Pro 3 validation through the production
+  daemon while A2DP audio remained uninterrupted.
+- The production distribution includes a relocatable, project-owned systemd
+  user-service installer. It derives the daemon interpreter from the installed
+  Python environment and does not depend on a repository checkout.
 - A minimal temporary SDP compatibility profile and bounded AAP-handshake layer
   have passed a controlled live validation.
 - The complete bounded one-shot path has passed one controlled end-to-end
@@ -55,8 +60,10 @@ Not yet implemented:
 
 - Reconnect and recovery handling.
 - Suspend and resume recovery.
-- A supported, stable SDK/API and additional language clients.
-- A user-friendly installer.
+- Publication of the Rust and Python v0.1 SDK release candidates; neither is
+  published yet, and v0.1 is not a 1.0 stability promise.
+- SDK packaging validation of the installed daemon distribution with real
+  hardware.
 
 ## Experimental BlueZ coexistence probe
 
@@ -177,11 +184,12 @@ Adds a separate private development binding for real FFI parity
 testing without changing the setuptools package or production parser.
 See [docs/rust-core-architecture.md](docs/rust-core-architecture.md).
 
-Adds the persistent local `airpods-hubd` service, and Client SDKA adds
-the first experimental Rust client crate over its Unix IPC. Applications do
-not acquire Bluetooth through this client boundary. See
+Adds the persistent local `airpods-hubd` service. Adds the
+v0.1 Rust and Python client SDK release candidates over its Unix IPC, and Iteration 9.10A adds the relocatable user-service installer. Applications do not acquire
+Bluetooth through either client boundary. See
 [docs/hubd-architecture.md](docs/hubd-architecture.md) and
-[docs/client-sdk-architecture.md](docs/client-sdk-architecture.md).
+[docs/client-sdk-architecture.md](docs/client-sdk-architecture.md). Installation
+instructions are in [docs/daemon-installation.md](docs/daemon-installation.md).
 
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program
