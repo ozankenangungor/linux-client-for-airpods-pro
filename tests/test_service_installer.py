@@ -89,6 +89,10 @@ class UnitRenderingTests(unittest.TestCase):
         with self.assertRaisesRegex(ServiceInstallerError, "unsupported double quote"):
             render_systemd_executable_path(Path('/home/a"b/python'))
 
+    def test_single_quote_in_executable_path_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported single quote"):
+            render_systemd_executable_path(Path("/home/a'b/python"))
+
     def test_backslash_in_executable_path_is_rejected(self) -> None:
         with self.assertRaisesRegex(ServiceInstallerError, "unsupported backslash"):
             render_systemd_executable_path(Path("/home/a\\b/python"))
@@ -96,6 +100,21 @@ class UnitRenderingTests(unittest.TestCase):
     def test_dollar_in_executable_path_is_rejected(self) -> None:
         with self.assertRaisesRegex(ServiceInstallerError, "unsupported dollar sign"):
             render_systemd_executable_path(Path("/home/$name/bin/python"))
+
+    def test_systemd_glob_metacharacters_are_rejected(self) -> None:
+        unsupported = {
+            "*": "asterisk",
+            "?": "question mark",
+            "[": "opening square bracket",
+        }
+        for character, description in unsupported.items():
+            with self.subTest(character=character):
+                with self.assertRaisesRegex(
+                    ServiceInstallerError, f"unsupported {description}"
+                ):
+                    render_systemd_executable_path(
+                        Path(f"/home/a{character}b/python")
+                    )
 
     def test_percent_in_executable_path_uses_systemd_specifier_escape(self) -> None:
         self.assertEqual(
@@ -245,6 +264,21 @@ class InstallActionTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), previous)
         self.assertEqual(self.systemctl.operations, [])
 
+    def test_single_quote_executable_preserves_owned_unit_and_skips_systemctl(
+        self,
+    ) -> None:
+        previous = render_unit(Path("/old/environment/bin/python"))
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(previous, encoding="utf-8")
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported single quote"):
+            install_service(
+                self.path,
+                Path("/new/invalid'environment/bin/python"),
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(self.path.read_text(encoding="utf-8"), previous)
+        self.assertEqual(self.systemctl.operations, [])
+
     def test_invalid_executable_dry_run_is_safe_cli_error(self) -> None:
         bad_python = Path(self.temporary.name) / 'invalid"env/bin/python'
         bad_python.parent.mkdir(parents=True)
@@ -287,6 +321,48 @@ class InstallActionTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr.getvalue())
         self.assertEqual(self.systemctl.operations, [])
 
+    def test_single_quote_executable_dry_run_is_safe_cli_error(self) -> None:
+        bad_python = Path(self.temporary.name) / "invalid'env/bin/python"
+        bad_python.parent.mkdir(parents=True)
+        bad_python.touch()
+        stderr = StringIO()
+        output: list[str] = []
+        with (
+            patch.object(service_installer.sys, "executable", os.fspath(bad_python)),
+            redirect_stderr(stderr),
+        ):
+            status = service_installer.main(
+                ["install", "--dry-run"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.path.parents[2])},
+                systemctl=self.systemctl,
+                output=output.append,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("unsupported single quote", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.systemctl.operations, [])
+        self.assertEqual(output, [f"unit_path={self.path}"])
+
+    def test_single_quote_current_executable_verify_is_safe_cli_error(self) -> None:
+        bad_python = Path(self.temporary.name) / "invalid'env/bin/python"
+        bad_python.parent.mkdir(parents=True)
+        bad_python.touch()
+        stderr = StringIO()
+        with (
+            patch.object(service_installer.sys, "executable", os.fspath(bad_python)),
+            redirect_stderr(stderr),
+        ):
+            status = service_installer.main(
+                ["verify"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.path.parents[2])},
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("unsupported single quote", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(self.systemctl.operations, [])
+
 
 class RealSystemdExecutablePathTests(unittest.TestCase):
     def _assert_systemd_accepts(self, relative_executable: str) -> None:
@@ -295,12 +371,17 @@ class RealSystemdExecutablePathTests(unittest.TestCase):
             self.skipTest("systemd-analyze is unavailable")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o700)
+            (runtime / "systemd").mkdir(mode=0o700)
             executable = root / relative_executable
             executable.parent.mkdir(parents=True)
             executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             executable.chmod(0o700)
             unit_path = root / "airpods-hubd.service"
             unit_path.write_text(render_unit(executable), encoding="utf-8")
+            environment = dict(os.environ)
+            environment["XDG_RUNTIME_DIR"] = os.fspath(runtime)
             result = subprocess.run(
                 [analyzer, "verify", "--user", os.fspath(unit_path)],
                 shell=False,
@@ -308,6 +389,7 @@ class RealSystemdExecutablePathTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env=environment,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
 

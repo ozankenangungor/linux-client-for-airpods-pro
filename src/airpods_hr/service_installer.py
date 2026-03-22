@@ -152,8 +152,12 @@ def render_systemd_executable_path(path: Path) -> str:
         )
     unsupported = {
         '"': "double quote",
+        "'": "single quote",
         "\\": "backslash",
         "$": "dollar sign",
+        "*": "asterisk",
+        "?": "question mark",
+        "[": "opening square bracket",
     }
     for character, name in unsupported.items():
         if character in value:
