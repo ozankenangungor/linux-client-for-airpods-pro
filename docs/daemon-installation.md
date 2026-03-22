@@ -28,6 +28,12 @@ environment in which it runs. The generated command is equivalent to:
 It does not depend on the repository, the current working directory, a shell
 wrapper, or a daemon-time `PATH` lookup.
 
+Interpreter paths containing spaces are supported, and literal percent signs
+are escaped for systemd specifier processing. The installer rejects paths
+containing control characters, double quotes, backslashes, or dollar signs
+before writing a unit or calling systemctl because those executable tokens
+cannot be represented reliably for the systemd service parser.
+
 ## Inspect and install
 
 Preview the resolved unit destination, `ExecStart`, and systemctl actions:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -26,8 +27,8 @@ from airpods_hr.service_installer import (
     inspect_installation,
     install_service,
     installed_python,
+    render_systemd_executable_path,
     render_unit,
-    systemd_quote_argument,
     uninstall_service,
     user_unit_path,
 )
@@ -84,21 +85,27 @@ class UnitRenderingTests(unittest.TestCase):
             '"/home/Air Pods/bin/python" -m airpods_hr._hubd.main',
         )
 
-    def test_quote_and_backslash_in_executable_path_are_escaped(self) -> None:
-        self.assertEqual(
-            systemd_quote_argument('/home/a"b\\c/python'),
-            '"/home/a\\"b\\\\c/python"',
-        )
+    def test_quote_in_executable_path_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported double quote"):
+            render_systemd_executable_path(Path('/home/a"b/python'))
 
-    def test_systemd_expansion_characters_are_escaped(self) -> None:
+    def test_backslash_in_executable_path_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported backslash"):
+            render_systemd_executable_path(Path("/home/a\\b/python"))
+
+    def test_dollar_in_executable_path_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported dollar sign"):
+            render_systemd_executable_path(Path("/home/$name/bin/python"))
+
+    def test_percent_in_executable_path_uses_systemd_specifier_escape(self) -> None:
         self.assertEqual(
-            systemd_quote_argument("/home/$name/100%/python"),
-            '"/home/$$name/100%%/python"',
+            render_systemd_executable_path(Path("/home/name/100%/python")),
+            '"/home/name/100%%/python"',
         )
 
     def test_control_character_is_rejected(self) -> None:
         with self.assertRaisesRegex(ServiceInstallerError, "control character"):
-            systemd_quote_argument("/bad\npath")
+            render_systemd_executable_path(Path("/bad\npath"))
 
     def test_relative_executable_is_rejected(self) -> None:
         with self.assertRaisesRegex(ServiceInstallerError, "must be absolute"):
@@ -223,6 +230,96 @@ class InstallActionTests(unittest.TestCase):
         )
         self.assertEqual(sum(line.startswith("would_run=") for line in output), 2)
 
+    def test_invalid_executable_preserves_owned_unit_and_skips_systemctl(
+        self,
+    ) -> None:
+        previous = render_unit(Path("/old/environment/bin/python"))
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(previous, encoding="utf-8")
+        with self.assertRaisesRegex(ServiceInstallerError, "unsupported double quote"):
+            install_service(
+                self.path,
+                Path('/new/invalid"environment/bin/python'),
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(self.path.read_text(encoding="utf-8"), previous)
+        self.assertEqual(self.systemctl.operations, [])
+
+    def test_invalid_executable_dry_run_is_safe_cli_error(self) -> None:
+        bad_python = Path(self.temporary.name) / 'invalid"env/bin/python'
+        bad_python.parent.mkdir(parents=True)
+        bad_python.touch()
+        stderr = StringIO()
+        output: list[str] = []
+        with (
+            patch.object(service_installer.sys, "executable", os.fspath(bad_python)),
+            redirect_stderr(stderr),
+        ):
+            status = service_installer.main(
+                ["install", "--dry-run"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.path.parents[2])},
+                systemctl=self.systemctl,
+                output=output.append,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("unsupported double quote", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.systemctl.operations, [])
+        self.assertEqual(output, [f"unit_path={self.path}"])
+
+    def test_invalid_current_executable_verify_is_safe_cli_error(self) -> None:
+        bad_python = Path(self.temporary.name) / "invalid$env/bin/python"
+        bad_python.parent.mkdir(parents=True)
+        bad_python.touch()
+        stderr = StringIO()
+        with (
+            patch.object(service_installer.sys, "executable", os.fspath(bad_python)),
+            redirect_stderr(stderr),
+        ):
+            status = service_installer.main(
+                ["verify"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.path.parents[2])},
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("unsupported dollar sign", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(self.systemctl.operations, [])
+
+
+class RealSystemdExecutablePathTests(unittest.TestCase):
+    def _assert_systemd_accepts(self, relative_executable: str) -> None:
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer is None:
+            self.skipTest("systemd-analyze is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / relative_executable
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            unit_path = root / "airpods-hubd.service"
+            unit_path.write_text(render_unit(executable), encoding="utf-8")
+            result = subprocess.run(
+                [analyzer, "verify", "--user", os.fspath(unit_path)],
+                shell=False,
+                timeout=15,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_real_systemd_accepts_ordinary_executable_path(self) -> None:
+        self._assert_systemd_accepts("ordinary/bin/python")
+
+    def test_real_systemd_accepts_space_in_executable_path(self) -> None:
+        self._assert_systemd_accepts("installed env/bin/python")
+
+    def test_real_systemd_accepts_percent_in_executable_path(self) -> None:
+        self._assert_systemd_accepts("percent%env/bin/python")
+
 
 class VerifyAndUninstallTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -280,6 +377,60 @@ class VerifyAndUninstallTests(unittest.TestCase):
     def test_missing_unit_uninstall_is_idempotent(self) -> None:
         uninstall_service(self.path, systemctl=self.systemctl)
         self.assertEqual(self.systemctl.operations, ["daemon-reload"])
+
+
+class InvalidUnitEncodingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.config_home = Path(self.temporary.name) / "config"
+        self.path = self.config_home / "systemd/user/airpods-hubd.service"
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b"\xff\xfe\x00")
+        self.python = Path("/clean/venv/bin/python")
+        self.systemctl = FakeSystemctl()
+
+    def test_install_does_not_replace_invalid_utf8_unit(self) -> None:
+        previous = self.path.read_bytes()
+        with self.assertRaisesRegex(ServiceInstallerError, "not valid UTF-8"):
+            install_service(self.path, self.python, systemctl=self.systemctl)
+        self.assertEqual(self.path.read_bytes(), previous)
+        self.assertEqual(self.systemctl.operations, [])
+
+    def test_verify_reports_invalid_utf8_as_safe_cli_error(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            status = service_installer.main(
+                ["verify"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.config_home)},
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("not valid UTF-8", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(self.systemctl.operations, [])
+
+    def test_uninstall_does_not_delete_invalid_utf8_unit(self) -> None:
+        previous = self.path.read_bytes()
+        with self.assertRaisesRegex(ServiceInstallerError, "not valid UTF-8"):
+            uninstall_service(self.path, systemctl=self.systemctl)
+        self.assertEqual(self.path.read_bytes(), previous)
+        self.assertEqual(self.systemctl.operations, [])
+
+    def test_uninstall_dry_run_reports_invalid_utf8_as_safe_cli_error(self) -> None:
+        previous = self.path.read_bytes()
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            status = service_installer.main(
+                ["uninstall", "--dry-run"],
+                environment={"XDG_CONFIG_HOME": os.fspath(self.config_home)},
+                systemctl=self.systemctl,
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("not valid UTF-8", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(self.path.read_bytes(), previous)
+        self.assertEqual(self.systemctl.operations, [])
 
 
 class SystemctlBoundaryTests(unittest.TestCase):

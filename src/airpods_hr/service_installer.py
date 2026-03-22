@@ -140,28 +140,33 @@ def installed_python(executable: str | os.PathLike[str] | None = None) -> Path:
     return path
 
 
-def systemd_quote_argument(value: str) -> str:
-    """Quote one systemd command argument without applying shell semantics."""
+def render_systemd_executable_path(path: Path) -> str:
+    """Render a systemd-valid absolute executable token or fail closed."""
 
-    if not value:
-        raise ServiceInstallerError("systemd command argument must not be empty")
+    if not path.is_absolute():
+        raise ServiceInstallerError("daemon Python executable must be absolute")
+    value = os.fspath(path)
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ServiceInstallerError(
-            "systemd command argument contains a control character"
+            "daemon Python executable contains a control character"
         )
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("$", "$$")
-        .replace("%", "%%")
-    )
+    unsupported = {
+        '"': "double quote",
+        "\\": "backslash",
+        "$": "dollar sign",
+    }
+    for character, name in unsupported.items():
+        if character in value:
+            raise ServiceInstallerError(
+                f"daemon Python executable contains unsupported {name}: {path}"
+            )
+    escaped = value.replace("%", "%%")
     return f'"{escaped}"'
 
 
 def exec_start_for(python: Path) -> str:
-    if not python.is_absolute():
-        raise ServiceInstallerError("daemon Python executable must be absolute")
-    return f"{systemd_quote_argument(os.fspath(python))} -m airpods_hr._hubd.main"
+    executable = render_systemd_executable_path(python)
+    return f"{executable} -m airpods_hr._hubd.main"
 
 
 def render_unit(python: Path) -> str:
@@ -196,6 +201,19 @@ def _path_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
+def _read_unit(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise ServiceInstallerError(
+            f"service unit is not valid UTF-8: {path}"
+        ) from error
+    except OSError as error:
+        raise ServiceInstallerError(
+            f"cannot read service unit {path}: {error}"
+        ) from error
+
+
 def _installed_exec_start(contents: str) -> str | None:
     values = [
         line.removeprefix("ExecStart=")
@@ -211,12 +229,7 @@ def inspect_installation(unit_path: Path, python: Path) -> InstallationState:
     expected = exec_start_for(python)
     if not _path_exists(unit_path):
         return InstallationState(unit_path, False, False, False, expected, None)
-    try:
-        contents = unit_path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise ServiceInstallerError(
-            f"cannot read service unit {unit_path}: {error}"
-        ) from error
+    contents = _read_unit(unit_path)
     installed = _installed_exec_start(contents)
     return InstallationState(
         unit_path,
@@ -271,19 +284,15 @@ def install_service(
     force: bool = False,
     writer: Callable[[Path, str], None] = atomic_write_unit,
 ) -> None:
+    rendered = render_unit(python)
     if _path_exists(unit_path):
-        try:
-            previous = unit_path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise ServiceInstallerError(
-                f"cannot read existing service unit: {error}"
-            ) from error
+        previous = _read_unit(unit_path)
         if not is_project_owned(previous) and not force:
             raise ForeignUnitError(
                 f"refusing to replace unrecognized service unit: {unit_path}; "
                 "use --force to replace it"
             )
-    writer(unit_path, render_unit(python))
+    writer(unit_path, rendered)
     systemctl.run("daemon-reload")
     if enable:
         systemctl.run("enable")
@@ -296,12 +305,7 @@ def uninstall_service(
     disable: bool = False,
 ) -> None:
     if _path_exists(unit_path):
-        try:
-            contents = unit_path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise ServiceInstallerError(
-                f"cannot read existing service unit: {error}"
-            ) from error
+        contents = _read_unit(unit_path)
         if not is_project_owned(contents):
             raise ForeignUnitError(
                 f"refusing to remove unrecognized service unit: {unit_path}"
@@ -412,7 +416,7 @@ def main(
             operations = [*(["disable"] if args.disable else []), "daemon-reload"]
             if args.dry_run:
                 if _path_exists(path) and not is_project_owned(
-                    path.read_text(encoding="utf-8")
+                    _read_unit(path)
                 ):
                     raise ForeignUnitError(
                         f"refusing to remove unrecognized service unit: {path}"
