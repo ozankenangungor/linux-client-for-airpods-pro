@@ -6,6 +6,11 @@ Python standard library and communicates through the local Unix JSONL socket.
 It does not own Bluetooth, start the daemon, call systemd, or reconnect
 automatically.
 
+The standalone client supports Python 3.11 through 3.14. Its implementation is
+standard-library-only, and its package, public-contract, protocol, lifecycle,
+and typed-error tests run on every supported version. The production
+`airpods-hr-linux` package remains a separate Python 3.14 distribution.
+
 ```python
 import asyncio
 
