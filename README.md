@@ -44,7 +44,9 @@ Working:
   daemon while A2DP audio remained uninterrupted.
 - The production distribution includes a relocatable, project-owned systemd
   user-service installer. It derives the daemon interpreter from the installed
-  Python environment and does not depend on a repository checkout.
+  Python environment and does not depend on a repository checkout. The
+  installed distribution and real Rust SDK path have passed their SDK packaging
+  hardware gate while A2DP audio remained uninterrupted.
 - A minimal temporary SDP compatibility profile and bounded AAP-handshake layer
   have passed a controlled live validation.
 - The complete bounded one-shot path has passed one controlled end-to-end
@@ -62,8 +64,6 @@ Not yet implemented:
 - Suspend and resume recovery.
 - Publication of the Rust and Python v0.1 SDK release candidates; neither is
   published yet, and v0.1 is not a 1.0 stability promise.
-- SDK packaging validation of the installed daemon distribution with real
-  hardware.
 
 ## Experimental BlueZ coexistence probe
 

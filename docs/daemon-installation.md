@@ -1,9 +1,36 @@
 # Daemon distribution and user-service installation
 
-Iteration 9.10A packages a relocatable systemd user-service installer with the
+Iteration 9.10 packages a relocatable systemd user-service installer with the
 unpublished `airpods-hr-linux` 0.1.0 release candidate. This is an experimental
-RC, not a 1.0 stability promise. Real installed-service hardware validation is
-reserved for SDK packaging.
+RC, not a 1.0 stability promise.
+
+## SDK packaging and Iteration 9.10 FINAL PASS
+
+SDK packaging validated a production wheel built from repository commit
+`77913781c43ccaf86f26514d4c424bc78bc599ad`. The wheel was installed into the
+isolated environment `/home/kenan/.local/share/airpods-hr-linux-9.10b`. Its
+generated public user service used the installed interpreter directly:
+
+```text
+ExecStart="/home/kenan/.local/share/airpods-hr-linux-9.10b/bin/python" -m airpods_hr._hubd.main
+```
+
+The unit had no repository `.venv` dependency. Installer verification reported
+`exists=true`, `project_owned=true`, and `exec_start_matches=true`; the default
+installation left the service disabled.
+
+The real systemd user manager started that installed interpreter. The production
+stack reached BlueZ, confirmed a powered adapter and
+`Device1.Connected=true`, completed the descriptor handshake, and reported the
+daemon ready. A real Rust SDK client received heart-rate values 169, 158, 104,
+84, 84, 85, 85, 85, 85, and 85, then exited with status 0. After shutdown the
+service was inactive, the Unix socket was removed, the process lock was
+released, and `Device1.Connected` remained true. The operator confirmed that
+A2DP music remained uninterrupted for the entire test.
+
+This proves that the production daemon works from an installed relocatable
+distribution rather than a repository checkout. SDK packaging and Iteration 9.10 are
+FINAL PASS. The packages remain unpublished.
 
 ## Environment requirement
 
@@ -72,8 +99,7 @@ Starting the service remains a separate user action after installation:
 systemctl --user start airpods-hubd.service
 ```
 
-Do not perform that start as part of Iteration 9.10A validation. SDK packaging will
-validate the installed-service path with real AirPods hardware.
+Automated release validation must not perform that start. The completed Iteration 9.10B hardware result above is the manual installed-service gate.
 
 ## Verify installation state
 
