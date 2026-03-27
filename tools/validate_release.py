@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build and validate a local release candidate without publishing or hardware.
 
 This is the canonical release-validation entrypoint.  Every child
@@ -8,37 +7,64 @@ daemon, invokes Bluetooth tooling, or accesses publication credentials.
 
 from __future__ import annotations
 
-
 import email.parser
 import hashlib
-
 import os
-
-
 import subprocess
 import sys
 import tarfile
-
-
+import textwrap
 import tomllib
-
+import venv
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+
 PYTHON_CLIENT_ROOT = ROOT / "packages/airpods-client-python"
+
+
+
 RUST_CLIENT_ROOT = ROOT / "crates/airpods-client"
+
+
+
 RELEASE_VERSION = "0.1.0"
+
+
+
 MANIFEST_SCHEMA_VERSION = 1
+
+
+
 BUILD_VERSION = "1.3.0"
+
+
+
 SETUPTOOLS_VERSION = "84.0.0"
+
+
+
 WHEEL_VERSION = "0.48.0"
+
+
+
 COMMAND_TIMEOUT = 600
+
+
+
 TEST_TIMEOUT = 1_200
 
+
+
 PYTHON_TESTS = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
+
+
+
 CROSS_LANGUAGE_TESTS = [
     sys.executable,
     "-m",
@@ -48,6 +74,9 @@ CROSS_LANGUAGE_TESTS = [
     "tests.test_python_client_hubd_integration",
     "tests.test_mixed_client_hubd_integration",
 ]
+
+
+
 RUST_CHECKS = (
     ["cargo", "fmt", "--check"],
     ["cargo", "check", "--workspace", "--locked"],
@@ -66,12 +95,15 @@ RUST_CHECKS = (
 )
 
 
+
 class ValidationError(RuntimeError):
     """A release invariant or bounded command failed."""
 
 
+
 def fail(message: str) -> NoReturn:
     raise ValidationError(message)
+
 
 
 def run(
@@ -104,8 +136,20 @@ def run(
     return result
 
 
+
 def output(argv: Sequence[str], *, cwd: Path = ROOT) -> str:
     return run(argv, cwd=cwd, capture=True).stdout.strip()
+
+
+
+def clean_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    environment["PIP_NO_INPUT"] = "1"
+    return environment
+
 
 
 def project_versions() -> dict[str, str]:
@@ -123,6 +167,7 @@ def project_versions() -> dict[str, str]:
     }
 
 
+
 def validate_version_consistency() -> None:
     versions = project_versions()
     if set(versions.values()) != {RELEASE_VERSION}:
@@ -138,6 +183,7 @@ def validate_version_consistency() -> None:
         if expected not in path.read_text(encoding="utf-8"):
             fail(f"current version reference missing from {path.relative_to(ROOT)}")
     print(f"version consistency: {RELEASE_VERSION}")
+
 
 
 def validate_sensitive_paths() -> None:
@@ -159,10 +205,17 @@ def validate_sensitive_paths() -> None:
     print("sensitive-data filename scan: pass")
 
 
+
 def validate_static_policy() -> None:
     validate_version_consistency()
     validate_sensitive_paths()
     run(["git", "diff", "--check"])
+
+
+
+def venv_python(directory: Path) -> Path:
+    return directory / "bin/python"
+
 
 
 def wheel_metadata(path: Path) -> tuple[email.message.Message, dict[str, str]]:
@@ -191,6 +244,7 @@ def wheel_metadata(path: Path) -> tuple[email.message.Message, dict[str, str]]:
     return metadata, entries
 
 
+
 def _unsafe_member(name: str) -> bool:
     path = PurePosixPath(name)
     lowered = [part.lower() for part in path.parts]
@@ -199,6 +253,7 @@ def _unsafe_member(name: str) -> bool:
         part.endswith((".log", ".pcap", ".pcapng", ".btsnoop", ".pem", ".key"))
         for part in lowered
     )
+
 
 
 def audit_production_wheel(path: Path) -> None:
@@ -224,6 +279,7 @@ def audit_production_wheel(path: Path) -> None:
         fail(f"production console entrypoints mismatch: {entries}")
 
 
+
 def audit_python_client_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -241,6 +297,7 @@ def audit_python_client_wheel(path: Path) -> None:
         fail("Python client wheel identity/version mismatch")
     if metadata.get_all("Requires-Dist", []) or entries:
         fail("Python client wheel must have zero dependencies and no entrypoints")
+
 
 
 def audit_sdist(path: Path, *, package: str) -> None:
@@ -269,6 +326,7 @@ def audit_sdist(path: Path, *, package: str) -> None:
         fail("Python client sdist contains daemon/Rust material")
 
 
+
 def audit_rust_crate(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
         names = archive.getnames()
@@ -285,12 +343,161 @@ def audit_rust_crate(path: Path) -> None:
         fail("Rust client crate lacks src/lib.rs")
 
 
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+
+def clean_install_production(wheel: Path, work: Path) -> None:
+    environment = clean_environment()
+    venv.EnvBuilder(with_pip=True).create(work)
+    python = venv_python(work)
+    run(
+        [python, "-m", "pip", "install", wheel],
+        cwd=work,
+        env=environment,
+        timeout=TEST_TIMEOUT,
+    )
+    run([python, "-m", "pip", "check"], cwd=work, env=environment)
+    code = textwrap.dedent(
+        """
+        import importlib.metadata
+        import airpods_hr
+        assert importlib.metadata.version("airpods-hr-linux") == "0.1.0"
+        assert "hub" not in " ".join(airpods_hr.__all__).lower()
+        """
+    )
+    run([python, "-I", "-c", code], cwd=work, env=environment)
+    for command in ("airpods-hr", "airpods-hubd", "airpods-hubd-service"):
+        executable = work / "bin" / command
+        if not executable.is_file():
+            fail(f"clean production install lacks {command}")
+        run([executable, "--help"], cwd=work, env=environment, timeout=30, capture=True)
+    home = work / "isolated-home"
+    config = work / "isolated-config"
+    runtime = work / "isolated-runtime"
+    home.mkdir()
+    config.mkdir()
+    runtime.mkdir(mode=0o700)
+    isolated = dict(environment)
+    isolated.update(
+        HOME=os.fspath(home),
+        XDG_CONFIG_HOME=os.fspath(config),
+        XDG_RUNTIME_DIR=os.fspath(runtime),
+    )
+    dry_run = run(
+        [work / "bin/airpods-hubd-service", "install", "--dry-run"],
+        cwd=work,
+        env=isolated,
+        capture=True,
+    ).stdout
+    expected = f'exec_start="{python}" -m airpods_hr._hubd.main'
+    if expected not in dry_run or os.fspath(ROOT / ".venv") in dry_run:
+        fail("service dry run did not use the clean installed interpreter")
+    if any(config.rglob("*.service")):
+        fail("service dry run mutated isolated user configuration")
+    run([python, "-m", "compileall", "-q", work / "lib"], cwd=work, env=environment)
+
+
+
+def clean_install_python_client(wheel: Path, work: Path) -> None:
+    environment = clean_environment()
+    venv.EnvBuilder(with_pip=True).create(work)
+    python = venv_python(work)
+    run(
+        [python, "-m", "pip", "install", "--no-index", "--no-deps", wheel],
+        cwd=work,
+        env=environment,
+    )
+    run([python, "-m", "pip", "check"], cwd=work, env=environment)
+    code = textwrap.dedent(
+        """
+        import asyncio
+        import importlib.metadata
+        import os
+        import tempfile
+        from pathlib import Path
+        from airpods_client import AirPodsClient, ConnectionFailed, XdgRuntimeDirMissing
+
+        assert importlib.metadata.version("airpods-client") == "0.1.0"
+        async def check():
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            try:
+                await AirPodsClient.connect()
+            except XdgRuntimeDirMissing:
+                pass
+            else:
+                raise AssertionError("missing XDG_RUNTIME_DIR was not typed")
+            with tempfile.TemporaryDirectory() as directory:
+                try:
+                    await AirPodsClient.connect_to(Path(directory) / "missing.sock")
+                except ConnectionFailed:
+                    pass
+                else:
+                    raise AssertionError("missing daemon was not typed")
+        asyncio.run(check())
+        """
+    )
+    run([python, "-I", "-c", code], cwd=work, env=environment)
+    run([python, "-m", "compileall", "-q", work / "lib"], cwd=work, env=environment)
+
+
+
+def external_rust_consumer(crate: Path, work: Path) -> None:
+    package_root = work / "package"
+    package_root.mkdir(parents=True)
+    with tarfile.open(crate, "r:gz") as archive:
+        archive.extractall(package_root, filter="data")
+    extracted = package_root / f"airpods-client-{RELEASE_VERSION}"
+    consumer = work / "consumer"
+    (consumer / "src").mkdir(parents=True)
+    relative = os.path.relpath(extracted, consumer).replace(os.sep, "/")
+    (consumer / "Cargo.toml").write_text(
+        textwrap.dedent(
+            f"""
+            [package]
+            name = "release-consumer"
+            version = "0.0.0"
+            edition = "2024"
+
+            [dependencies]
+            airpods-client = {{ path = "{relative}" }}
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    (consumer / "src/main.rs").write_text(
+        textwrap.dedent(
+            """
+            use airpods_client::{AirPodsClient, Error, MAX_FRAME_SIZE, PROTOCOL_VERSION};
+            use std::path::Path;
+
+            async fn public_contract() -> Result<(), Error> {
+                let client = AirPodsClient::connect_to(Path::new("/tmp/not-opened")).await?;
+                let _ = client.hello().await?;
+                let _ = client.ping().await?;
+                let _ = client.status().await?;
+                let mut subscription = client.subscribe_heart_rate().await?;
+                let _ = subscription.next().await?;
+                subscription.unsubscribe().await?;
+                Ok(())
+            }
+
+            fn main() {
+                let _ = (PROTOCOL_VERSION, MAX_FRAME_SIZE, public_contract);
+            }
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    run(["cargo", "generate-lockfile"], cwd=consumer, timeout=TEST_TIMEOUT)
+    run(["cargo", "check", "--locked"], cwd=consumer, timeout=TEST_TIMEOUT)
+
 
 
 def artifact_record(path: Path, *, kind: str, package: str) -> dict[str, Any]:
@@ -302,6 +509,7 @@ def artifact_record(path: Path, *, kind: str, package: str) -> dict[str, Any]:
         "sha256": sha256(path),
         "size": path.stat().st_size,
     }
+
 
 
 def validate_manifest(manifest: dict[str, Any]) -> None:
@@ -354,6 +562,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("manifest repeated-build results do not match artifact filenames")
 
 
+
 def write_summary(path: Path, manifest: dict[str, Any]) -> None:
     repeat = manifest["repeat_build_check"]
     lines = [
@@ -392,5 +601,4 @@ def write_summary(path: Path, manifest: dict[str, Any]) -> None:
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
