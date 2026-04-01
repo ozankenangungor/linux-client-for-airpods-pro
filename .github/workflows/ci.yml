@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-policy:
+    name: Static release policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python tools/validate_release.py --scope static
+
+  python-production:
+    name: Python production and installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: python -m pip install -e . maturin==1.15.0
+      - name: Build private FFI parity binding
+        working-directory: crates/airpods-aap-py
+        run: maturin develop --release --locked
+      - run: python tools/validate_release.py --scope python
+
+  python-client:
+    name: Python client ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install packages/airpods-client-python
+      - name: Clean installed import
+        working-directory: ${{ runner.temp }}
+        run: python -I -c 'import importlib.metadata, airpods_client; assert importlib.metadata.version("airpods-client") == "0.1.0"'
+      - name: Standalone protocol, lifecycle, and v0.1 contract
+        env:
+          PYTHONPATH: src:packages/airpods-client-python/src
+        run: python -m unittest -v tests.test_python_client tests.test_sdk_v01_contract
+
+  rust:
+    name: Rust workspace and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python3 tools/validate_release.py --scope rust
+      - run: cargo package --locked --package airpods-client --target-dir "${{ runner.temp }}/cargo-package"
+
+  cross-language:
+    name: Rust and Python clients with fake hubd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python -m pip install -e .
+      - run: python tools/validate_release.py --scope cross-language
+
+  release-artifacts:
+    name: Canonical package and clean consumers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-release-candidate
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
