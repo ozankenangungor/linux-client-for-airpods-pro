@@ -91,8 +91,3 @@ jobs:
           cache: pip
       - uses: dtolnay/rust-toolchain@stable
       - run: python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: local-release-candidate
-          path: ${{ runner.temp }}/release
-          if-no-files-found: error
