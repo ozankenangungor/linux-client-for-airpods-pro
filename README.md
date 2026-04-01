@@ -190,6 +190,8 @@ Bluetooth through either client boundary. See
 [docs/hubd-architecture.md](docs/hubd-architecture.md) and
 [docs/client-sdk-architecture.md](docs/client-sdk-architecture.md). Installation
 instructions are in [docs/daemon-installation.md](docs/daemon-installation.md).
+The local release build, manifest, CI, and manual release gates are documented
+in [docs/release-process.md](docs/release-process.md).
 
 The currently tested setup may require elevated privileges to read existing
 BlueZ pairing material and acquire direct controller ownership. The program

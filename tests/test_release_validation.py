@@ -111,3 +111,5 @@ class ManifestSchemaTests(unittest.TestCase):
             validate_release.validate_manifest(broken)
 
 
+if __name__ == "__main__":
+    unittest.main()

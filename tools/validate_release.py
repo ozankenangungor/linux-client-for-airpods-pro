@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Build and validate a local release candidate without publishing or hardware.
 
 This is the canonical release-validation entrypoint.  Every child
@@ -7,12 +8,17 @@ daemon, invokes Bluetooth tooling, or accesses publication credentials.
 
 from __future__ import annotations
 
+import argparse
 import email.parser
 import hashlib
+import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import textwrap
 import tomllib
 import venv
@@ -22,49 +28,17 @@ from typing import Any, NoReturn, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-
 PYTHON_CLIENT_ROOT = ROOT / "packages/airpods-client-python"
-
-
-
 RUST_CLIENT_ROOT = ROOT / "crates/airpods-client"
-
-
-
 RELEASE_VERSION = "0.1.0"
-
-
-
 MANIFEST_SCHEMA_VERSION = 1
-
-
-
 BUILD_VERSION = "1.3.0"
-
-
-
 SETUPTOOLS_VERSION = "84.0.0"
-
-
-
 WHEEL_VERSION = "0.48.0"
-
-
-
 COMMAND_TIMEOUT = 600
-
-
-
 TEST_TIMEOUT = 1_200
 
-
-
 PYTHON_TESTS = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
-
-
-
 CROSS_LANGUAGE_TESTS = [
     sys.executable,
     "-m",
@@ -74,9 +48,6 @@ CROSS_LANGUAGE_TESTS = [
     "tests.test_python_client_hubd_integration",
     "tests.test_mixed_client_hubd_integration",
 ]
-
-
-
 RUST_CHECKS = (
     ["cargo", "fmt", "--check"],
     ["cargo", "check", "--workspace", "--locked"],
@@ -95,15 +66,12 @@ RUST_CHECKS = (
 )
 
 
-
 class ValidationError(RuntimeError):
     """A release invariant or bounded command failed."""
 
 
-
 def fail(message: str) -> NoReturn:
     raise ValidationError(message)
-
 
 
 def run(
@@ -136,10 +104,45 @@ def run(
     return result
 
 
-
 def output(argv: Sequence[str], *, cwd: Path = ROOT) -> str:
     return run(argv, cwd=cwd, capture=True).stdout.strip()
 
+
+def git_commit() -> str:
+    value = output(["git", "rev-parse", "HEAD"])
+    if len(value) != 40 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        fail(f"unexpected git commit: {value!r}")
+    return value
+
+
+def git_is_clean() -> bool:
+    return output(["git", "status", "--porcelain=v1"]) == ""
+
+
+def require_clean_tree() -> None:
+    if not git_is_clean():
+        fail("canonical release validation requires a clean git tree")
+
+
+def source_date_epoch() -> int:
+    value = output(["git", "show", "-s", "--format=%ct", "HEAD"])
+    try:
+        epoch = int(value)
+    except ValueError:
+        fail(f"invalid commit timestamp: {value!r}")
+    if epoch <= 0:
+        fail("commit timestamp must be positive")
+    return epoch
+
+
+def python_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    paths = [os.fspath(ROOT / "src"), os.fspath(PYTHON_CLIENT_ROOT / "src")]
+    environment["PYTHONPATH"] = os.pathsep.join(paths)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
 
 
 def clean_environment() -> dict[str, str]:
@@ -149,7 +152,6 @@ def clean_environment() -> dict[str, str]:
     environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     environment["PIP_NO_INPUT"] = "1"
     return environment
-
 
 
 def project_versions() -> dict[str, str]:
@@ -167,7 +169,6 @@ def project_versions() -> dict[str, str]:
     }
 
 
-
 def validate_version_consistency() -> None:
     versions = project_versions()
     if set(versions.values()) != {RELEASE_VERSION}:
@@ -183,7 +184,6 @@ def validate_version_consistency() -> None:
         if expected not in path.read_text(encoding="utf-8"):
             fail(f"current version reference missing from {path.relative_to(ROOT)}")
     print(f"version consistency: {RELEASE_VERSION}")
-
 
 
 def validate_sensitive_paths() -> None:
@@ -205,17 +205,137 @@ def validate_sensitive_paths() -> None:
     print("sensitive-data filename scan: pass")
 
 
-
 def validate_static_policy() -> None:
     validate_version_consistency()
     validate_sensitive_paths()
     run(["git", "diff", "--check"])
 
 
+def validate_systemd_parser() -> bool:
+    analyzer = shutil.which("systemd-analyze")
+    if analyzer is None:
+        print("systemd parser: SKIP (systemd-analyze unavailable)", flush=True)
+        return False
+    sys.path.insert(0, os.fspath(ROOT / "src"))
+    from airpods_hr.service_installer import render_unit
+
+    with tempfile.TemporaryDirectory(prefix="airpods-systemd-") as directory:
+        root = Path(directory)
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        (runtime / "systemd").mkdir(mode=0o700)
+        interpreter = root / "installed environment/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        interpreter.chmod(0o700)
+        unit = root / "airpods-hubd.service"
+        unit.write_text(render_unit(interpreter), encoding="utf-8")
+        environment = clean_environment()
+        environment["XDG_RUNTIME_DIR"] = os.fspath(runtime)
+        run([analyzer, "verify", "--user", unit], cwd=root, env=environment, timeout=30)
+    print("systemd parser: pass")
+    return True
+
+
+def run_python_checks() -> None:
+    environment = python_environment()
+    run(PYTHON_TESTS, env=environment, timeout=TEST_TIMEOUT)
+    run(
+        [
+            sys.executable,
+            "-m",
+            "compileall",
+            "-q",
+            "src",
+            "packages/airpods-client-python/src",
+        ],
+        env=environment,
+    )
+    validate_systemd_parser()
+
+
+def run_cross_language_checks() -> None:
+    run(CROSS_LANGUAGE_TESTS, env=python_environment(), timeout=TEST_TIMEOUT)
+
+
+def run_rust_checks() -> None:
+    for command in RUST_CHECKS:
+        run(command, timeout=TEST_TIMEOUT)
+
 
 def venv_python(directory: Path) -> Path:
     return directory / "bin/python"
 
+
+def prepare_build_environment(directory: Path) -> Path:
+    venv.EnvBuilder(with_pip=True, clear=True).create(directory)
+    python = venv_python(directory)
+    run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            f"build=={BUILD_VERSION}",
+            f"setuptools=={SETUPTOOLS_VERSION}",
+            f"wheel=={WHEEL_VERSION}",
+        ],
+        cwd=directory.parent,
+        env=clean_environment(),
+    )
+    return python
+
+
+def build_python_package(
+    python: Path, source: Path, destination: Path, *, epoch: int
+) -> list[Path]:
+    destination.mkdir(parents=True)
+    environment = clean_environment()
+    environment["SOURCE_DATE_EPOCH"] = str(epoch)
+    run(
+        [
+            python,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--wheel",
+            "--sdist",
+            "--outdir",
+            destination,
+            source,
+        ],
+        cwd=destination.parent,
+        env=environment,
+        timeout=TEST_TIMEOUT,
+    )
+    artifacts = sorted(path for path in destination.iterdir() if path.is_file())
+    if len(artifacts) != 2 or not any(path.suffix == ".whl" for path in artifacts):
+        fail(f"expected one wheel and one sdist from {source}, got {artifacts}")
+    return artifacts
+
+
+def build_rust_package(destination: Path, source_root: Path, *, epoch: int) -> Path:
+    target = destination / "cargo-target"
+    environment = clean_environment()
+    environment["SOURCE_DATE_EPOCH"] = str(epoch)
+    run(
+        [
+            "cargo",
+            "package",
+            "--locked",
+            "--package",
+            "airpods-client",
+            "--target-dir",
+            target,
+        ],
+        cwd=source_root,
+        env=environment,
+        timeout=TEST_TIMEOUT,
+    )
+    crate = target / "package" / f"airpods-client-{RELEASE_VERSION}.crate"
+    if not crate.is_file():
+        fail(f"cargo package did not produce {crate}")
+    return crate
 
 
 def wheel_metadata(path: Path) -> tuple[email.message.Message, dict[str, str]]:
@@ -244,7 +364,6 @@ def wheel_metadata(path: Path) -> tuple[email.message.Message, dict[str, str]]:
     return metadata, entries
 
 
-
 def _unsafe_member(name: str) -> bool:
     path = PurePosixPath(name)
     lowered = [part.lower() for part in path.parts]
@@ -253,7 +372,6 @@ def _unsafe_member(name: str) -> bool:
         part.endswith((".log", ".pcap", ".pcapng", ".btsnoop", ".pem", ".key"))
         for part in lowered
     )
-
 
 
 def audit_production_wheel(path: Path) -> None:
@@ -279,7 +397,6 @@ def audit_production_wheel(path: Path) -> None:
         fail(f"production console entrypoints mismatch: {entries}")
 
 
-
 def audit_python_client_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -297,7 +414,6 @@ def audit_python_client_wheel(path: Path) -> None:
         fail("Python client wheel identity/version mismatch")
     if metadata.get_all("Requires-Dist", []) or entries:
         fail("Python client wheel must have zero dependencies and no entrypoints")
-
 
 
 def audit_sdist(path: Path, *, package: str) -> None:
@@ -326,7 +442,6 @@ def audit_sdist(path: Path, *, package: str) -> None:
         fail("Python client sdist contains daemon/Rust material")
 
 
-
 def audit_rust_crate(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
         names = archive.getnames()
@@ -343,14 +458,12 @@ def audit_rust_crate(path: Path) -> None:
         fail("Rust client crate lacks src/lib.rs")
 
 
-
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
 
 
 def clean_install_production(wheel: Path, work: Path) -> None:
@@ -404,7 +517,6 @@ def clean_install_production(wheel: Path, work: Path) -> None:
     run([python, "-m", "compileall", "-q", work / "lib"], cwd=work, env=environment)
 
 
-
 def clean_install_python_client(wheel: Path, work: Path) -> None:
     environment = clean_environment()
     venv.EnvBuilder(with_pip=True).create(work)
@@ -445,7 +557,6 @@ def clean_install_python_client(wheel: Path, work: Path) -> None:
     )
     run([python, "-I", "-c", code], cwd=work, env=environment)
     run([python, "-m", "compileall", "-q", work / "lib"], cwd=work, env=environment)
-
 
 
 def external_rust_consumer(crate: Path, work: Path) -> None:
@@ -499,7 +610,6 @@ def external_rust_consumer(crate: Path, work: Path) -> None:
     run(["cargo", "check", "--locked"], cwd=consumer, timeout=TEST_TIMEOUT)
 
 
-
 def artifact_record(path: Path, *, kind: str, package: str) -> dict[str, Any]:
     return {
         "kind": kind,
@@ -510,6 +620,17 @@ def artifact_record(path: Path, *, kind: str, package: str) -> dict[str, Any]:
         "size": path.stat().st_size,
     }
 
+
+def export_committed_source(destination: Path) -> Path:
+    """Materialize HEAD so ignored build state cannot affect release archives."""
+
+    destination.mkdir(parents=True)
+    archive_path = destination.parent / f"{destination.name}.tar"
+    run(["git", "archive", "--format=tar", "--output", archive_path, "HEAD"])
+    with tarfile.open(archive_path, "r:") as archive:
+        archive.extractall(destination, filter="data")
+    archive_path.unlink()
+    return destination
 
 
 def validate_manifest(manifest: dict[str, Any]) -> None:
@@ -562,7 +683,6 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("manifest repeated-build results do not match artifact filenames")
 
 
-
 def write_summary(path: Path, manifest: dict[str, Any]) -> None:
     repeat = manifest["repeat_build_check"]
     lines = [
@@ -602,3 +722,190 @@ def write_summary(path: Path, manifest: dict[str, Any]) -> None:
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def build_and_validate_artifacts(output_dir: Path) -> dict[str, Any]:
+    if output_dir.exists() and any(output_dir.iterdir()):
+        fail(f"output directory must be absent or empty: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    work = output_dir / ".work"
+    first = work / "first"
+    second = work / "second"
+    first_source = export_committed_source(work / "source-first")
+    second_source = export_committed_source(work / "source-second")
+    build_python = prepare_build_environment(work / "build-venv")
+    epoch = source_date_epoch()
+
+    first_production = build_python_package(
+        build_python, first_source, first / "production", epoch=epoch
+    )
+    first_client = build_python_package(
+        build_python,
+        first_source / "packages/airpods-client-python",
+        first / "python-client",
+        epoch=epoch,
+    )
+    first_crate = build_rust_package(first / "rust-client", first_source, epoch=epoch)
+    second_production = build_python_package(
+        build_python, second_source, second / "production", epoch=epoch
+    )
+    second_client = build_python_package(
+        build_python,
+        second_source / "packages/airpods-client-python",
+        second / "python-client",
+        epoch=epoch,
+    )
+    second_crate = build_rust_package(
+        second / "rust-client", second_source, epoch=epoch
+    )
+
+    pairs = (
+        list(zip(first_production, second_production, strict=True))
+        + list(zip(first_client, second_client, strict=True))
+        + [(first_crate, second_crate)]
+    )
+    repeat_results = [
+        {
+            "filename": left.name,
+            "byte_for_byte_equal": left.name == right.name
+            and sha256(left) == sha256(right),
+        }
+        for left, right in pairs
+    ]
+    repeat_equal = all(result["byte_for_byte_equal"] for result in repeat_results)
+    artifacts = first_production + first_client + [first_crate]
+    copied: list[Path] = []
+    for artifact in artifacts:
+        destination = output_dir / artifact.name
+        shutil.copy2(artifact, destination)
+        copied.append(destination)
+
+    production_wheel = next(
+        path
+        for path in copied
+        if path.suffix == ".whl" and path.name.startswith("airpods_hr_linux-")
+    )
+    production_sdist = next(
+        path
+        for path in copied
+        if path.name.startswith("airpods_hr_linux-") and path.name.endswith(".tar.gz")
+    )
+    client_wheel = next(
+        path
+        for path in copied
+        if path.suffix == ".whl" and path.name.startswith("airpods_client-")
+    )
+    client_sdist = next(
+        path
+        for path in copied
+        if path.name.startswith("airpods_client-") and path.name.endswith(".tar.gz")
+    )
+    rust_crate = next(path for path in copied if path.suffix == ".crate")
+    audit_production_wheel(production_wheel)
+    audit_sdist(production_sdist, package="airpods-hr-linux")
+    audit_python_client_wheel(client_wheel)
+    audit_sdist(client_sdist, package="airpods-client")
+    audit_rust_crate(rust_crate)
+    clean_install_production(production_wheel, work / "production-consumer")
+    clean_install_python_client(client_wheel, work / "python-client-consumer")
+    external_rust_consumer(rust_crate, work / "rust-consumer")
+
+    records = [
+        artifact_record(
+            production_wheel, kind="python-wheel", package="airpods-hr-linux"
+        ),
+        artifact_record(
+            production_sdist, kind="python-sdist", package="airpods-hr-linux"
+        ),
+        artifact_record(client_wheel, kind="python-wheel", package="airpods-client"),
+        artifact_record(client_sdist, kind="python-sdist", package="airpods-client"),
+        artifact_record(rust_crate, kind="rust-crate", package="airpods-client"),
+    ]
+    records.sort(key=lambda item: (item["package"], item["kind"], item["filename"]))
+    manifest: dict[str, Any] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "release_version": RELEASE_VERSION,
+        "git": {"commit": git_commit(), "clean": True},
+        "source_date_epoch": epoch,
+        "toolchain": {
+            "python": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "python_build_frontend": f"build {BUILD_VERSION}",
+            "setuptools": SETUPTOOLS_VERSION,
+            "wheel": WHEEL_VERSION,
+            "rustc": output(["rustc", "--version"]),
+            "cargo": output(["cargo", "--version"]),
+            "platform": platform.platform(),
+        },
+        "artifacts": records,
+        "repeat_build_check": {
+            "source_date_epoch": epoch,
+            "byte_for_byte_equal": repeat_equal,
+            "artifact_count": len(pairs),
+            "matched_artifact_count": sum(
+                result["byte_for_byte_equal"] for result in repeat_results
+            ),
+            "artifacts": repeat_results,
+            "scope": "same source, host, toolchain, and SOURCE_DATE_EPOCH",
+            "reproducible_build_guarantee": False,
+        },
+        "validation": {
+            "bluetooth_hardware_used": False,
+            "production_daemon_started": False,
+            "published": False,
+        },
+    }
+    validate_manifest(manifest)
+    (output_dir / "release-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    write_summary(output_dir / "release-summary.txt", manifest)
+    shutil.rmtree(work)
+    print(f"release manifest: {output_dir / 'release-manifest.json'}")
+    print(f"release summary: {output_dir / 'release-summary.txt'}")
+    return manifest
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--scope",
+        choices=("all", "static", "python", "rust", "cross-language", "artifacts"),
+        default="all",
+        help="bounded CI subset; 'all' is the canonical local release gate",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="new or empty directory for generated artifacts (required by all/artifacts)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        require_clean_tree()
+        if args.scope in {"all", "static"}:
+            validate_static_policy()
+        if args.scope in {"all", "python"}:
+            run_python_checks()
+        if args.scope in {"all", "rust"}:
+            run_rust_checks()
+        if args.scope in {"all", "cross-language"}:
+            run_cross_language_checks()
+        if args.scope in {"all", "artifacts"}:
+            if args.output_dir is None:
+                fail("--output-dir is required for all/artifacts validation")
+            output_dir = args.output_dir.expanduser().resolve()
+            if output_dir == ROOT or ROOT in output_dir.parents:
+                fail("release output must be outside the repository")
+            build_and_validate_artifacts(output_dir)
+    except (OSError, ValidationError, subprocess.SubprocessError) as error:
+        print(f"release validation failed: {error}", file=sys.stderr)
+        return 1
+    print(f"release validation PASS ({args.scope})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
