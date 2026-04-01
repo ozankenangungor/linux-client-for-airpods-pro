@@ -240,17 +240,20 @@ def validate_systemd_parser() -> bool:
 def run_python_checks() -> None:
     environment = python_environment()
     run(PYTHON_TESTS, env=environment, timeout=TEST_TIMEOUT)
-    run(
-        [
-            sys.executable,
-            "-m",
-            "compileall",
-            "-q",
-            "src",
-            "packages/airpods-client-python/src",
-        ],
-        env=environment,
-    )
+    with tempfile.TemporaryDirectory(prefix="airpods-compileall-") as directory:
+        compile_environment = dict(environment)
+        compile_environment["PYTHONPYCACHEPREFIX"] = directory
+        run(
+            [
+                sys.executable,
+                "-m",
+                "compileall",
+                "-q",
+                "src",
+                "packages/airpods-client-python/src",
+            ],
+            env=compile_environment,
+        )
     validate_systemd_parser()
 
 

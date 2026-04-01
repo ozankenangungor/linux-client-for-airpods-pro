@@ -26,6 +26,7 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertNotIn("shell=" + "True", source)
         self.assertNotIn("systemctl --user start", source)
         self.assertNotIn("bluetoothctl", source)
+        self.assertIn('compile_environment["PYTHONPYCACHEPREFIX"]', source)
 
 
 class ManifestSchemaTests(unittest.TestCase):
