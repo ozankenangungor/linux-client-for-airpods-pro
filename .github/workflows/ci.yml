@@ -28,10 +28,22 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
+      - uses: dtolnay/rust-toolchain@stable
       - run: python -m pip install -e . maturin==1.15.0
-      - name: Build private FFI parity binding
+      - name: Build and install private FFI parity wheel
         working-directory: crates/airpods-aap-py
-        run: maturin develop --release --locked
+        run: |
+          maturin build --release --locked \
+            --interpreter "${{ env.pythonLocation }}/bin/python" \
+            --out "${{ runner.temp }}/ffi-wheel"
+          python -m pip install --no-deps "${{ runner.temp }}/ffi-wheel/"*.whl
+      - name: Verify native FFI binding
+        run: >-
+          python -c 'import inspect, pathlib, sys; import _airpods_aap_core as ffi;
+          assert sys.version_info[:2] == (3, 14);
+          assert inspect.isbuiltin(ffi.parse_heart_rate_packet);
+          assert pathlib.Path(ffi.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve());
+          print(f"python={sys.executable} ffi={ffi.__file__}")'
       - run: python tools/validate_release.py --scope python
 
   python-client:

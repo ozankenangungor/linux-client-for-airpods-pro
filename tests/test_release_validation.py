@@ -28,6 +28,29 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertNotIn("bluetoothctl", source)
         self.assertIn('compile_environment["PYTHONPYCACHEPREFIX"]', source)
 
+    def test_python_production_ci_builds_and_installs_private_ffi_wheel(self) -> None:
+        workflow = (validate_release.ROOT / ".github/workflows/ci.yml").read_text()
+        production = workflow.split("  python-production:\n", 1)[1].split(
+            "\n  python-client:", 1
+        )[0]
+
+        rust_setup = production.index("uses: dtolnay/rust-toolchain@stable")
+        ffi_build = production.index("maturin build --release --locked")
+        ffi_install = production.index(
+            'python -m pip install --no-deps "${{ runner.temp }}/ffi-wheel/"*.whl'
+        )
+        ffi_smoke = production.index("import _airpods_aap_core as ffi")
+        validation = production.index(
+            "python tools/validate_release.py --scope python"
+        )
+
+        self.assertNotIn("maturin develop", production)
+        self.assertIn('--interpreter "${{ env.pythonLocation }}/bin/python"', production)
+        self.assertLess(rust_setup, ffi_build)
+        self.assertLess(ffi_build, ffi_install)
+        self.assertLess(ffi_install, ffi_smoke)
+        self.assertLess(ffi_smoke, validation)
+
 
 class ManifestSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
