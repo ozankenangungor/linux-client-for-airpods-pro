@@ -34,6 +34,8 @@ class VersionPolicyTests(unittest.TestCase):
             "\n  python-client:", 1
         )[0]
 
+        setup_python = production.index("uses: actions/setup-python@v6")
+        setup_python_id = production.index("id: setup-python")
         rust_setup = production.index("uses: dtolnay/rust-toolchain@stable")
         ffi_build = production.index("maturin build --release --locked")
         ffi_install = production.index(
@@ -44,8 +46,18 @@ class VersionPolicyTests(unittest.TestCase):
             "python tools/validate_release.py --scope python"
         )
 
+        self.assertIn(
+            "- uses: actions/setup-python@v6\n        id: setup-python",
+            production,
+        )
         self.assertNotIn("maturin develop", production)
-        self.assertIn('--interpreter "${{ env.pythonLocation }}/bin/python"', production)
+        self.assertNotIn("env.pythonLocation", production)
+        self.assertIn(
+            '--interpreter "${{ steps.setup-python.outputs.python-path }}"',
+            production,
+        )
+        self.assertLess(setup_python, setup_python_id)
+        self.assertLess(setup_python_id, rust_setup)
         self.assertLess(rust_setup, ffi_build)
         self.assertLess(ffi_build, ffi_install)
         self.assertLess(ffi_install, ffi_smoke)

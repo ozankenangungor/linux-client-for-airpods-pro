@@ -63,10 +63,11 @@ GitHub Actions divides the same project-owned checks into static policy,
 production Python, standalone Python compatibility, Rust, cross-language, and
 release-artifact jobs. CI uses fake sensor sessions and temporary Unix sockets.
 The production Python job explicitly provisions Rust, builds the private PyO3
-parity binding as a wheel for the setup-python 3.14 interpreter, installs that
-wheel into the same interpreter, and verifies its compiled entrypoint before
-running the Python release scope. This flow does not depend on a checkout
-virtualenv or upload the private binding as a release artifact.
+parity binding as a wheel using setup-python's explicit `python-path` output,
+installs that wheel into the same Python 3.14 interpreter, and verifies its
+compiled entrypoint before running the Python release scope. This flow does not
+depend on a checkout virtualenv or upload the private binding as a release
+artifact.
 Installer tests isolate `HOME`, `XDG_CONFIG_HOME`, and `XDG_RUNTIME_DIR` and
 inject fake `systemctl` behavior. `systemd-analyze verify --user` performs only
 static unit parsing. If the runner has no `systemd-analyze`, the validator and

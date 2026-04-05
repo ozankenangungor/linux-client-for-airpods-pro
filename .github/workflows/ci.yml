@@ -25,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        id: setup-python
         with:
           python-version: "3.14"
           cache: pip
@@ -34,7 +35,7 @@ jobs:
         working-directory: crates/airpods-aap-py
         run: |
           maturin build --release --locked \
-            --interpreter "${{ env.pythonLocation }}/bin/python" \
+            --interpreter "${{ steps.setup-python.outputs.python-path }}" \
             --out "${{ runner.temp }}/ffi-wheel"
           python -m pip install --no-deps "${{ runner.temp }}/ffi-wheel/"*.whl
       - name: Verify native FFI binding
