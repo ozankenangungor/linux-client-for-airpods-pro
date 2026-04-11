@@ -7,6 +7,18 @@ unpublished production package and both v0.1 client SDKs. It builds artifacts
 and validates consumers; it never publishes, reads credentials, opens
 Bluetooth, or starts the production daemon.
 
+## Release validation FINAL PASS
+
+Release validation is accepted at commit
+`d19e4be93dde7cd36b82437b7480c144d8cd545c`. The accepted release foundation
+includes manifest schema v1, commit and clean-tree provenance, the
+commit-derived `SOURCE_DATE_EPOCH`, five locally built package artifacts,
+package and clean-consumer audits, the Python 3.11–3.14 client matrix, Rust and
+cross-language gates, and static systemd parsing. Production Python CI builds
+and installs the private parity wheel with explicitly provisioned Rust and
+passes setup-python's documented `python-path` output to maturin. No package
+has been published.
+
 ## Canonical validation
 
 Run from a clean checkout after installing the development project and the
