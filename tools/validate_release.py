@@ -205,9 +205,23 @@ def validate_sensitive_paths() -> None:
     print("sensitive-data filename scan: pass")
 
 
+def validate_public_documentation() -> None:
+    tracked = output(["git", "ls-files", "-z", "--", "*.md"])
+    forbidden = ("/home/kenan/", "~/airpods-hr-linux")
+    for relative in tracked.split("\0"):
+        if not relative:
+            continue
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for value in forbidden:
+            if value in text:
+                fail(f"personal checkout path in public documentation: {relative}")
+    print("public-documentation path scan: pass")
+
+
 def validate_static_policy() -> None:
     validate_version_consistency()
     validate_sensitive_paths()
+    validate_public_documentation()
     run(["git", "diff", "--check"])
 
 
@@ -391,6 +405,10 @@ def audit_production_wheel(path: Path) -> None:
     metadata, entries = wheel_metadata(path)
     if metadata["Name"] != "airpods-hr-linux" or metadata["Version"] != RELEASE_VERSION:
         fail("production wheel identity/version mismatch")
+    if metadata["License-Expression"] != "MIT" or not any(
+        name.endswith(".dist-info/licenses/LICENSE") for name in names
+    ):
+        fail("production wheel license metadata/content mismatch")
     dependencies = metadata.get_all("Requires-Dist", [])
     dependency_names = {value.split(";", 1)[0].strip() for value in dependencies}
     if dependency_names != {"bumble==0.0.234", "dbus-next>=0.2.3"}:
@@ -415,6 +433,10 @@ def audit_python_client_wheel(path: Path) -> None:
     metadata, entries = wheel_metadata(path)
     if metadata["Name"] != "airpods-client" or metadata["Version"] != RELEASE_VERSION:
         fail("Python client wheel identity/version mismatch")
+    if metadata["License-Expression"] != "MIT" or not any(
+        name.endswith(".dist-info/licenses/LICENSE") for name in names
+    ):
+        fail("Python client wheel license metadata/content mismatch")
     if metadata.get_all("Requires-Dist", []) or entries:
         fail("Python client wheel must have zero dependencies and no entrypoints")
 
@@ -439,6 +461,8 @@ def audit_sdist(path: Path, *, package: str) -> None:
     )
     if required not in joined:
         fail(f"{path.name} lacks {required}")
+    if not any(name.endswith("/LICENSE") for name in names):
+        fail(f"{path.name} lacks packaged license")
     if package == "airpods-hr-linux" and "/src/airpods_client/" in joined:
         fail("production sdist contains standalone client")
     if package == "airpods-client" and ("airpods_hr" in joined or "/crates/" in joined):
@@ -448,6 +472,15 @@ def audit_sdist(path: Path, *, package: str) -> None:
 def audit_rust_crate(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
         names = archive.getnames()
+        manifest_name = next(
+            (name for name in names if name.endswith("/Cargo.toml")), None
+        )
+        if manifest_name is None:
+            fail("Rust client crate lacks Cargo.toml")
+        manifest_file = archive.extractfile(manifest_name)
+        if manifest_file is None:
+            fail("Rust client crate Cargo.toml is unreadable")
+        manifest = tomllib.loads(manifest_file.read().decode("utf-8"))
     forbidden = (
         "integration_probe.rs",
         "/target/",
@@ -459,6 +492,8 @@ def audit_rust_crate(path: Path) -> None:
         fail("Rust client crate contains repository-only Python/probe material")
     if not any(name.endswith("/src/lib.rs") for name in names):
         fail("Rust client crate lacks src/lib.rs")
+    if manifest["package"].get("license") != "MIT":
+        fail("Rust client crate license metadata mismatch")
 
 
 def sha256(path: Path) -> str:

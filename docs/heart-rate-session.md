@@ -189,8 +189,7 @@ Signal handlers are installed only around a live monitor invocation and are
 removed after its task completes. Help and dry-run paths install none. Iteration 9.2
 adds no retry, reconnect, suspend/resume hook, daemon behavior, or
 machine-readable output. The packaged command later completed one controlled
-AirPods Pro 3 run using
-`sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor`. It produced
+AirPods Pro 3 run using `sudo .venv/bin/airpods-hr monitor`. It produced
 continuous samples and, after Ctrl+C, reported that monitoring stopped and
 Bluetooth ownership and BlueZ state were restored. This is evidence for the
 tested setup only.

@@ -8,11 +8,11 @@ RC, not a 1.0 stability promise.
 
 SDK packaging validated a production wheel built from repository commit
 `77913781c43ccaf86f26514d4c424bc78bc599ad`. The wheel was installed into the
-isolated environment `/home/kenan/.local/share/airpods-hr-linux-9.10b`. Its
-generated public user service used the installed interpreter directly:
+operator's isolated package environment outside the repository. Its generated
+public user service used that installed interpreter directly:
 
 ```text
-ExecStart="/home/kenan/.local/share/airpods-hr-linux-9.10b/bin/python" -m airpods_hr._hubd.main
+ExecStart="<install-root>/bin/python" -m airpods_hr._hubd.main
 ```
 
 The unit had no repository `.venv` dependency. Installer verification reported

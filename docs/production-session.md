@@ -117,14 +117,14 @@ is external to the session core and remains an owner hardware observation.
 The probe is a deterministic dry run unless `--execute` is present:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_production_session.py
 ```
 
-The future owner validation command is:
+The completed owner validation used:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_production_session.py \
   --execute \
   --cycles 3 \
@@ -193,14 +193,14 @@ cause or install an automatic Bluetooth reconnect workaround.
 The dry run performs no D-Bus or Bluetooth operations:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py
 ```
 
 The Session reopen owner characterization command was:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --execute \
   --samples-per-session 5 \
@@ -287,7 +287,7 @@ alone, or automatically reconnect Bluetooth.
 The completed five-second descriptor-only characterization used:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --execute \
   --session-1-mode descriptor-only \
@@ -301,7 +301,7 @@ The completed 60-second descriptor-only characterization used a fresh normal
 BlueZ reconnect before the independent run:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_session_reopen.py \
   --execute \
   --session-1-mode descriptor-only \

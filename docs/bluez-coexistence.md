@@ -72,7 +72,7 @@ startup values are retained. There is no validity interpretation or filtering.
 The default invocation only prints its plan:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py
 ```
 
@@ -127,7 +127,7 @@ bluetoothctl devices Connected | sed -n '/AirPods/p'
 Confirm the dry-run, then try the live operation as the normal user:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py
 PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py \
   --execute --samples 5 --descriptor-timeout 30 --verbose

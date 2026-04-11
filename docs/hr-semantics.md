@@ -122,7 +122,7 @@ field inferred by the tool.
 The default invocation is a dry run and performs no Bluetooth work:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_hr_semantics.py
 ```
 
@@ -172,7 +172,7 @@ the activation-restart scenario.
 Baseline capture:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_hr_semantics.py \
   --execute \
   --scenario baseline \
@@ -183,7 +183,7 @@ PYTHONPATH=src .venv/bin/python tools/probe_hr_semantics.py \
 Same-session activation restart:
 
 ```console
-cd /home/kenan/airpods-hr-linux
+cd airpods-hr-linux
 PYTHONPATH=src .venv/bin/python tools/probe_hr_semantics.py \
   --execute \
   --scenario activation-restart \

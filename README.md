@@ -103,13 +103,14 @@ sudo env PYTHONPATH=src .venv/bin/python tools/probe_bluez_coexistence.py --exec
 ```
 
 The probe reports BlueZ reachability, adapter power, and
-`Device1.Connected` at every phase and after cleanup. Hardware feasibility is
-not yet validated. A successful owner run must receive at least three
-canonical heart-rate reports, preferably five, retain the BlueZ connection at
-every checkpoint, and leave real audio uninterrupted. No public coexistence or
-heart-rate library API is frozen by this experiment. See
+`Device1.Connected` at every phase and after cleanup. Controlled AirPods Pro 3
+runs have received canonical heart-rate reports while retaining the BlueZ
+connection at every checkpoint and leaving A2DP audio uninterrupted. This is
+feasibility evidence for the tested hardware and firmware, not a broad
+compatibility guarantee. No public coexistence or heart-rate library API is
+frozen by this experiment. See
 [docs/bluez-coexistence.md](docs/bluez-coexistence.md) for the complete owner
-procedure and current feasibility unknowns.
+procedure, evidence, and remaining limitations.
 
 ## Continuous monitor command
 
@@ -129,7 +130,7 @@ airpods-hr monitor --dry-run
 Start continuous monitoring with:
 
 ```console
-sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor
+sudo .venv/bin/airpods-hr monitor
 ```
 
 Press `Ctrl+C` to request graceful shutdown. Once heart-rate activation has
@@ -154,13 +155,13 @@ To display the unresolved fields and exact validated 18-byte report alongside
 each BPM sample, enable diagnostic mode:
 
 ```console
-sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor --diagnostic
+sudo .venv/bin/airpods-hr monitor --diagnostic
 ```
 
 Diagnostic events can also be preserved as UTF-8 JSON Lines:
 
 ```console
-sudo /home/kenan/airpods-hr-linux/.venv/bin/airpods-hr monitor --diagnostic --output /tmp/airpods-hr-task9.3.jsonl
+sudo .venv/bin/airpods-hr monitor --diagnostic --output /tmp/airpods-hr-task9.3.jsonl
 ```
 
 The output path must not already exist; this avoids overwriting evidence.
@@ -193,12 +194,14 @@ instructions are in [docs/daemon-installation.md](docs/daemon-installation.md).
 The local release build, manifest, CI, and manual release gates are documented
 in [docs/release-process.md](docs/release-process.md).
 
-The currently tested setup may require elevated privileges to read existing
-BlueZ pairing material and acquire direct controller ownership. The program
-does not invoke `sudo` or perform privilege escalation. There is no automatic
-reconnect after connection loss. Compatibility evidence is limited to the
-tested AirPods Pro 3 setup and does not establish broad firmware, controller,
-distribution, or AirPods-model support.
+Legacy direct-controller research probes may require elevated privileges to
+read existing BlueZ pairing material and acquire HCI ownership. The production
+hubd path uses the hardware-proven BlueZ coexistence transport and does not take
+direct controller ownership. No command invokes `sudo` or performs privilege
+escalation. There is no automatic reconnect after connection loss.
+Compatibility evidence is limited to the tested AirPods Pro 3 setup and does
+not establish broad firmware, controller, distribution, or AirPods-model
+support.
 
 Classic auth adds a safe-by-default diagnostic for a future Classic BR/EDR
 connection, authentication, and encryption experiment. It composes the

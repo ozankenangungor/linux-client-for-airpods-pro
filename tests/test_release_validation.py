@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import tomllib
 import unittest
 
 from tools import validate_release
@@ -90,6 +91,28 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertIn("retention-days: 14", release_job[upload:])
         self.assertNotIn("if: always()", release_job)
         self.assertNotIn("ffi-wheel", release_job)
+
+    def test_tracked_public_docs_exclude_personal_checkout_paths(self) -> None:
+        validate_release.validate_public_documentation()
+
+    def test_source_license_metadata_is_consistently_mit(self) -> None:
+        root = validate_release.ROOT
+        production = tomllib.loads((root / "pyproject.toml").read_text())
+        python_client = tomllib.loads(
+            (root / "packages/airpods-client-python/pyproject.toml").read_text()
+        )
+        rust_client = tomllib.loads(
+            (root / "crates/airpods-client/Cargo.toml").read_text()
+        )
+
+        self.assertTrue((root / "LICENSE").is_file())
+        self.assertEqual(production["project"]["license"], "MIT")
+        self.assertEqual(python_client["project"]["license"], "MIT")
+        self.assertEqual(rust_client["package"]["license"], "MIT")
+        self.assertEqual(
+            (root / "LICENSE").read_bytes(),
+            (root / "packages/airpods-client-python/LICENSE").read_bytes(),
+        )
 
 
 class ManifestSchemaTests(unittest.TestCase):
