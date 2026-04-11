@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import ctypes
-import socket
 import struct
 import unittest
 from contextlib import asynccontextmanager, redirect_stderr
@@ -81,6 +80,15 @@ ALL_COMPATIBILITY_UUIDS = frozenset(
 
 LOCAL_ADAPTER_ADDRESS = "00:11:22:33:44:55"
 REMOTE_AIRPODS_ADDRESS = "AA:BB:CC:DD:EE:FF"
+
+# Deterministic Linux-shaped values used only to verify injected constant
+# plumbing. The fake transport must not depend on the host Python socket build.
+TEST_AF_BLUETOOTH = 31
+TEST_SOCK_SEQPACKET = 5
+TEST_BTPROTO_L2CAP = 0
+TEST_SOL_BLUETOOTH = 274
+TEST_BT_SECURITY = 4
+TEST_BT_SECURITY_MEDIUM = 2
 
 
 def l2cap_options(
@@ -271,12 +279,12 @@ class FakeSocket:
 
 
 class FakeSocketModule:
-    AF_BLUETOOTH = socket.AF_BLUETOOTH
-    SOCK_SEQPACKET = socket.SOCK_SEQPACKET
-    BTPROTO_L2CAP = socket.BTPROTO_L2CAP
-    SOL_BLUETOOTH = socket.SOL_BLUETOOTH
-    BT_SECURITY = socket.BT_SECURITY
-    BT_SECURITY_MEDIUM = socket.BT_SECURITY_MEDIUM
+    AF_BLUETOOTH = TEST_AF_BLUETOOTH
+    SOCK_SEQPACKET = TEST_SOCK_SEQPACKET
+    BTPROTO_L2CAP = TEST_BTPROTO_L2CAP
+    SOL_BLUETOOTH = TEST_SOL_BLUETOOTH
+    BT_SECURITY = TEST_BT_SECURITY
+    BT_SECURITY_MEDIUM = TEST_BT_SECURITY_MEDIUM
     SOL_L2CAP = _LINUX_SOL_L2CAP
     L2CAP_OPTIONS = _LINUX_L2CAP_OPTIONS
 
@@ -897,7 +905,9 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         await transport.open(LOCAL_ADAPTER_ADDRESS, REMOTE_AIRPODS_ADDRESS)
         factory.assert_called_once_with(
-            socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
+            FakeSocketModule.AF_BLUETOOTH,
+            FakeSocketModule.SOCK_SEQPACKET,
+            FakeSocketModule.BTPROTO_L2CAP,
         )
         bind_index = next(
             index for index, event in enumerate(fake.events)
@@ -933,8 +943,13 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(options_read_indexes[1], connect_index)
         self.assertLess(connect_index, route_index)
         security = fake.events[security_index]
-        self.assertEqual(security[1:3], (socket.SOL_BLUETOOTH, socket.BT_SECURITY))
-        self.assertEqual(security[3], bytes((socket.BT_SECURITY_MEDIUM, 0)))
+        self.assertEqual(
+            security[1:3],
+            (FakeSocketModule.SOL_BLUETOOTH, FakeSocketModule.BT_SECURITY),
+        )
+        self.assertEqual(
+            security[3], bytes((FakeSocketModule.BT_SECURITY_MEDIUM, 0))
+        )
         self.assertEqual(
             fake.events[connect_index],
             ("connect", (REMOTE_AIRPODS_ADDRESS, AAP_PSM)),
@@ -1001,12 +1016,12 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         module = SimpleNamespace(
-            AF_BLUETOOTH=socket.AF_BLUETOOTH,
-            SOCK_SEQPACKET=socket.SOCK_SEQPACKET,
-            BTPROTO_L2CAP=socket.BTPROTO_L2CAP,
-            SOL_BLUETOOTH=socket.SOL_BLUETOOTH,
-            BT_SECURITY=socket.BT_SECURITY,
-            BT_SECURITY_MEDIUM=socket.BT_SECURITY_MEDIUM,
+            AF_BLUETOOTH=FakeSocketModule.AF_BLUETOOTH,
+            SOCK_SEQPACKET=FakeSocketModule.SOCK_SEQPACKET,
+            BTPROTO_L2CAP=FakeSocketModule.BTPROTO_L2CAP,
+            SOL_BLUETOOTH=FakeSocketModule.SOL_BLUETOOTH,
+            BT_SECURITY=FakeSocketModule.BT_SECURITY,
+            BT_SECURITY_MEDIUM=FakeSocketModule.BT_SECURITY_MEDIUM,
             SOL_L2CAP=_LINUX_SOL_L2CAP,
         )
         fake = FakeSocket()
@@ -1070,12 +1085,12 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conflicting_exposed_l2cap_constant_fails_closed(self) -> None:
         module = SimpleNamespace(
-            AF_BLUETOOTH=socket.AF_BLUETOOTH,
-            SOCK_SEQPACKET=socket.SOCK_SEQPACKET,
-            BTPROTO_L2CAP=socket.BTPROTO_L2CAP,
-            SOL_BLUETOOTH=socket.SOL_BLUETOOTH,
-            BT_SECURITY=socket.BT_SECURITY,
-            BT_SECURITY_MEDIUM=socket.BT_SECURITY_MEDIUM,
+            AF_BLUETOOTH=FakeSocketModule.AF_BLUETOOTH,
+            SOCK_SEQPACKET=FakeSocketModule.SOCK_SEQPACKET,
+            BTPROTO_L2CAP=FakeSocketModule.BTPROTO_L2CAP,
+            SOL_BLUETOOTH=FakeSocketModule.SOL_BLUETOOTH,
+            BT_SECURITY=FakeSocketModule.BT_SECURITY,
+            BT_SECURITY_MEDIUM=FakeSocketModule.BT_SECURITY_MEDIUM,
             SOL_L2CAP=99,
             L2CAP_OPTIONS=_LINUX_L2CAP_OPTIONS,
         )
