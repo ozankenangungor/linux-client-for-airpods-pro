@@ -85,11 +85,44 @@ inject fake `systemctl` behavior. `systemd-analyze verify --user` performs only
 static unit parsing. If the runner has no `systemd-analyze`, the validator and
 unit tests print an explicit skip reason.
 
+After the `release-artifacts` job successfully validates the canonical output
+at `${{ runner.temp }}/release`, it uploads that complete directory as the
+GitHub Actions artifact `airpods-hr-linux-0.1.0-${{ github.sha }}` for 14 days.
+The upload uses the normal success condition rather than `if: always()`, so a
+failed artifact gate cannot produce a downloadable RC bundle. The directory
+contains only the five packages, `release-manifest.json`, and
+`release-summary.txt`; the validator removes `.work` before the upload step.
+The private PyO3 wheel belongs only to the production test job and is never
+included.
+
+The downloadable Actions artifact is a retained validation result associated
+with the exact GitHub SHA. It is not a GitHub Release or a publication to PyPI
+or crates.io. After source review, the next gate is to push the exact reviewed
+commit, run GitHub Actions remotely, and verify every job on that SHA.
+
 CI cannot validate BlueZ reachability, adapter state, a descriptor handshake,
 real heart-rate delivery, systemd's runtime user-manager behavior, or A2DP
 continuity. The accepted SDK packaging installed-distribution run remains the
 current hardware evidence. Every future release still needs a separately
-authorized manual hardware gate.
+authorized manual hardware gate. Documentation and CI-only changes do not
+repeat hardware testing while the frozen runtime implementation remains
+unchanged.
+
+## GitHub Actions supply chain
+
+The workflow uses four action families:
+
+- `actions/checkout@v5` checks out the requested repository commit.
+- `actions/setup-python@v6` installs and selects the requested Python version.
+- `dtolnay/rust-toolchain@stable` provisions Rust, plus rustfmt and clippy where
+  requested.
+- `actions/upload-artifact@v4` retains the already validated canonical output.
+
+These references are version or channel tags, not immutable commit pins, and a
+floating action reference is not a cryptographic artifact signature. Immutable
+SHA pinning is deferred until the upstream commits can be verified from
+authoritative sources and applied consistently across the workflow; it remains
+a pre-publication supply-chain hardening item.
 
 ## Python version policy
 
@@ -132,5 +165,8 @@ temporary external Cargo consumer compiles against the packaged v0.1 API.
    cross-language gates passed.
 5. Perform the separately authorized hardware release gate and record its
    evidence without addresses, keys, captures, or private paths.
-6. Treat publication as a later, explicit operation. Release validation needs no
+6. Push the exact reviewed commit, run the six GitHub Actions jobs, and verify
+   every result and retained artifact belongs to that GitHub SHA.
+7. Treat GitHub Release creation and PyPI/crates.io publication as later,
+   explicit operations. Release validation needs no
    registry credentials and does not establish that any package was published.

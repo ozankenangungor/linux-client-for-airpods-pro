@@ -104,3 +104,10 @@ jobs:
           cache: pip
       - uses: dtolnay/rust-toolchain@stable
       - run: python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"
+      - name: Retain validated release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: airpods-hr-linux-0.1.0-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 14

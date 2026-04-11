@@ -63,6 +63,34 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertLess(ffi_install, ffi_smoke)
         self.assertLess(ffi_smoke, validation)
 
+    def test_release_artifacts_ci_retains_only_validated_canonical_output(
+        self,
+    ) -> None:
+        workflow = (validate_release.ROOT / ".github/workflows/ci.yml").read_text()
+        release_job = workflow.split("  release-artifacts:\n", 1)[1]
+
+        checkout = release_job.index("uses: actions/checkout@v5")
+        python_setup = release_job.index("uses: actions/setup-python@v6")
+        rust_setup = release_job.index("uses: dtolnay/rust-toolchain@stable")
+        validation = release_job.index(
+            'python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"'
+        )
+        upload = release_job.index("uses: actions/upload-artifact@v4")
+
+        self.assertLess(checkout, python_setup)
+        self.assertLess(python_setup, rust_setup)
+        self.assertLess(rust_setup, validation)
+        self.assertLess(validation, upload)
+        self.assertIn(
+            "name: airpods-hr-linux-0.1.0-${{ github.sha }}",
+            release_job[upload:],
+        )
+        self.assertIn("path: ${{ runner.temp }}/release", release_job[upload:])
+        self.assertIn("if-no-files-found: error", release_job[upload:])
+        self.assertIn("retention-days: 14", release_job[upload:])
+        self.assertNotIn("if: always()", release_job)
+        self.assertNotIn("ffi-wheel", release_job)
+
 
 class ManifestSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
