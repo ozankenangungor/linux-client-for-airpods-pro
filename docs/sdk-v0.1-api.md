@@ -147,6 +147,8 @@ The following are not part of the v0.1 SDK contract:
 - daemon installation paths or production systemd packaging
 - external registry-name availability or publication policy
 
-The Python distribution and Rust crate are release candidates built locally in
-Client SDKD. Publication, public daemon distribution, and coordinated future IPC
-versioning remain separate gates.
+The Python distribution and Rust crate are release candidates first built
+locally in Client SDKD. At that point, publication, public daemon distribution,
+and coordinated future IPC versioning were separate gates. Iteration 9.10 later
+completed the production daemon distribution; publication and future IPC
+versioning remain separate.

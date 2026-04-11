@@ -30,9 +30,9 @@ dependency.
 application / game
         |
         v
- airpods-client             future Python / Unity / C# / JS clients
+ Rust client                  Python client / future Unity / C# / JS
         |                                  |
-        +---------- Unix JSONL ------------+
+        +----------- Unix JSONL -----------+
                            |
                            v
                     +-------------+
@@ -186,8 +186,9 @@ All subprocesses use explicit argument arrays, bounded waits and output, and
 failure cleanup. The harness never constructs the production session, calls
 BlueZ or systemd, or opens Bluetooth. The accepted Client SDKA external types did
 not expose an ownership blocker during this review and remain unchanged. The
-crate and IPC are still experimental. Real AirPods validation of the Rust
-client remains pending after source review.
+crate and IPC are still experimental. At the Client SDKB source-review point,
+real AirPods validation of the Rust client was still pending. The subsequent
+FINAL PASS below records its completion.
 
 ### Client SDKB FINAL PASS
 
@@ -342,9 +343,10 @@ uninterrupted. Client SDKD performs no additional hardware or production-service
 run.
 
 Before public release, maintainers must separately choose and verify registry
-names, perform the publication gate, and package the daemon and production
-systemd paths. Automatic reconnect, a deliberate request-timeout policy, and
-future IPC compatibility remain outside this SDK packaging gate.
+names and perform the publication gate. Iteration 9.10 subsequently packaged the
+daemon and production systemd paths. Automatic reconnect, a deliberate
+request-timeout policy, and future IPC compatibility remain outside this SDK
+packaging gate.
 
 ### Client SDKD and Client SDK FINAL PASS
 

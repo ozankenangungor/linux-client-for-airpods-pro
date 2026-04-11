@@ -80,5 +80,6 @@ BlueZ's optional `PINLength` is preserved in the project's internal
 `ClassicPairingCredentials`. Bumble 0.0.234's `PairingKeys` has no corresponding
 Classic PIN-length field, so it is not placed into the Bumble object.
 
-This layer is not connected to the packaged CLI or to a Bumble `Device` yet.
-The final one-command experience remains future work.
+At Discovery layer, this layer was not yet connected to the packaged CLI or to a Bumble
+`Device`; the final one-command experience was future work. Later tasks
+integrated it into the hardware-proven research monitor path.

@@ -405,8 +405,8 @@ After these coexistence experiments, testing reran the previously proven
 Bumble/reference monitor and it failed at its generic AAP handshake/descriptor
 stage. The same result followed an AirPods case cycle. Testing then rebooted
 the host, reconnected the AirPods, and reproduced the reference failure before
-running another coexistence probe. The missing HR stream therefore cannot yet
-be attributed solely to the coexistence architecture.
+running another coexistence probe. At that diagnostic stage, the missing HR
+stream could not be attributed solely to the coexistence architecture.
 
 Coexistence probe.4 adds the separate private reference handshake diagnostic above. It
 reuses the existing paired-device discovery, local Classic credentials,

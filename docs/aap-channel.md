@@ -50,9 +50,9 @@ Run the diagnostic without flags to inspect its plan:
 PYTHONPATH=src python3.14 tools/probe_aap_l2cap.py
 ```
 
-The default path constructs no D-Bus or Bumble backend. A future reviewed
-`--execute` run will perform security and L2CAP signaling only. Its channel
-body is intentionally empty, and the project-owned channel view has no payload
-send API. The probe also installs no SDP service records. This signaling-only
-flow has opened the real AAP PSM on test hardware; SDP and AAP application
-behavior are handled by a separate layer.
+The default path constructs no D-Bus or Bumble backend. At source review, the
+planned `--execute` run was limited to security and L2CAP signaling. Its
+channel body is intentionally empty, and the project-owned channel view has no
+payload send API. The probe also installs no SDP service records. The
+subsequently accepted signaling-only run opened the real AAP PSM on test
+hardware; SDP and AAP application behavior are handled by a separate layer.

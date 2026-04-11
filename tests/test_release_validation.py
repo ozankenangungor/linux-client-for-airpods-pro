@@ -95,6 +95,16 @@ class VersionPolicyTests(unittest.TestCase):
     def test_tracked_public_docs_exclude_personal_checkout_paths(self) -> None:
         validate_release.validate_public_documentation()
 
+    def test_tracked_public_docs_exclude_stale_current_status(self) -> None:
+        validate_release.validate_public_documentation_status()
+        architecture = (
+            validate_release.ROOT / "docs/client-sdk-architecture.md"
+        ).read_text()
+        self.assertIn(
+            "Rust client                  Python client / future Unity / C# / JS",
+            architecture,
+        )
+
     def test_source_license_metadata_is_consistently_mit(self) -> None:
         root = validate_release.ROOT
         production = tomllib.loads((root / "pyproject.toml").read_text())
@@ -112,6 +122,10 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertEqual(
             (root / "LICENSE").read_bytes(),
             (root / "packages/airpods-client-python/LICENSE").read_bytes(),
+        )
+        self.assertEqual(
+            (root / "LICENSE").read_bytes(),
+            (root / "crates/airpods-client/LICENSE").read_bytes(),
         )
 
 

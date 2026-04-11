@@ -203,7 +203,7 @@ Compatibility evidence is limited to the tested AirPods Pro 3 setup and does
 not establish broad firmware, controller, distribution, or AirPods-model
 support.
 
-Classic auth adds a safe-by-default diagnostic for a future Classic BR/EDR
+Added a safe-by-default diagnostic for the subsequent Classic BR/EDR
 connection, authentication, and encryption experiment. It composes the
 reviewed discovery, local credential, and controller-handoff layers, but it
 does not open AAP or install SDP records:

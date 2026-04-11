@@ -218,10 +218,31 @@ def validate_public_documentation() -> None:
     print("public-documentation path scan: pass")
 
 
+def validate_public_documentation_status() -> None:
+    tracked = output(["git", "ls-files", "-z", "--", "*.md"])
+    forbidden = (
+        "Real AirPods validation of the Rust client remains pending",
+        "A future Rust client crate should speak to the daemon",
+        "future Python / Unity / C# / JS clients",
+        "The daemon, SDKs, and IPC layer are future components",
+        "The future execution uses",
+        "Before a future owner run",
+    )
+    for relative in tracked.split("\0"):
+        if not relative:
+            continue
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for value in forbidden:
+            if value in text:
+                fail(f"stale current-state documentation in {relative}: {value!r}")
+    print("public-documentation current-state scan: pass")
+
+
 def validate_static_policy() -> None:
     validate_version_consistency()
     validate_sensitive_paths()
     validate_public_documentation()
+    validate_public_documentation_status()
     run(["git", "diff", "--check"])
 
 
@@ -472,6 +493,14 @@ def audit_sdist(path: Path, *, package: str) -> None:
 def audit_rust_crate(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
         names = archive.getnames()
+        license_name = f"airpods-client-{RELEASE_VERSION}/LICENSE"
+        if license_name not in names:
+            fail("Rust client crate lacks packaged LICENSE")
+        license_file = archive.extractfile(license_name)
+        if license_file is None:
+            fail("Rust client crate LICENSE is unreadable")
+        if license_file.read() != (ROOT / "LICENSE").read_bytes():
+            fail("Rust client crate packaged LICENSE differs from root LICENSE")
         manifest_name = next(
             (name for name in names if name.endswith("/Cargo.toml")), None
         )

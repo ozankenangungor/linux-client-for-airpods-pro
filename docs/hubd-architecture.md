@@ -65,9 +65,9 @@ the probe is exported from `airpods_hr`.
 
 Rust retains its Iteration 9.7 role. `airpods-aap-core` is the portable protocol
 core and `_airpods_aap_core` is the private PyO3 parity bridge. The Python
-parser remains authoritative, and no production parsing path changes. A
-future Rust client crate should speak to the daemon instead of opening another
-AAP connection.
+parser remains authoritative, and no production parsing path changes. The
+Rust `airpods-client` crate added in Client SDK speaks to the daemon instead of
+opening another AAP connection.
 
 ## Daemon serviceB private production probe
 
@@ -75,11 +75,11 @@ The repository-private `tools/probe_hubd_production.py` composes exactly one
 production session with one daemon and exercises it only when the operator
 supplies `--execute`. Its default invocation is a deterministic dry run: it
 does not resolve a socket, construct the production factory, connect to BlueZ,
-or open Bluetooth. Daemon serviceB code completion is therefore not hardware
-validation and must not be marked FINAL PASS until testing runs the reviewed
-probe and records hardware evidence.
+or open Bluetooth. At the source-review point, Daemon serviceB code completion did
+not constitute hardware validation, so the task was not marked FINAL PASS
+until testing ran the reviewed probe and recorded the evidence below.
 
-The future execution uses
+The planned owner execution used
 `$XDG_RUNTIME_DIR/airpods-hubd-probe.sock`, including the accepted sibling
 process lock. Two real Unix JSONL clients ping the daemon and subscribe. The
 first subscription starts HR, the second shares the same activation, and both
@@ -120,11 +120,12 @@ sample before an unsubscribe completes. The probe does not filter, smooth,
 deduplicate, or require an exact report count. It also reports one factory call
 and one production session object.
 
-Before a future owner run, the operator must establish normal BlueZ ownership,
-perform a fresh normal AirPods disconnect and reconnect outside the probe,
-confirm the AirPods are normally connected with the ordinary A2DP profile, and
-play music. The probe performs no disconnect, reconnect, adapter power change,
-pairing operation, or fallback. The human operator must separately confirm
+Before testing validation run, the operator was required to establish normal
+BlueZ ownership, perform a fresh normal AirPods disconnect and reconnect
+outside the probe, confirm the AirPods were normally connected with the
+ordinary A2DP profile, and play music. The probe performed no disconnect,
+reconnect, adapter power change, pairing operation, or fallback. The human
+operator separately confirmed
 whether music remained uninterrupted; software counters cannot establish
 audio continuity.
 

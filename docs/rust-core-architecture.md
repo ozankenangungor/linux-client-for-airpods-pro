@@ -1,9 +1,9 @@
 # Rust core architecture
 
-Protocol core introduces `airpods-aap-core` as a platform-independent protocol
+Protocol core introduced `airpods-aap-core` as a platform-independent protocol
 core. Rust provides explicit integer widths, exhaustive result handling, and a
-small typed boundary that future SDKs can share. This task establishes byte
-parity and package structure. It does not replace the hardware-proven Python
+small typed boundary shared by later SDK work. That task established byte
+parity and package structure. It did not replace the hardware-proven Python
 production runtime or freeze the final end-user API.
 
 ## Target architecture
@@ -24,8 +24,8 @@ production runtime or freeze the final end-user API.
                                      Unity / others
 ```
 
-The daemon, SDKs, and IPC layer are future components. Protocol core implements
-only the pure core crate shown below.
+At Protocol core, the daemon, SDKs, and IPC layer were future components. That task
+implemented only the pure core crate shown below.
 
 ```text
 airpods-aap-core (Protocol core)
@@ -34,7 +34,7 @@ airpods-aap-core (Protocol core)
   mechanically derived semantics
   no operating-system I/O
 
-future Linux layers
+future Linux layers as planned at Protocol core
   BlueZ and D-Bus orchestration
   kernel Bluetooth sockets and persistent channel lifecycle
   audio coexistence and controller ownership policy
@@ -114,7 +114,7 @@ BPM 169 is parsed as the integer 169. It is not filtered, treated as a
 sentinel, dropped at startup, smoothed, or assigned lower validity. Duplicate
 reports likewise remain ordinary data.
 
-## Future crate layout
+## Protocol core planned crate layout
 
 The intended separation is:
 
@@ -210,12 +210,12 @@ raw bytes, failure category, and source-side derivation. It neither opens or
 intercepts Bluetooth traffic nor logs packet data, chooses a production parser,
 or falls back between implementations. Production code never imports it.
 
-## Future persistent daemon
+## Protocol core persistent daemon plan
 
-Iteration 9.6 hardware evidence favors a daemon because the reliable lifecycle is
+Iteration 9.6 hardware evidence favored a daemon because the reliable lifecycle is
 one continuously open AAP session with one descriptor bootstrap and repeated
-HR START/STOP cycles. A later daemon can own that session while multiple local
-consumers come and go:
+HR START/STOP cycles. The planned daemon would own that session while multiple
+local consumers came and went:
 
 ```text
 subscriber_count 0 -> 1:  START HR
@@ -223,9 +223,10 @@ subscriber_count 1 -> 0:  STOP HR; keep AAP channel READY
 application exits:        daemon and READY AAP session remain alive
 ```
 
-This would avoid treating each application lifetime as a new AAP channel.
-Protocol core does not implement the daemon, subscriber accounting, IPC, or service
-management.
+This design avoided treating each application lifetime as a new AAP channel.
+Protocol core did not implement the daemon, subscriber accounting, IPC, or service
+management. Daemon service subsequently implemented and validated that persistent
+daemon design.
 
 ## Authority and migration gates
 
