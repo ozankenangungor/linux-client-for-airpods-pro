@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - run: python -m pip install -e . maturin==1.15.0
       - name: Build and install private FFI parity wheel
         working-directory: crates/airpods-aap-py
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - run: python3 tools/validate_release.py --scope rust
@@ -89,12 +89,18 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - run: python -m pip install -e .
       - run: python tools/validate_release.py --scope cross-language
 
   release-artifacts:
     name: Canonical package and clean consumers
+    needs:
+      - static-policy
+      - python-production
+      - python-client
+      - rust
+      - cross-language
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -102,7 +108,7 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - run: python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"
       - name: Retain validated release candidate
         uses: actions/upload-artifact@v4

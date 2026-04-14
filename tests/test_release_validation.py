@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
+import subprocess
+import sys
 import tomllib
 import unittest
 
@@ -37,7 +40,7 @@ class VersionPolicyTests(unittest.TestCase):
 
         setup_python = production.index("uses: actions/setup-python@v6")
         setup_python_id = production.index("id: setup-python")
-        rust_setup = production.index("uses: dtolnay/rust-toolchain@stable")
+        rust_setup = production.index("uses: dtolnay/rust-toolchain@1.97.0")
         ffi_build = production.index("maturin build --release --locked")
         ffi_install = production.index(
             'python -m pip install --no-deps "${{ runner.temp }}/ffi-wheel/"*.whl'
@@ -64,6 +67,24 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertLess(ffi_install, ffi_smoke)
         self.assertLess(ffi_smoke, validation)
 
+    def test_every_rust_ci_job_uses_the_accepted_release_toolchain(self) -> None:
+        workflow = (validate_release.ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertNotIn("dtolnay/rust-toolchain@stable", workflow)
+        self.assertEqual(
+            workflow.count("uses: dtolnay/rust-toolchain@1.97.0"), 4
+        )
+        boundaries = (
+            ("python-production", "python-client"),
+            ("rust", "cross-language"),
+            ("cross-language", "release-artifacts"),
+            ("release-artifacts", None),
+        )
+        for job, following_job in boundaries:
+            section = workflow.split(f"  {job}:\n", 1)[1]
+            if following_job is not None:
+                section = section.split(f"\n  {following_job}:\n", 1)[0]
+            self.assertIn("uses: dtolnay/rust-toolchain@1.97.0", section)
+
     def test_release_artifacts_ci_retains_only_validated_canonical_output(
         self,
     ) -> None:
@@ -72,7 +93,7 @@ class VersionPolicyTests(unittest.TestCase):
 
         checkout = release_job.index("uses: actions/checkout@v5")
         python_setup = release_job.index("uses: actions/setup-python@v6")
-        rust_setup = release_job.index("uses: dtolnay/rust-toolchain@stable")
+        rust_setup = release_job.index("uses: dtolnay/rust-toolchain@1.97.0")
         validation = release_job.index(
             'python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"'
         )
@@ -83,6 +104,15 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertLess(rust_setup, validation)
         self.assertLess(validation, upload)
         self.assertIn(
+            "needs:\n"
+            "      - static-policy\n"
+            "      - python-production\n"
+            "      - python-client\n"
+            "      - rust\n"
+            "      - cross-language",
+            release_job[:checkout],
+        )
+        self.assertIn(
             "name: airpods-hr-linux-0.1.0-${{ github.sha }}",
             release_job[upload:],
         )
@@ -91,6 +121,67 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertIn("retention-days: 14", release_job[upload:])
         self.assertNotIn("if: always()", release_job)
         self.assertNotIn("ffi-wheel", release_job)
+
+    def test_coexistence_fakes_run_without_host_bluetooth_constants(self) -> None:
+        test_path = validate_release.ROOT / "tests/test_bluez_coexistence.py"
+        source = test_path.read_text()
+        attributes = (
+            "AF_BLUETOOTH",
+            "SOCK_SEQPACKET",
+            "BTPROTO_L2CAP",
+            "SOL_BLUETOOTH",
+            "BT_SECURITY",
+            "BT_SECURITY_MEDIUM",
+        )
+        for attribute in attributes:
+            self.assertNotIn(f"socket.{attribute}", source)
+
+        code = """
+import socket
+import unittest
+
+for attribute in (
+    "AF_BLUETOOTH",
+    "SOCK_SEQPACKET",
+    "BTPROTO_L2CAP",
+    "SOL_BLUETOOTH",
+    "BT_SECURITY",
+    "BT_SECURITY_MEDIUM",
+):
+    if hasattr(socket, attribute):
+        delattr(socket, attribute)
+
+from tests.test_bluez_coexistence import KernelL2CAPTransportTests
+
+names = (
+    "test_bind_security_connect_and_route_order",
+    "test_python_constant_gap_uses_verified_linux_uapi_fallback",
+    "test_conflicting_exposed_l2cap_constant_fails_closed",
+)
+suite = unittest.TestSuite(KernelL2CAPTransportTests(name) for name in names)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+if result.testsRun != len(names) or not result.wasSuccessful():
+    raise SystemExit(1)
+"""
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            (
+                os.fspath(validate_release.ROOT / "src"),
+                os.fspath(
+                    validate_release.ROOT / "packages/airpods-client-python/src"
+                ),
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=validate_release.ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_tracked_public_docs_exclude_personal_checkout_paths(self) -> None:
         validate_release.validate_public_documentation()

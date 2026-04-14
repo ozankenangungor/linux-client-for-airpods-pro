@@ -85,6 +85,17 @@ inject fake `systemctl` behavior. `systemd-analyze verify --user` performs only
 static unit parsing. If the runner has no `systemd-analyze`, the validator and
 unit tests print an explicit skip reason.
 
+The first remote Actions run, run `34764947612` at commit
+`2d88f4c651e280331319d6bb5a237055d2f41a5e`, was a useful pre-release failure,
+not a final pass. It showed that floating Rust stable caused validation drift,
+that the setup-python CPython build did not expose host Bluetooth socket
+constants used by a test fake, and that artifact retention needed dependencies
+on the complete validation graph. The v0.1.0 RC workflow now provisions exact
+Rust and Cargo 1.97.0 in every Rust-using job, keeps fake transport constants
+independent of the host socket module, and gates `release-artifacts` on static,
+production Python, the complete Python client matrix, Rust, and cross-language
+success.
+
 After the `release-artifacts` job successfully validates the canonical output
 at `${{ runner.temp }}/release`, it uploads that complete directory as the
 GitHub Actions artifact `airpods-hr-linux-0.1.0-${{ github.sha }}` for 14 days.
@@ -114,8 +125,8 @@ The workflow uses four action families:
 
 - `actions/checkout@v5` checks out the requested repository commit.
 - `actions/setup-python@v6` installs and selects the requested Python version.
-- `dtolnay/rust-toolchain@stable` provisions Rust, plus rustfmt and clippy where
-  requested.
+- `dtolnay/rust-toolchain@1.97.0` provisions the exact Rust/Cargo toolchain
+  accepted for the v0.1.0 RC, plus rustfmt and clippy where requested.
 - `actions/upload-artifact@v4` retains the already validated canonical output.
 
 These references are version or channel tags, not immutable commit pins, and a
