@@ -253,10 +253,10 @@ client API, or establish automatic daemon restart behavior.
 
 ## Lifecycle and arbitration
 
-The daemon creates exactly one session object and calls `open()` exactly once
-during startup. Successful startup reaches `READY` with the session still
-open. Subscriber transitions are serialized by one asynchronous lifecycle
-lock:
+The daemon owns at most one session object at a time. It creates and opens one
+during startup, keeps it open through ordinary subscription cycles, and
+replaces it only after a recoverable session failure. Subscriber transitions
+and session replacement are serialized by one asynchronous lifecycle lock:
 
 ```text
 STOPPED -> STARTING -> READY
@@ -275,7 +275,8 @@ STOPPED -> STARTING -> READY
                          v
                        READY
 
-any session failure -> FAILED
+recoverable session failure -> STARTING -> fresh session -> READY/STREAMING
+terminal session failure -> FAILED
 shutdown from any owned state -> SHUTTING_DOWN -> STOPPED
 ```
 
@@ -290,11 +291,12 @@ One daemon task calls `receive_report()`. It forwards each report unchanged to
 every current subscriber. It does not smooth, filter, or deduplicate BPM, so
 BPM 169 and duplicate reports remain ordinary events.
 
-Shutdown is idempotent and bounds every session operation. If heart rate may
+Shutdown is idempotent and bounds every session operation. It first cancels an
+active recovery task, including its pending backoff sleep. If heart rate may
 still be active, shutdown attempts STOP before canceling the report reader. It
-then closes clients and the listener, closes the one session, removes only the
-socket inode it created, and reaches `STOPPED`. No task is intentionally left
-running.
+then closes clients and the listener, closes the current session, removes only
+the socket inode it created, and reaches `STOPPED`. No task is intentionally
+left running.
 
 ## Experimental local IPC and security
 
@@ -368,13 +370,28 @@ slow client, so it cannot block sensor reads, other clients, or lifecycle
 transitions. Other subscribers keep the session streaming; disconnecting the
 last subscriber follows the normal `1 -> 0` STOP transition.
 
-A START failure does not activate the requesting subscription or create a
-reader task. Unexpected receive failure ends the reader, clears active
-subscriptions, enters `FAILED`, and sends connected clients a generic service
-error without packet data. A STOP failure enters `FAILED` and never claims
-`READY`. Daemon serviceA does not retry, create another session or AAP channel,
-reconnect Bluetooth, or define recovery. Shutdown still performs bounded,
-best-effort cleanup of resources the daemon owns. Shutdown enters
+Production session failures classified as temporary BlueZ, registration,
+transport, descriptor-handshake, activation, receive, or STOP failures enter
+automatic recovery. The daemon closes the failed session before constructing a
+fresh one and waits 1, 2, 5, then at most 10 seconds between attempts. A
+successful open, and activation when subscribers remain, resets that sequence.
+The retry owner is unique, so duplicate failure observations cannot create
+overlapping sessions or retry loops.
+
+Connected clients remain connected during recovery. Existing heart-rate
+subscriptions remain active and resume receiving events after the fresh
+session starts. A newly connected client can use `hello`, `ping`, and `status`;
+`status` reports `starting`, while a new subscription receives the existing
+`service_unavailable` response until recovery completes. No temporary failure
+event is injected into an active subscription because the v0.1 clients treat
+an unsolicited error response as terminal.
+
+Invalid session state, configuration errors, cleanup failures used as a
+primary failure, and unexpected exceptions remain terminal. They enter
+`FAILED` and produce the existing generic service error without exposing
+packet data. Recovery never restarts BlueZ, cycles an adapter, changes pairing
+state, or bypasses the canonical production session and parser. Shutdown still
+performs bounded, best-effort cleanup of resources the daemon owns. It enters
 `SHUTTING_DOWN` and closes the listening server before waiting on HR or client
 cleanup, preventing new connections from entering while teardown is in
 progress.

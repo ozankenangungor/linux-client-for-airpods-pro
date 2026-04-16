@@ -34,7 +34,10 @@ from airpods_hr.production_session import (
     DEFAULT_REPORT_TIMEOUT,
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
+    ProductionSessionCategory,
     ProductionSessionCounters,
+    ProductionSessionError,
+    ProductionSessionState,
 )
 from tools import probe_hubd_production
 from tools.probe_hubd_production import (
@@ -325,21 +328,21 @@ class ProbeClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProductionFactoryTests(unittest.TestCase):
-    def test_factory_delegates_to_existing_production_builder_once(self) -> None:
+    def test_factory_delegates_each_attempt_to_production_builder(self) -> None:
         config = ProductionHubConfig()
-        session = Mock()
+        first, second = Mock(), Mock()
         with patch.object(
             hubd_production,
             "create_production_session",
-            return_value=session,
+            side_effect=(first, second),
         ) as builder:
             factory = ProductionSessionFactory(
                 config, output=lambda _line: None
             )
-            self.assertIs(factory(), session)
-            with self.assertRaisesRegex(RuntimeError, "single-use"):
-                factory()
-        builder.assert_called_once_with(
+            self.assertIs(factory(), first)
+            self.assertIs(factory(), second)
+        self.assertEqual(builder.call_count, 2)
+        builder.assert_called_with(
             descriptor_timeout=30.0,
             dbus_timeout=5.0,
             connect_timeout=10.0,
@@ -348,8 +351,50 @@ class ProductionFactoryTests(unittest.TestCase):
             stop_timeout=5.0,
             output=unittest.mock.ANY,
         )
-        self.assertEqual(factory.calls, 1)
-        self.assertIs(factory.session, session)
+        self.assertEqual(factory.calls, 2)
+        self.assertIs(factory.session, second)
+
+    def test_only_runtime_production_categories_are_recoverable(self) -> None:
+        recoverable = {
+            ProductionSessionCategory.PREFLIGHT_FAILED,
+            ProductionSessionCategory.REGISTRATION_FAILED,
+            ProductionSessionCategory.TRANSPORT_FAILED,
+            ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+            ProductionSessionCategory.ACTIVATION_FAILED,
+            ProductionSessionCategory.RECEIVE_FAILED,
+            ProductionSessionCategory.STOP_FAILED,
+        }
+        for category in ProductionSessionCategory:
+            with self.subTest(category=category):
+                error = ProductionSessionError(category, "test")
+                self.assertEqual(
+                    hubd_production._is_recoverable_production_error(error),
+                    category in recoverable,
+                )
+        self.assertTrue(
+            hubd_production._is_recoverable_production_error(TimeoutError())
+        )
+        self.assertFalse(
+            hubd_production._is_recoverable_production_error(ValueError())
+        )
+        self.assertFalse(
+            hubd_production._is_recoverable_production_error(RuntimeError())
+        )
+
+    def test_production_cleanup_requires_explicit_closed_state(self) -> None:
+        session = Mock(spec=["state"])
+        session.state = ProductionSessionState.CLOSED
+        self.assertTrue(
+            hubd_production._production_cleanup_completed(
+                session, RuntimeError()
+            )
+        )
+        session.state = ProductionSessionState.FAILED
+        self.assertFalse(
+            hubd_production._production_cleanup_completed(
+                session, RuntimeError()
+            )
+        )
 
     def test_outer_timeout_covers_complete_production_windows(self) -> None:
         minimum = minimum_daemon_operation_timeout(

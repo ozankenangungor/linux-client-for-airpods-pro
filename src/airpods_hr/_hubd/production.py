@@ -14,6 +14,9 @@ from airpods_hr.production_session import (
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
     InternalProductionSession,
+    ProductionSessionCategory,
+    ProductionSessionError,
+    ProductionSessionState,
     create_production_session,
 )
 
@@ -93,7 +96,7 @@ class ProductionHubConfig:
 
 
 class ProductionSessionFactory:
-    """Construct exactly one authoritative production session for one daemon."""
+    """Construct a fresh authoritative production session for each attempt."""
 
     def __init__(
         self,
@@ -109,8 +112,6 @@ class ProductionSessionFactory:
         self.session: InternalProductionSession | None = None
 
     def __call__(self) -> InternalProductionSession:
-        if self.calls != 0:
-            raise RuntimeError("production session factory is single-use")
         self.calls += 1
         builder = self._builder or create_production_session
         session = builder(
@@ -126,9 +127,37 @@ class ProductionSessionFactory:
         return session
 
 
+_RECOVERABLE_PRODUCTION_CATEGORIES = frozenset(
+    {
+        ProductionSessionCategory.PREFLIGHT_FAILED,
+        ProductionSessionCategory.REGISTRATION_FAILED,
+        ProductionSessionCategory.TRANSPORT_FAILED,
+        ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+        ProductionSessionCategory.ACTIVATION_FAILED,
+        ProductionSessionCategory.RECEIVE_FAILED,
+        ProductionSessionCategory.STOP_FAILED,
+    }
+)
+
+
+def _is_recoverable_production_error(error: BaseException) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    return (
+        isinstance(error, ProductionSessionError)
+        and error.category in _RECOVERABLE_PRODUCTION_CATEGORIES
+    )
+
+
+def _production_cleanup_completed(
+    session: object, _error: BaseException
+) -> bool:
+    return getattr(session, "state", None) is ProductionSessionState.CLOSED
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionHub:
-    """The private daemon and its observable single-use production factory."""
+    """The private daemon and its observable production session factory."""
 
     daemon: AirPodsHubDaemon
     factory: ProductionSessionFactory
@@ -149,6 +178,9 @@ def create_production_hub(
         factory,
         socket_path,
         operation_timeout=selected.daemon_operation_timeout,
+        session_error_is_recoverable=_is_recoverable_production_error,
+        session_cleanup_completed=_production_cleanup_completed,
+        lifecycle_output=output,
     )
     return ProductionHub(daemon=daemon, factory=factory)
 
