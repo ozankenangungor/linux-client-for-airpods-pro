@@ -14,7 +14,6 @@ from airpods_hr.production_session import (
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
     InternalProductionSession,
-    ProductionSessionCategory,
     ProductionSessionError,
     ProductionSessionState,
     create_production_session,
@@ -127,26 +126,10 @@ class ProductionSessionFactory:
         return session
 
 
-_RECOVERABLE_PRODUCTION_CATEGORIES = frozenset(
-    {
-        ProductionSessionCategory.PREFLIGHT_FAILED,
-        ProductionSessionCategory.REGISTRATION_FAILED,
-        ProductionSessionCategory.TRANSPORT_FAILED,
-        ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
-        ProductionSessionCategory.ACTIVATION_FAILED,
-        ProductionSessionCategory.RECEIVE_FAILED,
-        ProductionSessionCategory.STOP_FAILED,
-    }
-)
-
-
 def _is_recoverable_production_error(error: BaseException) -> bool:
     if isinstance(error, TimeoutError):
         return True
-    return (
-        isinstance(error, ProductionSessionError)
-        and error.category in _RECOVERABLE_PRODUCTION_CATEGORIES
-    )
+    return isinstance(error, ProductionSessionError) and error.recoverable
 
 
 def _production_cleanup_completed(

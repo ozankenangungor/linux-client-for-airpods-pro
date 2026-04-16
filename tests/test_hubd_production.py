@@ -54,7 +54,7 @@ from tools.probe_hubd_production import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "f4141c6372c9bda65b4aca1b09c40e2f024ec8fe1b75964e8cc5f26c2156371e"
+    "0f7cd4cb0c21a193045ae2dd14d5673b9ed6e32fd05f0662d2d54fecf07aaa01"
 )
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
@@ -354,22 +354,20 @@ class ProductionFactoryTests(unittest.TestCase):
         self.assertEqual(factory.calls, 2)
         self.assertIs(factory.session, second)
 
-    def test_only_runtime_production_categories_are_recoverable(self) -> None:
-        recoverable = {
-            ProductionSessionCategory.PREFLIGHT_FAILED,
-            ProductionSessionCategory.REGISTRATION_FAILED,
-            ProductionSessionCategory.TRANSPORT_FAILED,
-            ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
-            ProductionSessionCategory.ACTIVATION_FAILED,
-            ProductionSessionCategory.RECEIVE_FAILED,
-            ProductionSessionCategory.STOP_FAILED,
-        }
+    def test_recovery_uses_provenance_instead_of_category(self) -> None:
         for category in ProductionSessionCategory:
             with self.subTest(category=category):
-                error = ProductionSessionError(category, "test")
-                self.assertEqual(
-                    hubd_production._is_recoverable_production_error(error),
-                    category in recoverable,
+                self.assertFalse(
+                    hubd_production._is_recoverable_production_error(
+                        ProductionSessionError(category, "test")
+                    )
+                )
+                self.assertTrue(
+                    hubd_production._is_recoverable_production_error(
+                        ProductionSessionError(
+                            category, "test", recoverable=True
+                        )
+                    )
                 )
         self.assertTrue(
             hubd_production._is_recoverable_production_error(TimeoutError())

@@ -370,13 +370,18 @@ slow client, so it cannot block sensor reads, other clients, or lifecycle
 transitions. Other subscribers keep the session streaming; disconnecting the
 last subscriber follows the normal `1 -> 0` STOP transition.
 
-Production session failures classified as temporary BlueZ, registration,
-transport, descriptor-handshake, activation, receive, or STOP failures enter
-automatic recovery. The daemon closes the failed session before constructing a
-fresh one and waits 1, 2, 5, then at most 10 seconds between attempts. A
-successful open, and activation when subscribers remain, resets that sequence.
-The retry owner is unique, so duplicate failure observations cannot create
-overlapping sessions or retry loops.
+Production session failures enter automatic recovery only when their private
+error carries explicit transient provenance. Known peer disconnects, temporary
+BlueZ unavailability, connection and protocol timeouts, and expected session
+losses are transient. A broad phase category alone is insufficient: programmer
+errors, invalid internal state, and Linux socket or receive-MTU incompatibility
+remain terminal even when they occur during transport or activation. The daemon
+closes a failed transient session before constructing a fresh one and waits 1,
+2, 5, then at most 10 seconds between attempts. A successful open, and
+activation when subscribers remain, resets that sequence. The retry owner is
+unique, so duplicate failure observations cannot create overlapping sessions or
+retry loops. Cancellation is propagated as control flow, including when a
+dependency has wrapped it.
 
 Connected clients remain connected during recovery. Existing heart-rate
 subscriptions remain active and resume receiving events after the fresh
@@ -385,6 +390,13 @@ session starts. A newly connected client can use `hello`, `ping`, and `status`;
 `service_unavailable` response until recovery completes. No temporary failure
 event is injected into an active subscription because the v0.1 clients treat
 an unsolicited error response as terminal.
+
+The listener is registered with asyncio before the initial sensor open attempt.
+Consequently the same control operations remain responsive when the daemon is
+first started without usable AirPods and is waiting in its initial recovery
+backoff. Initial sensor establishment retains the startup task and the same
+lifecycle owner, so terminal startup failures still reach the runner while a
+shutdown cancels that task and its pending retry delay.
 
 Invalid session state, configuration errors, cleanup failures used as a
 primary failure, and unexpected exceptions remain terminal. They enter

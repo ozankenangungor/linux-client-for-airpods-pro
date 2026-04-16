@@ -1074,7 +1074,7 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SessionOperationError):
                 await self.daemon.start()
         self.assertEqual(self.factory.calls, 1)
-        self.assertEqual(self.factory.session.open_calls, 1)
+        self.assertEqual(self.factory.session.open_calls, 0)
         self.assertEqual(self.daemon.state, DaemonState.FAILED)
         self.assertIsNone(self.daemon._server)
         self.assertFalse(self.socket_path.exists())

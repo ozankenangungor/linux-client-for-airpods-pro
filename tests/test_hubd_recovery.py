@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
-from airpods_hr._hubd.server import AirPodsHubDaemon, DaemonState
+from airpods_hr._hubd.server import (
+    AirPodsHubDaemon,
+    DaemonState,
+    SessionOperationError,
+)
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
 from airpods_hr.protocol import (
     HEART_RATE_MARKER,
@@ -245,6 +249,54 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed.events, ["open", "close"])
         self.assertEqual(restored.events, ["open"])
         self.assertEqual(daemon.state, DaemonState.READY)
+
+    async def test_initial_recovery_keeps_ipc_responsive_then_becomes_ready(
+        self,
+    ) -> None:
+        sleeper = BlockingSleeper()
+        failed = ScriptedSession(open_error=RecoverableSessionFailure("gone"))
+        restored = ScriptedSession()
+        daemon, factory = self.make_daemon([failed, restored], sleeper)
+
+        startup = asyncio.create_task(daemon.start())
+        await asyncio.wait_for(sleeper.entered.wait(), timeout=1)
+        client = await self.client()
+
+        hello = await client.request("hello")
+        ping = await client.request("ping")
+        status = await client.request("status")
+        unavailable = await self.subscribe(client)
+
+        self.assertTrue(hello["ok"])
+        self.assertTrue(ping["pong"])
+        self.assertEqual(status["state"], "starting")
+        self.assertEqual(unavailable["error"]["code"], "service_unavailable")
+        self.assertFalse(startup.done())
+
+        sleeper.release.set()
+        await asyncio.wait_for(startup, timeout=1)
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(daemon.state, DaemonState.READY)
+
+        subscribed = await self.subscribe(client)
+        self.assertTrue(subscribed["ok"])
+        restored.inject(canonical_report(93))
+        self.assertEqual((await client.read())["bpm"], 93)
+
+    async def test_initial_programmer_error_is_terminal_without_retry(
+        self,
+    ) -> None:
+        sleeper = ImmediateSleeper()
+        failed = ScriptedSession(open_error=TypeError("implementation bug"))
+        daemon, factory = self.make_daemon([failed], sleeper)
+
+        with self.assertRaises(SessionOperationError):
+            await daemon.start()
+
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(sleeper.delays, [])
+        self.assertFalse(daemon.recovery_active)
+        self.assertEqual(daemon.state, DaemonState.FAILED)
 
     async def test_repeated_recoverable_failures_use_bounded_order(self) -> None:
         sleeper = ImmediateSleeper()

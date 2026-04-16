@@ -6,13 +6,19 @@ This module is deliberately not exported from :mod:`airpods_hr`.  It validates a
 from __future__ import annotations
 
 import asyncio
+import errno
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from airpods_hr.aap import AAPHandshakeResult, AAPHandshakeSession
+from airpods_hr.aap import (
+    AAPDescriptorObservationTimeoutError,
+    AAPHandshakeResult,
+    AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
+)
 from airpods_hr.bluez_coexistence import (
     DEFAULT_DBUS_TIMEOUT,
     DEFAULT_HANDSHAKE_TIMEOUT,
@@ -20,15 +26,25 @@ from airpods_hr.bluez_coexistence import (
     BlueZCoexistenceState,
     BlueZCompatibilityRegistration,
     BlueZStateClient,
+    CoexistenceCategory,
+    CoexistenceFailure,
     CoexistenceTransport,
     CompatibilityRegistration,
     DBusNextBlueZCoexistenceClient,
     KernelL2CAPTransport,
 )
+from airpods_hr.discovery import (
+    DeviceDiscoveryUnavailableError,
+    NoAirPodsCandidatesError,
+)
 from airpods_hr.heart_rate_session import (
+    HeartRateBootstrapAckTimeoutError,
+    HeartRateConnectAckTimeoutError,
     HeartRateMonitorActivationSession,
     HeartRateMonitorSessionResult,
+    HeartRateNoSamplesError,
     HeartRateProgress,
+    HeartRateStartAckTimeoutError,
 )
 from airpods_hr.heartrate import HeartRateReport
 from airpods_hr.protocol import HeartRateCommand
@@ -70,10 +86,13 @@ class ProductionSessionError(RuntimeError):
         category: ProductionSessionCategory,
         phase: str,
         detail: str | None = None,
+        *,
+        recoverable: bool = False,
     ) -> None:
         self.category = category
         self.phase = phase
         self.detail = detail
+        self.recoverable = recoverable
         message = f"{category.value} at {phase}"
         if detail:
             message += f": {detail}"
@@ -87,6 +106,108 @@ class ProductionSessionStateError(ProductionSessionError):
             operation,
             f"state={state.value}",
         )
+
+
+_RECOVERABLE_COEXISTENCE_CATEGORIES = frozenset(
+    {
+        CoexistenceCategory.PREFLIGHT_FAILED,
+        CoexistenceCategory.BLUEZ_NOT_AVAILABLE,
+        CoexistenceCategory.AIRPODS_NOT_CONNECTED,
+        CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+        CoexistenceCategory.L2CAP_BIND_FAILED,
+        CoexistenceCategory.L2CAP_CONNECT_FAILED,
+        CoexistenceCategory.AAP_HANDSHAKE_FAILED,
+        CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
+        CoexistenceCategory.HR_ACTIVATION_FAILED,
+        CoexistenceCategory.HR_TIMEOUT,
+        CoexistenceCategory.BLUEZ_CONNECTION_LOST,
+    }
+)
+
+_RECOVERABLE_SESSION_EXCEPTIONS = (
+    AAPHandshakeTimeoutError,
+    AAPDescriptorObservationTimeoutError,
+    HeartRateBootstrapAckTimeoutError,
+    HeartRateConnectAckTimeoutError,
+    HeartRateStartAckTimeoutError,
+    HeartRateNoSamplesError,
+    NoAirPodsCandidatesError,
+    DeviceDiscoveryUnavailableError,
+    ConnectionError,
+    TimeoutError,
+)
+
+_RECOVERABLE_OS_ERRNOS = frozenset(
+    {
+        errno.EADDRNOTAVAIL,
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+        errno.EINTR,
+        errno.ENETDOWN,
+        errno.ENETRESET,
+        errno.ENETUNREACH,
+        errno.ENODEV,
+        errno.ENOENT,
+        errno.ENOTCONN,
+        errno.ETIMEDOUT,
+    }
+)
+
+
+def _nested_control_flow(error: Exception) -> BaseException | None:
+    """Find control flow hidden by a dependency wrapper, without cycling."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if not isinstance(current, Exception):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _is_recoverable_session_error(error: BaseException) -> bool:
+    """Classify only explicit, expected operational session failures."""
+
+    if isinstance(error, ProductionSessionError):
+        return error.recoverable
+    if isinstance(error, _RECOVERABLE_SESSION_EXCEPTIONS):
+        return True
+    if not isinstance(error, CoexistenceFailure):
+        return False
+    if error.category not in _RECOVERABLE_COEXISTENCE_CATEGORIES:
+        return False
+
+    cause = error.__cause__
+    if cause is None:
+        return True
+    if isinstance(cause, CoexistenceFailure):
+        return _is_recoverable_session_error(cause)
+    if isinstance(cause, _RECOVERABLE_SESSION_EXCEPTIONS):
+        return True
+    if isinstance(cause, OSError):
+        return cause.errno in _RECOVERABLE_OS_ERRNOS
+    # dbus-next exposes remote failures through a stable D-Bus error name.
+    return isinstance(getattr(cause, "type", None), str)
+
+
+def _translate_session_error(
+    category: ProductionSessionCategory,
+    phase: str,
+    error: Exception,
+) -> ProductionSessionError:
+    return ProductionSessionError(
+        category,
+        phase,
+        type(error).__name__,
+        recoverable=_is_recoverable_session_error(error),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,16 +378,18 @@ class InternalProductionSession:
                 self._handshake = handshake
                 self._descriptor_handshakes += 1
                 await self._checkpoint("after_descriptor_handshake")
-            except BaseException as error:
-                cleanup_errors = await self._cleanup_resources()
-                self.state = ProductionSessionState.FAILED
-                self._annotate_cleanup(error, cleanup_errors)
-                if isinstance(error, asyncio.CancelledError):
-                    raise
+            except asyncio.CancelledError as error:
+                await self._record_failed_operation(error)
+                raise
+            except Exception as error:
+                await self._record_failed_operation(error)
+                control_flow = _nested_control_flow(error)
+                if control_flow is not None:
+                    raise control_flow
                 if isinstance(error, ProductionSessionError):
                     raise
-                raise ProductionSessionError(
-                    self._open_category(phase), phase, type(error).__name__
+                raise _translate_session_error(
+                    self._open_category(phase), phase, error
                 ) from error
 
             self.state = ProductionSessionState.READY
@@ -305,19 +428,22 @@ class InternalProductionSession:
             )
             try:
                 await self._wait_for_activation_start()
-            except BaseException as error:
+            except asyncio.CancelledError as error:
                 await self._abort_activation()
-                cleanup_errors = await self._cleanup_resources()
-                self.state = ProductionSessionState.FAILED
-                self._annotate_cleanup(error, cleanup_errors)
-                if isinstance(error, asyncio.CancelledError):
-                    raise
+                await self._record_failed_operation(error)
+                raise
+            except Exception as error:
+                await self._abort_activation()
+                await self._record_failed_operation(error)
+                control_flow = _nested_control_flow(error)
+                if control_flow is not None:
+                    raise control_flow
                 if isinstance(error, ProductionSessionError):
                     raise
-                raise ProductionSessionError(
+                raise _translate_session_error(
                     ProductionSessionCategory.ACTIVATION_FAILED,
                     "start",
-                    type(error).__name__,
+                    error,
                 ) from error
             self._hr_activations += 1
             self.state = ProductionSessionState.STREAMING
@@ -352,21 +478,30 @@ class InternalProductionSession:
             if self._activation_task in done:
                 try:
                     self._activation_task.result()
-                except BaseException as error:
-                    if isinstance(error, asyncio.CancelledError):
-                        raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    control_flow = _nested_control_flow(error)
+                    if control_flow is not None:
+                        raise control_flow
                     self.state = ProductionSessionState.FAILED
-                    raise ProductionSessionError(
+                    raise _translate_session_error(
                         ProductionSessionCategory.RECEIVE_FAILED,
                         "receive_report",
-                        type(error).__name__,
+                        error,
                     ) from error
                 raise ProductionSessionError(
                     ProductionSessionCategory.RECEIVE_FAILED,
                     "receive_report",
                     "activation ended before a report arrived",
+                    recoverable=True,
                 )
-            raise TimeoutError("no heart-rate report arrived before timeout")
+            raise ProductionSessionError(
+                ProductionSessionCategory.RECEIVE_FAILED,
+                "receive_report",
+                "no heart-rate report arrived before timeout",
+                recoverable=True,
+            )
         finally:
             if not get_task.done():
                 get_task.cancel()
@@ -382,18 +517,20 @@ class InternalProductionSession:
                 raise ProductionSessionStateError("stop", self.state)
             try:
                 await self._stop_locked()
-            except BaseException as error:
-                cleanup_errors = await self._cleanup_resources()
-                self.state = ProductionSessionState.FAILED
-                self._annotate_cleanup(error, cleanup_errors)
-                if isinstance(error, asyncio.CancelledError):
-                    raise
+            except asyncio.CancelledError as error:
+                await self._record_failed_operation(error)
+                raise
+            except Exception as error:
+                await self._record_failed_operation(error)
+                control_flow = _nested_control_flow(error)
+                if control_flow is not None:
+                    raise control_flow
                 if isinstance(error, ProductionSessionError):
                     raise
-                raise ProductionSessionError(
+                raise _translate_session_error(
                     ProductionSessionCategory.STOP_FAILED,
                     "stop",
-                    type(error).__name__,
+                    error,
                 ) from error
 
     async def close(self) -> None:
@@ -453,12 +590,14 @@ class InternalProductionSession:
                 ProductionSessionCategory.STOP_FAILED,
                 "stop",
                 "canonical HR cleanup timed out",
+                recoverable=True,
             ) from error
         if not result.stop_acknowledged:
             raise ProductionSessionError(
                 ProductionSessionCategory.STOP_FAILED,
                 "stop",
                 "canonical STOP_HR acknowledgement was not observed",
+                recoverable=True,
             )
         self._hr_stops += 1
         self._clear_activation()
@@ -540,6 +679,11 @@ class InternalProductionSession:
             self._client_connected = False
         return errors
 
+    async def _record_failed_operation(self, error: BaseException) -> None:
+        cleanup_errors = await self._cleanup_resources()
+        self.state = ProductionSessionState.FAILED
+        self._annotate_cleanup(error, cleanup_errors)
+
     async def _checkpoint(self, phase: str) -> BlueZCoexistenceState:
         assert self._initial_state is not None
         current = await asyncio.wait_for(
@@ -560,6 +704,7 @@ class InternalProductionSession:
                 ProductionSessionCategory.PREFLIGHT_FAILED,
                 phase,
                 "BlueZ adapter or device connection invariant failed",
+                recoverable=True,
             )
 
     @staticmethod

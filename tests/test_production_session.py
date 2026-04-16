@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import hashlib
 import unittest
 from contextlib import asynccontextmanager, redirect_stderr
@@ -23,6 +24,9 @@ from airpods_hr.aap import (
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import (
     BlueZCoexistenceState,
+    CoexistenceCategory,
+    CoexistenceFailure,
+    CoexistencePhase,
     KernelL2CAPLocalRXObservation,
 )
 from airpods_hr.discovery import AirPodsCandidate
@@ -296,15 +300,18 @@ def make_session(
     *,
     frames: list[bytes] | None = None,
     events: list[str] | None = None,
+    client=None,
+    registration=None,
+    transport=None,
     handshake=None,
     monitor_factory=None,
     start_timeout: float = 1.0,
     stop_timeout: float = 1.0,
 ):
     event_log = events if events is not None else []
-    client = FakeClient(event_log)
-    registration = FakeRegistration(event_log)
-    transport = FakeTransport(event_log, frames)
+    client = client or FakeClient(event_log)
+    registration = registration or FakeRegistration(event_log)
+    transport = transport or FakeTransport(event_log, frames)
     handshake_session = handshake or FakeHandshake(event_log)
     session = InternalProductionSession(
         client,
@@ -437,6 +444,88 @@ class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(transport.open_calls), 1)
         self.assertEqual(handshake.calls, 0)
         self.assertEqual(transport.close_calls, 1)
+        self.assertFalse(raised.exception.recoverable)
+
+    async def test_known_disconnected_preflight_is_recoverable(self) -> None:
+        events: list[str] = []
+        disconnected = CoexistenceFailure(
+            CoexistenceCategory.AIRPODS_NOT_CONNECTED,
+            CoexistencePhase.PREFLIGHT,
+        )
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            client=FakeClient(events, preflight_error=disconnected),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.PREFLIGHT_FAILED,
+        )
+        self.assertTrue(raised.exception.recoverable)
+
+    async def test_programmer_error_during_open_is_terminal(self) -> None:
+        events: list[str] = []
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            transport=FakeTransport(
+                events, open_error=TypeError("unexpected implementation bug")
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.TRANSPORT_FAILED,
+        )
+        self.assertEqual(raised.exception.detail, "TypeError")
+        self.assertFalse(raised.exception.recoverable)
+
+    async def test_unsupported_kernel_bind_semantics_are_terminal(self) -> None:
+        events: list[str] = []
+        platform_error = CoexistenceFailure(
+            CoexistenceCategory.L2CAP_BIND_FAILED,
+            CoexistencePhase.L2CAP_CONNECTION,
+        )
+        platform_error.__cause__ = OSError(
+            errno.EINVAL, "unsupported L2CAP bind semantics"
+        )
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            transport=FakeTransport(events, open_error=platform_error),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.TRANSPORT_FAILED,
+        )
+        self.assertFalse(raised.exception.recoverable)
+
+    async def test_wrapped_cancellation_remains_cancellation(self) -> None:
+        events: list[str] = []
+        cancellation = asyncio.CancelledError()
+        wrapped = CoexistenceFailure(
+            CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+            CoexistencePhase.PROFILE_REGISTRATION,
+        )
+        wrapped.__cause__ = cancellation
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            registration=FakeRegistration(events, register_error=wrapped),
+        )
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await session.open()
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
 
     async def test_partial_open_failures_close_owned_resources(self) -> None:
         for failure_phase in ("registration", "transport"):
@@ -681,6 +770,35 @@ class ProductionSessionStreamingTests(unittest.IsolatedAsyncioTestCase):
         report = await session.receive_report(timeout=1)
         self.assertEqual(report.bpm, 90)
         await stop_with_ack(session, transport)
+        await session.close()
+
+    async def test_unexpected_receive_bug_is_terminal(self) -> None:
+        fail = asyncio.Event()
+
+        class BuggyMonitor:
+            def __init__(self, progress) -> None:
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake, stop_event
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await fail.wait()
+                raise TypeError("unexpected report-processing bug")
+
+        session, _, _, _, _, _ = make_session(monitor_factory=BuggyMonitor)
+        await session.open()
+        await session.start()
+        fail.set()
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.receive_report(timeout=1)
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.RECEIVE_FAILED,
+        )
+        self.assertEqual(raised.exception.detail, "TypeError")
+        self.assertFalse(raised.exception.recoverable)
         await session.close()
 
 

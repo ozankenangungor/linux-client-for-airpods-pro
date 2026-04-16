@@ -269,6 +269,13 @@ class AirPodsHubDaemon:
                 owned_listener = self._acquire_listener()
                 session_factory_attempted = True
                 self._session = self._session_factory()
+                self._server = await asyncio.start_unix_server(
+                    self._handle_client,
+                    sock=owned_listener,
+                    limit=MAX_FRAME_SIZE + 1,
+                    cleanup_socket=False,
+                )
+                owned_listener = None
             while True:
                 try:
                     async with self._lifecycle_lock:
@@ -290,14 +297,6 @@ class AirPodsHubDaemon:
                     continue
                 self._reset_recovery_backoff()
                 break
-            async with self._lifecycle_lock:
-                self._server = await asyncio.start_unix_server(
-                    self._handle_client,
-                    sock=owned_listener,
-                    limit=MAX_FRAME_SIZE + 1,
-                    cleanup_socket=False,
-                )
-                owned_listener = None
         except BaseException as error:
             async with self._lifecycle_lock:
                 self.state = DaemonState.FAILED
@@ -622,6 +621,10 @@ class AirPodsHubDaemon:
         )
 
     async def _subscribe(self, client: _Client) -> bool:
+        if self.state is DaemonState.STARTING:
+            raise RequestError(
+                "service_unavailable", "sensor service is unavailable"
+            )
         async with self._lifecycle_lock:
             if client.subscribed:
                 return True
