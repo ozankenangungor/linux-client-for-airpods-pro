@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from airpods_hr.heartrate import HeartRateReport
@@ -23,3 +23,6 @@ class SensorSession(Protocol):
 
 
 SessionFactory = Callable[[], SensorSession]
+SessionErrorClassifier = Callable[[BaseException], bool]
+SessionCleanupVerifier = Callable[[SensorSession, BaseException], bool]
+RecoverySleeper = Callable[[float], Awaitable[None]]

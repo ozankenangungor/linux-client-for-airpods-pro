@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import math
 import os
 import socket
 import stat
@@ -26,11 +27,18 @@ from airpods_hr._hubd.protocol import (
     heart_rate_event,
     response,
 )
-from airpods_hr._hubd.session import SensorSession, SessionFactory
+from airpods_hr._hubd.session import (
+    RecoverySleeper,
+    SensorSession,
+    SessionCleanupVerifier,
+    SessionErrorClassifier,
+    SessionFactory,
+)
 
 
 DEFAULT_SOCKET_NAME = "airpods-hubd.sock"
 DEFAULT_OPERATION_TIMEOUT = 10.0
+DEFAULT_RECOVERY_DELAYS = (1.0, 2.0, 5.0, 10.0)
 _UNIX_PATH_MAX_BYTES = 107
 
 
@@ -62,6 +70,21 @@ class DaemonAlreadyRunningError(HubDaemonError):
 
 
 PeerUidProvider = Callable[[Any], int]
+LifecycleOutput = Callable[[str], None]
+
+
+def _never_recover(_error: BaseException) -> bool:
+    return False
+
+
+def _cleanup_not_verified(
+    _session: SensorSession, _error: BaseException
+) -> bool:
+    return False
+
+
+def _discard_output(_message: str) -> None:
+    pass
 
 
 def socket_path_from_environment() -> Path:
@@ -167,9 +190,18 @@ class AirPodsHubDaemon:
         *,
         peer_uid_provider: PeerUidProvider = linux_peer_uid,
         operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+        session_error_is_recoverable: SessionErrorClassifier = _never_recover,
+        session_cleanup_completed: SessionCleanupVerifier = _cleanup_not_verified,
+        recovery_delays: tuple[float, ...] = DEFAULT_RECOVERY_DELAYS,
+        recovery_sleep: RecoverySleeper = asyncio.sleep,
+        lifecycle_output: LifecycleOutput = _discard_output,
     ) -> None:
         if operation_timeout <= 0:
             raise ValueError("operation_timeout must be positive")
+        if not recovery_delays or any(
+            delay <= 0 or not math.isfinite(delay) for delay in recovery_delays
+        ):
+            raise ValueError("recovery delays must be finite and positive")
         self.socket_path = (
             Path(socket_path)
             if socket_path is not None
@@ -178,12 +210,19 @@ class AirPodsHubDaemon:
         self._session_factory = session_factory
         self._peer_uid_provider = peer_uid_provider
         self._operation_timeout = operation_timeout
+        self._session_error_is_recoverable = session_error_is_recoverable
+        self._session_cleanup_completed = session_cleanup_completed
+        self._recovery_delays = recovery_delays
+        self._recovery_sleep = recovery_sleep
+        self._lifecycle_output = lifecycle_output
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_lock = asyncio.Lock()
         self._session: SensorSession | None = None
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[_Client] = set()
         self._reader_task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
+        self._startup_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._handler_tasks: set[asyncio.Task[None]] = set()
         self._lock_path = self.socket_path.with_suffix(".lock")
@@ -191,6 +230,8 @@ class AirPodsHubDaemon:
         self._owned_socket_identity: tuple[int, int] | None = None
         self._hr_may_be_active = False
         self._start_attempted = False
+        self._shutdown_requested = False
+        self._recovery_delay_index = 0
         self.state = DaemonState.STOPPED
 
     @property
@@ -205,17 +246,22 @@ class AirPodsHubDaemon:
     def report_reader_active(self) -> bool:
         return self._reader_task is not None and not self._reader_task.done()
 
+    @property
+    def recovery_active(self) -> bool:
+        return self._recovery_task is not None and not self._recovery_task.done()
+
     async def start(self) -> None:
-        async with self._lifecycle_lock:
-            if self.state is not DaemonState.STOPPED:
-                raise HubDaemonError(f"cannot start daemon from {self.state.value}")
-            if self._start_attempted:
-                raise HubDaemonError("daemon objects are single-use")
-            self._start_attempted = True
-            self.state = DaemonState.STARTING
-            owned_listener: socket.socket | None = None
-            session_factory_attempted = False
-            try:
+        self._startup_task = asyncio.current_task()
+        owned_listener: socket.socket | None = None
+        session_factory_attempted = False
+        try:
+            async with self._lifecycle_lock:
+                if self.state is not DaemonState.STOPPED:
+                    raise HubDaemonError(f"cannot start daemon from {self.state.value}")
+                if self._start_attempted:
+                    raise HubDaemonError("daemon objects are single-use")
+                self._start_attempted = True
+                self.state = DaemonState.STARTING
                 _validate_socket_path(self.socket_path)
                 await self._before_process_lock()
                 self._acquire_process_lock()
@@ -223,7 +269,28 @@ class AirPodsHubDaemon:
                 owned_listener = self._acquire_listener()
                 session_factory_attempted = True
                 self._session = self._session_factory()
-                await self._bounded(self._session.open())
+            while True:
+                try:
+                    async with self._lifecycle_lock:
+                        await self._restore_session_locked()
+                except BaseException as error:
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    if not await self._dispose_current_session():
+                        raise SessionOperationError(
+                            "session cleanup did not complete"
+                        ) from error
+                    if not self._session_error_is_recoverable(error):
+                        raise
+                    self._lifecycle_output(
+                        "initial session establishment failed: recoverable="
+                        f"{self._safe_error_name(error)}"
+                    )
+                    await self._wait_before_recovery()
+                    continue
+                self._reset_recovery_backoff()
+                break
+            async with self._lifecycle_lock:
                 self._server = await asyncio.start_unix_server(
                     self._handle_client,
                     sock=owned_listener,
@@ -231,21 +298,50 @@ class AirPodsHubDaemon:
                     cleanup_socket=False,
                 )
                 owned_listener = None
-            except BaseException as error:
+        except BaseException as error:
+            async with self._lifecycle_lock:
                 self.state = DaemonState.FAILED
                 if owned_listener is not None:
                     owned_listener.close()
+                server = self._server
+                self._server = None
+                if server is not None:
+                    server.close()
                 self._remove_owned_socket()
                 if not session_factory_attempted:
                     self._release_process_lock()
-                if isinstance(error, asyncio.CancelledError):
-                    raise
-                if isinstance(
-                    error, (DaemonAlreadyRunningError, UnsafeSocketPathError)
-                ):
-                    raise
-                raise SessionOperationError("daemon startup failed") from error
+            if server is not None:
+                await server.wait_closed()
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if isinstance(error, (DaemonAlreadyRunningError, UnsafeSocketPathError)):
+                raise
+            raise SessionOperationError("daemon startup failed") from error
+        finally:
+            if self._startup_task is asyncio.current_task():
+                self._startup_task = None
+
+    async def _restore_session_locked(self) -> None:
+        if self._shutdown_requested:
+            raise asyncio.CancelledError
+        session = self._session
+        if session is None:
+            session = self._session_factory()
+            self._session = session
+        await self._bounded(session.open())
+        if self.subscriber_count == 0:
+            self._hr_may_be_active = False
             self.state = DaemonState.READY
+            return
+        self.state = DaemonState.STARTING_HR
+        self._hr_may_be_active = True
+        await self._bounded(session.start())
+        if self._shutdown_requested:
+            raise asyncio.CancelledError
+        self.state = DaemonState.STREAMING
+        self._reader_task = asyncio.create_task(
+            self._read_reports(), name="airpods-hubd-report-reader"
+        )
 
     async def _before_process_lock(self) -> None:
         """Run the private startup-boundary extension point."""
@@ -347,6 +443,19 @@ class AirPodsHubDaemon:
         async with self._shutdown_lock:
             if self.state is DaemonState.STOPPED:
                 return
+            self._shutdown_requested = True
+            cancellable = tuple(
+                task
+                for task in (self._startup_task, self._recovery_task)
+                if task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+            )
+            if cancellable:
+                self._lifecycle_output("shutdown while recovering")
+                for task in cancellable:
+                    task.cancel()
+                await asyncio.gather(*cancellable, return_exceptions=True)
             async with self._lifecycle_lock:
                 self.state = DaemonState.SHUTTING_DOWN
                 server = self._server
@@ -359,6 +468,7 @@ class AirPodsHubDaemon:
                         self._hr_may_be_active = False
                     except BaseException:
                         pass
+                self._hr_may_be_active = False
                 reader_task = self._reader_task
                 self._reader_task = None
                 if (
@@ -536,10 +646,18 @@ class AirPodsHubDaemon:
                 try:
                     await self._bounded(self._session.start())
                 except BaseException as error:
-                    self.state = DaemonState.FAILED
-                    await self._notify_service_failure_locked(exclude=client)
                     if isinstance(error, asyncio.CancelledError):
                         raise
+                    if self._session_error_is_recoverable(error):
+                        client.subscribed = True
+                        self._begin_recovery_locked(error)
+                        return False
+                    self._lifecycle_output(
+                        "terminal session failure: "
+                        f"{self._safe_error_name(error)}"
+                    )
+                    self.state = DaemonState.FAILED
+                    await self._notify_service_failure_locked(exclude=client)
                     raise RequestError(
                         "session_start_failed", "sensor service is unavailable"
                     ) from error
@@ -567,14 +685,21 @@ class AirPodsHubDaemon:
                     self._hr_may_be_active = False
                     self.state = DaemonState.READY
                 except BaseException as error:
-                    self.state = DaemonState.FAILED
-                    await self._notify_service_failure_locked(exclude=client)
                     if isinstance(error, asyncio.CancelledError):
                         raise
-                    stop_error = RequestError(
-                        "session_stop_failed", "sensor service is unavailable"
-                    )
-                    stop_cause = error
+                    if self._session_error_is_recoverable(error):
+                        self._begin_recovery_locked(error)
+                    else:
+                        self._lifecycle_output(
+                            "terminal session failure: "
+                            f"{self._safe_error_name(error)}"
+                        )
+                        self.state = DaemonState.FAILED
+                        await self._notify_service_failure_locked(exclude=client)
+                        stop_error = RequestError(
+                            "session_stop_failed", "sensor service is unavailable"
+                        )
+                        stop_cause = error
                 finally:
                     reader_task = self._reader_task
                     self._reader_task = None
@@ -598,17 +723,144 @@ class AirPodsHubDaemon:
                         self._spawn_background(self._disconnect_client(client))
         except asyncio.CancelledError:
             raise
-        except BaseException:
-            await self._receive_failed()
+        except BaseException as error:
+            await self._receive_failed(error)
 
-    async def _receive_failed(self) -> None:
+    async def _receive_failed(self, error: BaseException) -> None:
         async with self._lifecycle_lock:
             if self.state is not DaemonState.STREAMING:
                 return
-            self.state = DaemonState.FAILED
-            for client in self._clients:
-                client.subscribed = False
-            await self._notify_service_failure_locked()
+            if self._session_error_is_recoverable(error):
+                self._begin_recovery_locked(error)
+                return
+            self._lifecycle_output(
+                f"terminal session failure: {self._safe_error_name(error)}"
+            )
+            self._fail_terminal_locked()
+
+    def _begin_recovery_locked(self, error: BaseException) -> None:
+        if self._shutdown_requested or self.recovery_active:
+            return
+        self.state = DaemonState.STARTING
+        if self._reader_task is asyncio.current_task() or (
+            self._reader_task is not None and self._reader_task.done()
+        ):
+            self._reader_task = None
+        self._lifecycle_output(
+            f"HR session lost: recoverable={self._safe_error_name(error)}"
+        )
+        task = asyncio.create_task(
+            self._recover_session(), name="airpods-hubd-session-recovery"
+        )
+        self._recovery_task = task
+        task.add_done_callback(self._recovery_finished)
+
+    def _recovery_finished(self, task: asyncio.Task[None]) -> None:
+        if self._recovery_task is task:
+            self._recovery_task = None
+
+    async def _recover_session(self) -> None:
+        attempt = 0
+        try:
+            if not await self._dispose_current_session():
+                self._lifecycle_output(
+                    "terminal session failure: incomplete_cleanup"
+                )
+                async with self._lifecycle_lock:
+                    self._fail_terminal_locked()
+                return
+            while not self._shutdown_requested:
+                await self._wait_before_recovery()
+                if self._shutdown_requested:
+                    return
+                attempt += 1
+                self._lifecycle_output(f"recovery attempt {attempt}")
+                try:
+                    async with self._lifecycle_lock:
+                        await self._restore_session_locked()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    if not await self._dispose_current_session():
+                        self._lifecycle_output(
+                            "terminal session failure: incomplete_cleanup"
+                        )
+                        async with self._lifecycle_lock:
+                            self._fail_terminal_locked()
+                        return
+                    if not self._session_error_is_recoverable(error):
+                        self._lifecycle_output(
+                            "terminal session failure: "
+                            f"{self._safe_error_name(error)}"
+                        )
+                        async with self._lifecycle_lock:
+                            self._fail_terminal_locked()
+                        return
+                    self._lifecycle_output(
+                        f"recovery attempt {attempt} failed: "
+                        f"{self._safe_error_name(error)}"
+                    )
+                    continue
+                self._reset_recovery_backoff()
+                self._lifecycle_output("session restored")
+                return
+        except asyncio.CancelledError:
+            raise
+
+    async def _dispose_current_session(self) -> bool:
+        async with self._lifecycle_lock:
+            session = self._session
+            if session is None:
+                self._hr_may_be_active = False
+                return True
+            if self._hr_may_be_active:
+                try:
+                    await self._bounded(session.stop())
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    pass
+            self._hr_may_be_active = False
+            cleanup_complete = True
+            try:
+                await self._bounded(session.close())
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                cleanup_complete = self._session_cleanup_completed(session, error)
+                self._lifecycle_output(
+                    "failed session cleanup reported: "
+                    f"{self._safe_error_name(error)}"
+                )
+            if cleanup_complete and self._session is session:
+                self._session = None
+            return cleanup_complete
+
+    async def _wait_before_recovery(self) -> None:
+        index = min(self._recovery_delay_index, len(self._recovery_delays) - 1)
+        delay = self._recovery_delays[index]
+        self._recovery_delay_index += 1
+        self._lifecycle_output(f"recovery scheduled in {delay:g}s")
+        await self._recovery_sleep(delay)
+
+    def _reset_recovery_backoff(self) -> None:
+        self._recovery_delay_index = 0
+
+    def _fail_terminal_locked(self) -> None:
+        self.state = DaemonState.FAILED
+        for client in self._clients:
+            client.subscribed = False
+        message = error_response("service_failed")
+        for client in tuple(self._clients):
+            self._enqueue(client, message)
+
+    @staticmethod
+    def _safe_error_name(error: BaseException) -> str:
+        category = getattr(error, "category", None)
+        value = getattr(category, "value", None)
+        if isinstance(value, str):
+            return value
+        return type(error).__name__
 
     async def _notify_service_failure_locked(
         self, *, exclude: _Client | None = None
