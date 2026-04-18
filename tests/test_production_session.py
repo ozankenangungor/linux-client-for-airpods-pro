@@ -140,9 +140,13 @@ class FakeClient:
         events: list[str],
         *,
         preflight_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+        snapshot_error_at: int | None = None,
     ) -> None:
         self.events = events
         self.preflight_error = preflight_error
+        self.close_error = close_error
+        self.snapshot_error_at = snapshot_error_at
         self.close_calls = 0
         self.snapshot_calls = 0
 
@@ -160,11 +164,15 @@ class FakeClient:
         self.events.append("snapshot")
         self.snapshot_calls += 1
         self.selected = selected
+        if self.snapshot_calls == self.snapshot_error_at:
+            raise TimeoutError("synthetic cleanup checkpoint failure")
         return state()
 
     def close(self) -> None:
         self.events.append("client_close")
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeRegistration:
@@ -173,9 +181,11 @@ class FakeRegistration:
         events: list[str],
         *,
         register_error: BaseException | None = None,
+        unregister_error: BaseException | None = None,
     ) -> None:
         self.events = events
         self.register_error = register_error
+        self.unregister_error = unregister_error
         self.register_calls = 0
         self.unregister_calls = 0
         self.registered_count = 0
@@ -190,6 +200,8 @@ class FakeRegistration:
     async def unregister(self) -> None:
         self.events.append("unregister")
         self.unregister_calls += 1
+        if self.unregister_error is not None:
+            raise self.unregister_error
 
 
 class FakeTransport:
@@ -199,6 +211,8 @@ class FakeTransport:
         frames: list[bytes] | None = None,
         *,
         open_error: BaseException | None = None,
+        collection_exit_error: BaseException | None = None,
+        close_error: BaseException | None = None,
         imtu: int = 2048,
     ) -> None:
         self.events = events
@@ -206,6 +220,8 @@ class FakeTransport:
         for frame in frames or []:
             self.frames.put_nowait(frame)
         self.open_error = open_error
+        self.collection_exit_error = collection_exit_error
+        self.close_error = close_error
         self.application_payloads_sent = 0
         self.dropped_frames = 0
         self.pending_receive_frames = 0
@@ -243,6 +259,8 @@ class FakeTransport:
         finally:
             self.events.append("collect_exit")
             self.collect_exits += 1
+            if self.collection_exit_error is not None:
+                raise self.collection_exit_error
 
     def send_handshake_request(self) -> None:
         self.application_payloads_sent += 1
@@ -264,6 +282,8 @@ class FakeTransport:
     def close(self) -> None:
         self.events.append("transport_close")
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeHandshake:
@@ -340,6 +360,69 @@ def dbus_coexistence_failure(
 
 
 class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cleanup_failure_never_claims_complete_release(self) -> None:
+        cases = (
+            "collection_exit",
+            "transport_close",
+            "registration_unregister",
+            "client_close",
+        )
+        for boundary in cases:
+            with self.subTest(boundary=boundary):
+                events: list[str] = []
+                failure = RuntimeError(f"{boundary} failed")
+                client = FakeClient(
+                    events,
+                    close_error=(failure if boundary == "client_close" else None),
+                )
+                registration = FakeRegistration(
+                    events,
+                    unregister_error=(
+                        failure
+                        if boundary == "registration_unregister"
+                        else None
+                    ),
+                )
+                transport = FakeTransport(
+                    events,
+                    collection_exit_error=(
+                        failure if boundary == "collection_exit" else None
+                    ),
+                    close_error=(
+                        failure if boundary == "transport_close" else None
+                    ),
+                )
+                session, *_ = make_session(
+                    events=events,
+                    client=client,
+                    registration=registration,
+                    transport=transport,
+                )
+                await session.open()
+
+                with self.assertRaises(ProductionSessionError) as raised:
+                    await session.close()
+
+                self.assertEqual(
+                    raised.exception.category,
+                    ProductionSessionCategory.CLEANUP_FAILED,
+                )
+                self.assertIs(session.state, ProductionSessionState.FAILED)
+                self.assertFalse(session.cleanup_complete)
+                self.assertEqual(transport.collect_exits, 1)
+                self.assertEqual(transport.close_calls, 1)
+                self.assertEqual(registration.unregister_calls, 1)
+                self.assertEqual(client.close_calls, 1)
+                if boundary == "collection_exit":
+                    self.assertTrue(session._collection_entered)
+                    self.assertIsNotNone(session._collection_context)
+                elif boundary == "transport_close":
+                    self.assertTrue(session._transport_owned)
+                elif boundary == "registration_unregister":
+                    self.assertTrue(session._registration_owned)
+                else:
+                    self.assertTrue(session._client_connected)
+
     async def test_initial_state_and_invalid_operations(self) -> None:
         session, *_ = make_session()
         self.assertIs(session.state, ProductionSessionState.CLOSED)
@@ -351,6 +434,71 @@ class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
             await session.stop()
         await session.close()
         self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+    async def test_cleanup_checkpoint_error_does_not_erase_release_proof(
+        self,
+    ) -> None:
+        events: list[str] = []
+        client = FakeClient(events, snapshot_error_at=4)
+        session, _, registration, transport, _, _ = make_session(
+            events=events, client=client
+        )
+        await session.open()
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.close()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.CLEANUP_FAILED,
+        )
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+        self.assertTrue(session.cleanup_complete)
+        self.assertEqual(transport.close_calls, 1)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(client.close_calls, 1)
+
+    async def test_cleanup_cancellation_remains_control_flow(self) -> None:
+        events: list[str] = []
+        cancellation = asyncio.CancelledError()
+        transport = FakeTransport(events, close_error=cancellation)
+        session, client, registration, _, _, _ = make_session(
+            events=events, transport=transport
+        )
+        await session.open()
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await session.close()
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertFalse(session.cleanup_complete)
+        self.assertTrue(session._transport_owned)
+        self.assertEqual(registration.unregister_calls, 1)
+        self.assertEqual(client.close_calls, 1)
+
+    async def test_cleanup_retry_cannot_retroactively_prove_release(self) -> None:
+        events: list[str] = []
+        transport = FakeTransport(
+            events, close_error=RuntimeError("transport close failed")
+        )
+        session, *_ = make_session(events=events, transport=transport)
+        await session.open()
+
+        with self.assertRaises(ProductionSessionError):
+            await session.close()
+        transport.close_error = None
+        with self.assertRaises(ProductionSessionError) as retried:
+            await session.close()
+
+        self.assertEqual(
+            retried.exception.category,
+            ProductionSessionCategory.CLEANUP_FAILED,
+        )
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertFalse(session.cleanup_complete)
+        self.assertTrue(session._release_unproven)
+        self.assertEqual(transport.close_calls, 2)
 
     async def test_open_order_once_and_descriptor_gated_ready(self) -> None:
         session, client, registration, transport, handshake, events = make_session()

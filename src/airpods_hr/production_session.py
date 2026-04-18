@@ -308,6 +308,9 @@ class InternalProductionSession:
         self._transport_owned = False
         self._collection_context: AbstractAsyncContextManager[Any] | None = None
         self._collection_entered = False
+        # Some release APIs become no-ops after raising, so later retries cannot
+        # retroactively prove that the first release completed.
+        self._release_unproven = False
         self._initial_state: BlueZCoexistenceState | None = None
         self._handshake: AAPHandshakeResult | None = None
         self._activation_task: asyncio.Task[HeartRateMonitorSessionResult] | None = None
@@ -328,6 +331,20 @@ class InternalProductionSession:
             hr_activations=self._hr_activations,
             hr_stops=self._hr_stops,
             reports_received=self._reports_received,
+        )
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Return whether every potentially owned resource is proven released."""
+
+        return (
+            not self._release_unproven
+            and self._activation_task is None
+            and not self._collection_entered
+            and self._collection_context is None
+            and not self._transport_owned
+            and not self._registration_owned
+            and not self._client_connected
         )
 
     async def open(self) -> None:
@@ -450,11 +467,9 @@ class InternalProductionSession:
             try:
                 await self._wait_for_activation_start()
             except asyncio.CancelledError as error:
-                await self._abort_activation()
                 await self._record_failed_operation(error)
                 raise
             except Exception as error:
-                await self._abort_activation()
                 await self._record_failed_operation(error)
                 control_flow = _nested_control_flow(error)
                 if control_flow is not None:
@@ -570,13 +585,33 @@ class InternalProductionSession:
                 except BaseException as error:
                     errors.append(error)
             errors.extend(await self._cleanup_resources())
-            self.state = ProductionSessionState.CLOSED
+            self.state = (
+                ProductionSessionState.CLOSED
+                if self.cleanup_complete
+                else ProductionSessionState.FAILED
+            )
+            cancellation = next(
+                (
+                    error
+                    for error in errors
+                    if isinstance(error, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if cancellation is not None:
+                raise cancellation
             if errors:
                 raise ProductionSessionError(
                     ProductionSessionCategory.CLEANUP_FAILED,
                     "close",
                     type(errors[-1]).__name__,
                 ) from errors[-1]
+            if not self.cleanup_complete:
+                raise ProductionSessionError(
+                    ProductionSessionCategory.CLEANUP_FAILED,
+                    "close",
+                    "resource release remains unproven",
+                )
 
     async def _wait_for_activation_start(self) -> None:
         assert self._activation_started is not None
@@ -633,8 +668,13 @@ class InternalProductionSession:
                     asyncio.shield(self._activation_task),
                     timeout=self._stop_timeout,
                 )
+            except asyncio.CancelledError:
+                await self._cancel_activation_task()
+                raise
             except BaseException:
                 await self._cancel_activation_task()
+        if self._activation_task is not None and not self._activation_task.done():
+            raise RuntimeError("activation task cleanup did not complete")
         if self._activation_task is not None and self._activation_task.done():
             try:
                 result = self._activation_task.result()
@@ -652,6 +692,10 @@ class InternalProductionSession:
                 self._activation_task,
                 timeout=self._stop_timeout,
             )
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
         except BaseException:
             pass
 
@@ -663,30 +707,40 @@ class InternalProductionSession:
 
     async def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
+        release_uncertain = False
         if self._activation_task is not None:
             try:
                 await self._abort_activation()
             except BaseException as error:
                 errors.append(error)
+                release_uncertain = True
         if self._collection_entered and self._collection_context is not None:
             try:
                 await self._collection_context.__aexit__(None, None, None)
             except BaseException as error:
                 errors.append(error)
-            self._collection_entered = False
-        self._collection_context = None
+                release_uncertain = True
+            else:
+                self._collection_entered = False
+                self._collection_context = None
+        elif not self._collection_entered:
+            self._collection_context = None
         if self._transport_owned:
             try:
                 self._transport.close()
             except BaseException as error:
                 errors.append(error)
-            self._transport_owned = False
+                release_uncertain = True
+            else:
+                self._transport_owned = False
         if self._registration_owned:
             try:
                 await self._registration.unregister()
             except BaseException as error:
                 errors.append(error)
-            self._registration_owned = False
+                release_uncertain = True
+            else:
+                self._registration_owned = False
         if self._client_connected and self._initial_state is not None:
             try:
                 await self._checkpoint("after_cleanup")
@@ -697,13 +751,27 @@ class InternalProductionSession:
                 self._client.close()
             except BaseException as error:
                 errors.append(error)
-            self._client_connected = False
+                release_uncertain = True
+            else:
+                self._client_connected = False
+        if release_uncertain:
+            self._release_unproven = True
         return errors
 
     async def _record_failed_operation(self, error: BaseException) -> None:
         cleanup_errors = await self._cleanup_resources()
         self.state = ProductionSessionState.FAILED
         self._annotate_cleanup(error, cleanup_errors)
+        cancellation = next(
+            (
+                cleanup_error
+                for cleanup_error in cleanup_errors
+                if isinstance(cleanup_error, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancellation is not None:
+            raise cancellation
 
     async def _checkpoint(self, phase: str) -> BlueZCoexistenceState:
         assert self._initial_state is not None

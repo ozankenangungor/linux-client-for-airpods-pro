@@ -28,16 +28,32 @@ from airpods_hr._hubd.production import (
     minimum_daemon_operation_timeout,
 )
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
-from airpods_hr._hubd.server import DaemonState
+from airpods_hr._hubd.server import (
+    AirPodsHubDaemon,
+    DaemonState,
+    SessionOperationError,
+)
 from airpods_hr.heartrate import HeartRateReport
+from airpods_hr.heart_rate_session import (
+    HeartRateMonitorSessionResult,
+    HeartRateProgress,
+)
 from airpods_hr.production_session import (
     DEFAULT_REPORT_TIMEOUT,
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
+    InternalProductionSession,
     ProductionSessionCategory,
     ProductionSessionCounters,
     ProductionSessionError,
     ProductionSessionState,
+)
+from tests.test_production_session import (
+    FakeClient,
+    FakeHandshake,
+    FakeRegistration,
+    FakeTransport,
+    make_session,
 )
 from tools import probe_hubd_production
 from tools.probe_hubd_production import (
@@ -54,7 +70,7 @@ from tools.probe_hubd_production import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "e42a93b75b3e3cce853ad915e3e2d1d3bc3eab958f4d6f46aeb13270b5f3182c"
+    "72a14219cb9936b1a1d75cf156f74105cbcc5762ba611e47eac83e08beb6fcd5"
 )
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
@@ -122,6 +138,17 @@ class FakeBuilder:
         self.calls += 1
         self.kwargs = kwargs
         return self.session
+
+
+class SequenceBuilder:
+    def __init__(self, sessions: list[InternalProductionSession]) -> None:
+        self.sessions = sessions
+        self.calls = 0
+
+    def __call__(self, **_kwargs: Any) -> InternalProductionSession:
+        session = self.sessions[self.calls]
+        self.calls += 1
+        return session
 
 
 def process_lock_is_held(lock_path: Path) -> bool:
@@ -327,6 +354,188 @@ class ProbeClientTests(unittest.IsolatedAsyncioTestCase):
                 await server.wait_closed()
 
 
+class ProductionCleanupRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incomplete_initial_cleanup_forbids_replacement(self) -> None:
+        boundaries = (
+            "collection_exit",
+            "transport_close",
+            "registration_unregister",
+            "client_close",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                events: list[str] = []
+                cleanup_failure = RuntimeError(f"{boundary} failed")
+                client = FakeClient(
+                    events,
+                    close_error=(
+                        cleanup_failure if boundary == "client_close" else None
+                    ),
+                )
+                registration = FakeRegistration(
+                    events,
+                    unregister_error=(
+                        cleanup_failure
+                        if boundary == "registration_unregister"
+                        else None
+                    ),
+                )
+                transport = FakeTransport(
+                    events,
+                    collection_exit_error=(
+                        cleanup_failure
+                        if boundary == "collection_exit"
+                        else None
+                    ),
+                    close_error=(
+                        cleanup_failure
+                        if boundary == "transport_close"
+                        else None
+                    ),
+                )
+                failed, *_ = make_session(
+                    events=events,
+                    client=client,
+                    registration=registration,
+                    transport=transport,
+                    handshake=FakeHandshake(
+                        events, error=TimeoutError("temporary handshake failure")
+                    ),
+                )
+                replacement, *_ = make_session()
+                builder = SequenceBuilder([failed, replacement])
+                factory = ProductionSessionFactory(
+                    ProductionHubConfig(),
+                    output=lambda _message: None,
+                    builder=builder,
+                )
+
+                async def no_delay(_delay: float) -> None:
+                    await asyncio.sleep(0)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    daemon = AirPodsHubDaemon(
+                        factory,
+                        Path(directory) / "hubd.sock",
+                        session_error_is_recoverable=(
+                            hubd_production._is_recoverable_production_error
+                        ),
+                        session_cleanup_completed=(
+                            hubd_production._production_cleanup_completed
+                        ),
+                        recovery_sleep=no_delay,
+                    )
+                    try:
+                        with self.assertRaises(SessionOperationError):
+                            await daemon.start()
+
+                        self.assertEqual(factory.calls, 1)
+                        self.assertEqual(builder.calls, 1)
+                        self.assertIs(daemon.session, failed)
+                        self.assertIs(daemon.state, DaemonState.FAILED)
+                        self.assertFalse(daemon.report_reader_active)
+                        self.assertFalse(daemon.recovery_active)
+                        self.assertFalse(failed.cleanup_complete)
+                    finally:
+                        await daemon.shutdown()
+                        daemon._release_process_lock()
+
+    async def test_receive_cleanup_failure_forbids_replacement(self) -> None:
+        fail_receive = asyncio.Event()
+
+        class FailedMonitor:
+            def __init__(self, progress: Any) -> None:
+                self.progress = progress
+
+            async def run_collected(
+                self, transport: Any, handshake: Any, stop_event: Any
+            ) -> HeartRateMonitorSessionResult:
+                del transport, handshake, stop_event
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await fail_receive.wait()
+                raise ConnectionError("synthetic transport loss")
+
+        class StableMonitor:
+            def __init__(self, progress: Any) -> None:
+                self.progress = progress
+
+            async def run_collected(
+                self, transport: Any, handshake: Any, stop_event: Any
+            ) -> HeartRateMonitorSessionResult:
+                del transport, handshake
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await stop_event.wait()
+                return HeartRateMonitorSessionResult(
+                    samples_observed=0,
+                    stop_acknowledged=True,
+                    application_payloads_sent=0,
+                    control_frames_observed=0,
+                    non_hr_frames=0,
+                    malformed_hr_frames=0,
+                )
+
+        events: list[str] = []
+        transport = FakeTransport(
+            events, close_error=RuntimeError("transport close failed")
+        )
+        failed, *_ = make_session(
+            events=events,
+            transport=transport,
+            monitor_factory=FailedMonitor,
+        )
+        replacement, *_ = make_session(monitor_factory=StableMonitor)
+        builder = SequenceBuilder([failed, replacement])
+        factory = ProductionSessionFactory(
+            ProductionHubConfig(),
+            output=lambda _message: None,
+            builder=builder,
+        )
+
+        async def no_delay(_delay: float) -> None:
+            await asyncio.sleep(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = AirPodsHubDaemon(
+                factory,
+                Path(directory) / "hubd.sock",
+                session_error_is_recoverable=(
+                    hubd_production._is_recoverable_production_error
+                ),
+                session_cleanup_completed=(
+                    hubd_production._production_cleanup_completed
+                ),
+                recovery_sleep=no_delay,
+            )
+            client: ProbeClient | None = None
+            try:
+                await daemon.start()
+                client = await ProbeClient.connect(daemon.socket_path, timeout=1)
+                reply = await client.request("subscribe", stream="heart_rate")
+                self.assertTrue(reply["ok"])
+                fail_receive.set()
+                async with asyncio.timeout(1):
+                    while daemon.state is not DaemonState.FAILED:
+                        if factory.calls > 1:
+                            break
+                        await asyncio.sleep(0)
+
+                self.assertEqual(factory.calls, 1)
+                self.assertEqual(builder.calls, 1)
+                self.assertIs(daemon.session, failed)
+                self.assertIs(daemon.state, DaemonState.FAILED)
+                self.assertIs(failed.state, ProductionSessionState.FAILED)
+                self.assertFalse(failed.cleanup_complete)
+                self.assertTrue(failed._transport_owned)
+                self.assertFalse(daemon.report_reader_active)
+                self.assertFalse(daemon.recovery_active)
+                self.assertEqual(daemon.subscriber_count, 0)
+            finally:
+                if client is not None:
+                    await client.close()
+                await daemon.shutdown()
+                daemon._release_process_lock()
+
+
 class ProductionFactoryTests(unittest.TestCase):
     def test_factory_delegates_each_attempt_to_production_builder(self) -> None:
         config = ProductionHubConfig()
@@ -379,14 +588,24 @@ class ProductionFactoryTests(unittest.TestCase):
             hubd_production._is_recoverable_production_error(RuntimeError())
         )
 
-    def test_production_cleanup_requires_explicit_closed_state(self) -> None:
-        session = Mock(spec=["state"])
+    def test_production_cleanup_requires_closed_state_and_release_proof(
+        self,
+    ) -> None:
+        session = Mock(spec=["state", "cleanup_complete"])
         session.state = ProductionSessionState.CLOSED
+        session.cleanup_complete = True
         self.assertTrue(
             hubd_production._production_cleanup_completed(
                 session, RuntimeError()
             )
         )
+        session.cleanup_complete = False
+        self.assertFalse(
+            hubd_production._production_cleanup_completed(
+                session, RuntimeError()
+            )
+        )
+        session.cleanup_complete = True
         session.state = ProductionSessionState.FAILED
         self.assertFalse(
             hubd_production._production_cleanup_completed(

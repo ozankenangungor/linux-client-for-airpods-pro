@@ -135,7 +135,10 @@ def _is_recoverable_production_error(error: BaseException) -> bool:
 def _production_cleanup_completed(
     session: object, _error: BaseException
 ) -> bool:
-    return getattr(session, "state", None) is ProductionSessionState.CLOSED
+    return (
+        getattr(session, "state", None) is ProductionSessionState.CLOSED
+        and getattr(session, "cleanup_complete", False) is True
+    )
 
 
 @dataclass(frozen=True, slots=True)
