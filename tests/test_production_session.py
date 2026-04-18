@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from dbus_next.errors import DBusError
+
 from airpods_hr.aap import (
     AAP_HANDSHAKE_ACK,
     AAPDescriptorObservationTimeoutError,
@@ -326,6 +328,17 @@ def make_session(
     return session, client, registration, transport, handshake_session, event_log
 
 
+def dbus_coexistence_failure(
+    error_name: str,
+    *,
+    category: CoexistenceCategory = CoexistenceCategory.PREFLIGHT_FAILED,
+    phase: CoexistencePhase = CoexistencePhase.PREFLIGHT,
+) -> CoexistenceFailure:
+    failure = CoexistenceFailure(category, phase)
+    failure.__cause__ = DBusError(error_name, "synthetic test failure")
+    return failure
+
+
 class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_initial_state_and_invalid_operations(self) -> None:
         session, *_ = make_session()
@@ -465,6 +478,78 @@ class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
             ProductionSessionCategory.PREFLIGHT_FAILED,
         )
         self.assertTrue(raised.exception.recoverable)
+
+    async def test_transient_dbus_no_reply_is_recoverable(self) -> None:
+        events: list[str] = []
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            client=FakeClient(
+                events,
+                preflight_error=dbus_coexistence_failure(
+                    "org.freedesktop.DBus.Error.NoReply"
+                ),
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertTrue(raised.exception.recoverable)
+
+    async def test_bluez_invalid_arguments_is_terminal(self) -> None:
+        events: list[str] = []
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            registration=FakeRegistration(
+                events,
+                register_error=dbus_coexistence_failure(
+                    "org.bluez.Error.InvalidArguments",
+                    category=CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+                    phase=CoexistencePhase.PROFILE_REGISTRATION,
+                ),
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertFalse(raised.exception.recoverable)
+
+    async def test_bluez_not_supported_is_terminal(self) -> None:
+        events: list[str] = []
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            registration=FakeRegistration(
+                events,
+                register_error=dbus_coexistence_failure(
+                    "org.bluez.Error.NotSupported",
+                    category=CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+                    phase=CoexistencePhase.PROFILE_REGISTRATION,
+                ),
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertFalse(raised.exception.recoverable)
+
+    async def test_unknown_dbus_error_is_terminal(self) -> None:
+        events: list[str] = []
+        session, _, _, _, _, _ = make_session(
+            events=events,
+            client=FakeClient(
+                events,
+                preflight_error=dbus_coexistence_failure(
+                    "com.example.AirPods.Error.TemporarilyMysterious"
+                ),
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertFalse(raised.exception.recoverable)
 
     async def test_programmer_error_during_open_is_terminal(self) -> None:
         events: list[str] = []

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from dbus_next.errors import DBusError
+
 from airpods_hr.aap import (
     AAPDescriptorObservationTimeoutError,
     AAPHandshakeResult,
@@ -158,6 +160,26 @@ _RECOVERABLE_OS_ERRNOS = frozenset(
     }
 )
 
+_TRANSIENT_DBUS_ERROR_NAMES = frozenset(
+    {
+        "org.bluez.Error.NotConnected",
+        "org.bluez.Error.NotReady",
+        "org.freedesktop.DBus.Error.Disconnected",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.NoNetwork",
+        "org.freedesktop.DBus.Error.NoReply",
+        "org.freedesktop.DBus.Error.NoServer",
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.Timeout",
+    }
+)
+
+
+def _is_transient_dbus_error(error: BaseException) -> bool:
+    """Accept only D-Bus names that identify temporary service availability."""
+
+    return isinstance(error, DBusError) and error.type in _TRANSIENT_DBUS_ERROR_NAMES
+
 
 def _nested_control_flow(error: Exception) -> BaseException | None:
     """Find control flow hidden by a dependency wrapper, without cycling."""
@@ -193,8 +215,7 @@ def _is_recoverable_session_error(error: BaseException) -> bool:
         return True
     if isinstance(cause, OSError):
         return cause.errno in _RECOVERABLE_OS_ERRNOS
-    # dbus-next exposes remote failures through a stable D-Bus error name.
-    return isinstance(getattr(cause, "type", None), str)
+    return _is_transient_dbus_error(cause)
 
 
 def _translate_session_error(

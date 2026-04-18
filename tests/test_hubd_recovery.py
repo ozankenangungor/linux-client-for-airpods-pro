@@ -9,13 +9,26 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from dbus_next.errors import DBusError
+
+from airpods_hr._hubd.production import _is_recoverable_production_error
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
 from airpods_hr._hubd.server import (
     AirPodsHubDaemon,
     DaemonState,
     SessionOperationError,
 )
+from airpods_hr.bluez_coexistence import (
+    CoexistenceCategory,
+    CoexistenceFailure,
+    CoexistencePhase,
+)
 from airpods_hr.heartrate import HeartRateReport, parse_heart_rate_packet
+from airpods_hr.production_session import (
+    ProductionSessionCategory,
+    ProductionSessionError,
+    _translate_session_error,
+)
 from airpods_hr.protocol import (
     HEART_RATE_MARKER,
     HEART_RATE_REPORT_ID,
@@ -182,6 +195,20 @@ def canonical_report(bpm: int = 87) -> HeartRateReport:
     return parse_heart_rate_packet(HEART_RATE_MARKER + bytes(report))
 
 
+def production_dbus_error(error_name: str) -> ProductionSessionError:
+    dbus_error = DBusError(error_name, "synthetic D-Bus failure")
+    coexistence_error = CoexistenceFailure(
+        CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+        CoexistencePhase.PROFILE_REGISTRATION,
+    )
+    coexistence_error.__cause__ = dbus_error
+    return _translate_session_error(
+        ProductionSessionCategory.REGISTRATION_FAILED,
+        "compatibility_registration",
+        coexistence_error,
+    )
+
+
 class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -297,6 +324,56 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleeper.delays, [])
         self.assertFalse(daemon.recovery_active)
         self.assertEqual(daemon.state, DaemonState.FAILED)
+
+    async def test_bluez_invalid_arguments_is_terminal_without_retry(
+        self,
+    ) -> None:
+        production_error = production_dbus_error(
+            "org.bluez.Error.InvalidArguments"
+        )
+        failed = ScriptedSession(open_error=production_error)
+        sleeper = ImmediateSleeper()
+        factory = ScriptedFactory([failed])
+        daemon = AirPodsHubDaemon(
+            factory,
+            self.socket_path,
+            session_error_is_recoverable=_is_recoverable_production_error,
+            recovery_sleep=sleeper,
+        )
+        self.daemon = daemon
+
+        with self.assertRaises(SessionOperationError):
+            await daemon.start()
+
+        self.assertFalse(production_error.recoverable)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(sleeper.delays, [])
+        self.assertFalse(daemon.recovery_active)
+        self.assertEqual(daemon.state, DaemonState.FAILED)
+
+    async def test_transient_dbus_failure_retries(self) -> None:
+        production_error = production_dbus_error(
+            "org.freedesktop.DBus.Error.NoReply"
+        )
+        failed = ScriptedSession(open_error=production_error)
+        restored = ScriptedSession()
+        sleeper = ImmediateSleeper()
+        factory = ScriptedFactory([failed, restored])
+        daemon = AirPodsHubDaemon(
+            factory,
+            self.socket_path,
+            session_error_is_recoverable=_is_recoverable_production_error,
+            recovery_sleep=sleeper,
+        )
+        self.daemon = daemon
+
+        await daemon.start()
+
+        self.assertTrue(production_error.recoverable)
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(sleeper.delays, [1.0])
+        self.assertIs(daemon.session, restored)
+        self.assertEqual(daemon.state, DaemonState.READY)
 
     async def test_repeated_recoverable_failures_use_bounded_order(self) -> None:
         sleeper = ImmediateSleeper()
