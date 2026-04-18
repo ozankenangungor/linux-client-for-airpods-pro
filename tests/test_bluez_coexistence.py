@@ -17,6 +17,11 @@ from xml.etree import ElementTree
 
 from dbus_next.errors import DBusError
 
+from airpods_hr._hubd.session import (
+    ConnectionEpochRefreshError,
+    ConnectionEpochRefreshOutcome,
+    ConnectionEpochRefreshStage,
+)
 from airpods_hr.aap import (
     AAP_FRAME_SUMMARY_LIMIT,
     AAP_HANDSHAKE_ACK,
@@ -32,6 +37,7 @@ from airpods_hr.aap import (
 )
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import (
+    BlueZConnectionEpochRefresher,
     BlueZCompatibilityRegistration,
     BlueZCoexistenceSession,
     BlueZCoexistenceState,
@@ -819,6 +825,29 @@ class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.category, CoexistenceCategory.PREFLIGHT_FAILED
         )
 
+    async def test_device_connection_methods_use_selected_object_path(self) -> None:
+        selected = candidate()
+        device = SimpleNamespace(
+            call_disconnect=AsyncMock(), call_connect=AsyncMock()
+        )
+        proxy = SimpleNamespace(get_interface=Mock(return_value=device))
+        bus = SimpleNamespace(
+            introspect=AsyncMock(return_value=object()),
+            get_proxy_object=Mock(return_value=proxy),
+        )
+        client = DBusNextBlueZCoexistenceClient()
+        client._bus = bus
+
+        await client.disconnect_device(selected)
+        await client.connect_device(selected)
+
+        self.assertEqual(bus.introspect.await_count, 2)
+        bus.introspect.assert_awaited_with("org.bluez", selected.object_path)
+        self.assertEqual(bus.get_proxy_object.call_count, 2)
+        proxy.get_interface.assert_called_with("org.bluez.Device1")
+        device.call_disconnect.assert_awaited_once_with()
+        device.call_connect.assert_awaited_once_with()
+
     async def test_connect_rollback_failure_remains_unproven(self) -> None:
         bus = SimpleNamespace(
             connect=AsyncMock(),
@@ -883,6 +912,315 @@ class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
         await client.unregister_profile("/test/profile", profile)
 
         bus.unexport.assert_called_once_with("/test/profile", profile)
+
+
+class FakeEpochClient:
+    def __init__(
+        self,
+        *,
+        connected_states: list[bool],
+        candidate_count: int = 1,
+        disconnect_error: BaseException | None = None,
+        connect_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.connected_states = list(connected_states)
+        self.candidate_count = candidate_count
+        self.disconnect_error = disconnect_error
+        self.connect_error = connect_error
+        self.close_error = close_error
+        self.connect_calls = 0
+        self.close_calls = 0
+        self.disconnect_calls = 0
+        self.device_connect_calls = 0
+        self.snapshot_calls = 0
+        self.selected_candidates: list[AirPodsCandidate] = []
+        self._cleanup_complete = True
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self._cleanup_complete
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        self._cleanup_complete = False
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+        self._cleanup_complete = True
+
+    async def get_managed_objects(self):
+        selected = candidate()
+        objects = {
+            selected.adapter_path: {
+                "org.bluez.Adapter1": {
+                    "Address": SimpleNamespace(value=LOCAL_ADAPTER_ADDRESS),
+                    "Powered": SimpleNamespace(value=True),
+                    "Modalias": SimpleNamespace(value="usb:v1234p5678d9ABC"),
+                    "UUIDs": SimpleNamespace(value=list(ALL_COMPATIBILITY_UUIDS)),
+                }
+            }
+        }
+        addresses = (REMOTE_AIRPODS_ADDRESS, "AA:BB:CC:DD:EE:00")
+        for index in range(self.candidate_count):
+            address = addresses[index]
+            object_path = "/org/bluez/hci0/dev_" + address.replace(":", "_")
+            objects[object_path] = {
+                "org.bluez.Device1": {
+                    "Address": SimpleNamespace(value=address),
+                    "Adapter": SimpleNamespace(value=selected.adapter_path),
+                    "Name": SimpleNamespace(value=f"AirPods Test {index}"),
+                    "Alias": SimpleNamespace(value=f"AirPods Test {index}"),
+                    "Paired": SimpleNamespace(value=True),
+                    "Connected": SimpleNamespace(value=True),
+                }
+            }
+        return objects
+
+    async def snapshot(self, selected: AirPodsCandidate):
+        self.snapshot_calls += 1
+        self.selected_candidates.append(selected)
+        connected = (
+            self.connected_states.pop(0)
+            if len(self.connected_states) > 1
+            else self.connected_states[0]
+        )
+        return BlueZCoexistenceState(
+            selected, True, connected, ALL_COMPATIBILITY_UUIDS
+        )
+
+    async def disconnect_device(self, selected: AirPodsCandidate) -> None:
+        self.disconnect_calls += 1
+        self.selected_candidates.append(selected)
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
+
+    async def connect_device(self, selected: AirPodsCandidate) -> None:
+        self.device_connect_calls += 1
+        self.selected_candidates.append(selected)
+        if self.connect_error is not None:
+            raise self.connect_error
+
+
+class AdvancingEpochClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.now += delay
+        await asyncio.sleep(0)
+
+
+class BlockingEpochSleep:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = False
+
+    async def __call__(self, _delay: float) -> None:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class ConnectionEpochRefresherTests(unittest.IsolatedAsyncioTestCase):
+    def refresher(self, client: FakeEpochClient, **kwargs):
+        return BlueZConnectionEpochRefresher(
+            client_factory=lambda: client,
+            dbus_timeout=1,
+            state_timeout=kwargs.pop("state_timeout", 1),
+            poll_interval=kwargs.pop("poll_interval", 0.1),
+            **kwargs,
+        )
+
+    async def test_connected_target_is_replaced_once_and_proven(self) -> None:
+        client = FakeEpochClient(connected_states=[True, False, True])
+
+        result = await self.refresher(client).refresh()
+
+        self.assertIs(result, ConnectionEpochRefreshOutcome.REFRESHED)
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 1)
+        self.assertEqual(client.snapshot_calls, 3)
+        self.assertEqual(client.close_calls, 1)
+        self.assertTrue(client.cleanup_complete)
+        self.assertEqual(len(set(client.selected_candidates)), 1)
+
+    async def test_already_disconnected_target_is_not_touched(self) -> None:
+        client = FakeEpochClient(connected_states=[False])
+
+        result = await self.refresher(client).refresh()
+
+        self.assertIs(
+            result, ConnectionEpochRefreshOutcome.ALREADY_DISCONNECTED
+        )
+        self.assertEqual(client.disconnect_calls, 0)
+        self.assertEqual(client.device_connect_calls, 0)
+
+    async def test_zero_and_multiple_candidates_fail_closed(self) -> None:
+        for count in (0, 2):
+            with self.subTest(candidate_count=count):
+                client = FakeEpochClient(
+                    connected_states=[True], candidate_count=count
+                )
+                with self.assertRaises(ConnectionEpochRefreshError) as raised:
+                    await self.refresher(client).refresh()
+                self.assertIs(
+                    raised.exception.stage,
+                    ConnectionEpochRefreshStage.DISCOVERY,
+                )
+                self.assertEqual(client.disconnect_calls, 0)
+                self.assertEqual(client.device_connect_calls, 0)
+
+    async def test_disconnect_operational_error_is_typed(self) -> None:
+        client = FakeEpochClient(
+            connected_states=[True],
+            disconnect_error=DBusError("org.bluez.Error.Failed", "failed"),
+        )
+        with self.assertRaises(ConnectionEpochRefreshError) as raised:
+            await self.refresher(client).refresh()
+        self.assertIs(
+            raised.exception.stage,
+            ConnectionEpochRefreshStage.DISCONNECT_REQUEST,
+        )
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 0)
+
+    async def test_disconnected_state_timeout_is_typed_and_bounded(self) -> None:
+        clock = AdvancingEpochClock()
+        client = FakeEpochClient(connected_states=[True])
+        with self.assertRaises(ConnectionEpochRefreshError) as raised:
+            await self.refresher(
+                client,
+                clock=clock,
+                sleep=clock.sleep,
+                state_timeout=0.2,
+                poll_interval=0.1,
+            ).refresh()
+        self.assertIs(
+            raised.exception.stage,
+            ConnectionEpochRefreshStage.DISCONNECTED_STATE_PROOF,
+        )
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 0)
+
+    async def test_connect_operational_error_is_typed(self) -> None:
+        client = FakeEpochClient(
+            connected_states=[True, False],
+            connect_error=DBusError("org.bluez.Error.Failed", "failed"),
+        )
+        with self.assertRaises(ConnectionEpochRefreshError) as raised:
+            await self.refresher(client).refresh()
+        self.assertIs(
+            raised.exception.stage,
+            ConnectionEpochRefreshStage.CONNECT_REQUEST,
+        )
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 1)
+
+    async def test_connected_state_timeout_is_typed_and_bounded(self) -> None:
+        clock = AdvancingEpochClock()
+        client = FakeEpochClient(connected_states=[True, False, False])
+        with self.assertRaises(ConnectionEpochRefreshError) as raised:
+            await self.refresher(
+                client,
+                clock=clock,
+                sleep=clock.sleep,
+                state_timeout=0.2,
+                poll_interval=0.1,
+            ).refresh()
+        self.assertIs(
+            raised.exception.stage,
+            ConnectionEpochRefreshStage.CONNECTED_STATE_PROOF,
+        )
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 1)
+
+    async def test_expected_dbus_cleanup_failure_is_typed(self) -> None:
+        client = FakeEpochClient(
+            connected_states=[False],
+            close_error=DBusError("org.freedesktop.DBus.Error.Failed", "failed"),
+        )
+        with self.assertRaises(ConnectionEpochRefreshError) as raised:
+            await self.refresher(client).refresh()
+        self.assertIs(
+            raised.exception.stage, ConnectionEpochRefreshStage.DBUS_CLEANUP
+        )
+
+    async def test_unexpected_programming_error_is_not_operational(self) -> None:
+        client = FakeEpochClient(connected_states=[True])
+        client.disconnect_error = AssertionError("synthetic invariant failure")
+        with self.assertRaisesRegex(AssertionError, "invariant"):
+            await self.refresher(client).refresh()
+
+    async def test_cancellation_during_disconnect_proof_propagates(self) -> None:
+        blocker = BlockingEpochSleep()
+        client = FakeEpochClient(connected_states=[True])
+        task = asyncio.create_task(
+            self.refresher(client, sleep=blocker).refresh()
+        )
+        await asyncio.wait_for(blocker.entered.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(blocker.cancelled)
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 0)
+        self.assertEqual(client.close_calls, 1)
+
+    async def test_cancellation_during_dbus_request_propagates(self) -> None:
+        entered = asyncio.Event()
+        cancelled = False
+        client = FakeEpochClient(connected_states=[True])
+
+        async def blocked_disconnect(_selected: AirPodsCandidate) -> None:
+            nonlocal cancelled
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+
+        client.disconnect_device = blocked_disconnect
+        task = asyncio.create_task(self.refresher(client).refresh())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(cancelled)
+        self.assertEqual(client.device_connect_calls, 0)
+        self.assertEqual(client.close_calls, 1)
+
+    async def test_cancellation_during_reconnect_proof_propagates(self) -> None:
+        blocker = BlockingEpochSleep()
+        client = FakeEpochClient(connected_states=[True, False, False])
+        task = asyncio.create_task(
+            self.refresher(client, sleep=blocker).refresh()
+        )
+        await asyncio.wait_for(blocker.entered.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(blocker.cancelled)
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.device_connect_calls, 1)
+        self.assertEqual(client.close_calls, 1)
+
+    def test_production_refresher_has_no_hard_coded_target_address(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src/airpods_hr/bluez_coexistence.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(REMOTE_AIRPODS_ADDRESS, source)
 
 
 class ProfileLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -2401,8 +2739,6 @@ class StaticSafetyTests(unittest.TestCase):
             "HeartRateMonitorSession",
         }
         forbidden_dbus_calls = {
-            "call_connect",
-            "call_disconnect",
             "call_connect_profile",
             "call_disconnect_profile",
         }

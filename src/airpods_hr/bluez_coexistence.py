@@ -5,18 +5,25 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import math
 import os
 import socket
 import struct
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from time import monotonic
 from typing import Any, Protocol
 
+from dbus_next.errors import DBusError
 from dbus_next.service import ServiceInterface, method
 
+from airpods_hr._connection_epoch import (
+    ConnectionEpochRefreshError,
+    ConnectionEpochRefreshOutcome,
+    ConnectionEpochRefreshStage,
+)
 from airpods_hr.aap import (
     AAP_HANDSHAKE_REQUEST,
     AAPDescriptorObservationTimeoutError,
@@ -316,6 +323,7 @@ class DBusNextBlueZCoexistenceClient:
     BLUEZ_SERVICE = "org.bluez"
     OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
     PROFILE_MANAGER_INTERFACE = "org.bluez.ProfileManager1"
+    DEVICE_INTERFACE = "org.bluez.Device1"
 
     def __init__(self) -> None:
         self._bus: Any | None = None
@@ -477,6 +485,29 @@ class DBusNextBlueZCoexistenceClient:
             )
         return BlueZCoexistenceState(candidate, powered, connected, uuids)
 
+    async def disconnect_device(self, candidate: AirPodsCandidate) -> None:
+        """Request one normal BlueZ disconnect for the selected device."""
+
+        device = await self._device_interface(candidate)
+        await device.call_disconnect()
+
+    async def connect_device(self, candidate: AirPodsCandidate) -> None:
+        """Request one normal BlueZ connection for the selected device."""
+
+        device = await self._device_interface(candidate)
+        await device.call_connect()
+
+    async def _device_interface(self, candidate: AirPodsCandidate) -> Any:
+        if self._bus is None:
+            raise RuntimeError("BlueZ client is not connected")
+        introspection = await self._bus.introspect(
+            self.BLUEZ_SERVICE, candidate.object_path
+        )
+        proxy = self._bus.get_proxy_object(
+            self.BLUEZ_SERVICE, candidate.object_path, introspection
+        )
+        return proxy.get_interface(self.DEVICE_INTERFACE)
+
     async def register_profile(
         self,
         object_path: str,
@@ -541,6 +572,163 @@ class DBusNextBlueZCoexistenceClient:
             raise cleanup_error
         if primary_error is not None:
             raise primary_error
+
+
+_EXPECTED_EPOCH_OPERATION_ERRORS = (
+    CoexistenceFailure,
+    DeviceDiscoveryError,
+    DBusError,
+    OSError,
+    TimeoutError,
+)
+
+
+class BlueZConnectionEpochRefresher:
+    """Perform one finite connection replacement for one paired AirPods target."""
+
+    def __init__(
+        self,
+        *,
+        dbus_timeout: float = DEFAULT_DBUS_TIMEOUT,
+        state_timeout: float = DEFAULT_L2CAP_CONNECT_TIMEOUT,
+        poll_interval: float = 0.1,
+        client_factory: Callable[[], DBusNextBlueZCoexistenceClient] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if any(
+            value <= 0 or not math.isfinite(value)
+            for value in (dbus_timeout, state_timeout, poll_interval)
+        ):
+            raise ValueError("connection epoch refresh timeouts must be positive")
+        self._dbus_timeout = dbus_timeout
+        self._state_timeout = state_timeout
+        self._poll_interval = poll_interval
+        self._client_factory = client_factory or DBusNextBlueZCoexistenceClient
+        self._sleep = sleep
+        self._clock = clock
+
+    async def refresh(self) -> ConnectionEpochRefreshOutcome:
+        client = self._client_factory()
+        primary_error: BaseException | None = None
+        result: ConnectionEpochRefreshOutcome | None = None
+        try:
+            result = await self._refresh(client)
+        except BaseException as error:
+            primary_error = error
+
+        cleanup_error: BaseException | None = None
+        try:
+            client.close()
+            if not client.cleanup_complete:
+                cleanup_error = ConnectionEpochRefreshError(
+                    ConnectionEpochRefreshStage.DBUS_CLEANUP
+                )
+        except BaseException as error:
+            if isinstance(error, _EXPECTED_EPOCH_OPERATION_ERRORS):
+                cleanup_error = ConnectionEpochRefreshError(
+                    ConnectionEpochRefreshStage.DBUS_CLEANUP
+                )
+                cleanup_error.__cause__ = error
+            elif isinstance(primary_error, asyncio.CancelledError):
+                primary_error.add_note(
+                    "connection epoch D-Bus cleanup also failed"
+                )
+            else:
+                raise
+
+        if primary_error is not None:
+            if cleanup_error is not None:
+                primary_error.add_note(
+                    "connection epoch D-Bus cleanup also failed"
+                )
+            raise primary_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        assert result is not None
+        return result
+
+    async def _refresh(
+        self, client: DBusNextBlueZCoexistenceClient
+    ) -> ConnectionEpochRefreshOutcome:
+        await self._run_stage(
+            ConnectionEpochRefreshStage.DISCOVERY, client.connect()
+        )
+        try:
+            candidates = await asyncio.wait_for(
+                BlueZDeviceDiscovery(client).discover_candidates(),
+                timeout=self._dbus_timeout,
+            )
+            candidate = select_single_candidate(candidates)
+            state = await asyncio.wait_for(
+                client.snapshot(candidate), timeout=self._dbus_timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except _EXPECTED_EPOCH_OPERATION_ERRORS as error:
+            raise ConnectionEpochRefreshError(
+                ConnectionEpochRefreshStage.DISCOVERY
+            ) from error
+
+        if not state.device_connected:
+            return ConnectionEpochRefreshOutcome.ALREADY_DISCONNECTED
+
+        await self._run_stage(
+            ConnectionEpochRefreshStage.DISCONNECT_REQUEST,
+            client.disconnect_device(candidate),
+        )
+        await self._prove_connected_state(
+            client,
+            candidate,
+            connected=False,
+            stage=ConnectionEpochRefreshStage.DISCONNECTED_STATE_PROOF,
+        )
+        await self._run_stage(
+            ConnectionEpochRefreshStage.CONNECT_REQUEST,
+            client.connect_device(candidate),
+        )
+        await self._prove_connected_state(
+            client,
+            candidate,
+            connected=True,
+            stage=ConnectionEpochRefreshStage.CONNECTED_STATE_PROOF,
+        )
+        return ConnectionEpochRefreshOutcome.REFRESHED
+
+    async def _run_stage(
+        self, stage: ConnectionEpochRefreshStage, operation: Awaitable[Any]
+    ) -> Any:
+        try:
+            return await asyncio.wait_for(operation, timeout=self._dbus_timeout)
+        except asyncio.CancelledError:
+            raise
+        except _EXPECTED_EPOCH_OPERATION_ERRORS as error:
+            raise ConnectionEpochRefreshError(stage) from error
+
+    async def _prove_connected_state(
+        self,
+        client: DBusNextBlueZCoexistenceClient,
+        candidate: AirPodsCandidate,
+        *,
+        connected: bool,
+        stage: ConnectionEpochRefreshStage,
+    ) -> None:
+        deadline = self._clock() + self._state_timeout
+        while True:
+            try:
+                state = await asyncio.wait_for(
+                    client.snapshot(candidate), timeout=self._dbus_timeout
+                )
+            except asyncio.CancelledError:
+                raise
+            except _EXPECTED_EPOCH_OPERATION_ERRORS as error:
+                raise ConnectionEpochRefreshError(stage) from error
+            if state.device_connected is connected:
+                return
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise ConnectionEpochRefreshError(stage) from TimeoutError()
+            await self._sleep(min(self._poll_interval, remaining))
 
 
 class _BlueZProfileObject(ServiceInterface):
