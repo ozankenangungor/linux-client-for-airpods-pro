@@ -345,6 +345,9 @@ class InternalProductionSession:
             and not self._transport_owned
             and not self._registration_owned
             and not self._client_connected
+            and self._client.cleanup_complete
+            and self._registration.cleanup_complete
+            and self._transport.cleanup_complete
         )
 
     async def open(self) -> None:
@@ -732,7 +735,13 @@ class InternalProductionSession:
                 errors.append(error)
                 release_uncertain = True
             else:
-                self._transport_owned = False
+                if self._transport.cleanup_complete:
+                    self._transport_owned = False
+                else:
+                    errors.append(
+                        RuntimeError("transport release remains unproven")
+                    )
+                    release_uncertain = True
         if self._registration_owned:
             try:
                 await self._registration.unregister()
@@ -740,7 +749,13 @@ class InternalProductionSession:
                 errors.append(error)
                 release_uncertain = True
             else:
-                self._registration_owned = False
+                if self._registration.cleanup_complete:
+                    self._registration_owned = False
+                else:
+                    errors.append(
+                        RuntimeError("registration release remains unproven")
+                    )
+                    release_uncertain = True
         if self._client_connected and self._initial_state is not None:
             try:
                 await self._checkpoint("after_cleanup")
@@ -753,7 +768,13 @@ class InternalProductionSession:
                 errors.append(error)
                 release_uncertain = True
             else:
-                self._client_connected = False
+                if self._client.cleanup_complete:
+                    self._client_connected = False
+                else:
+                    errors.append(
+                        RuntimeError("BlueZ client release remains unproven")
+                    )
+                    release_uncertain = True
         if release_uncertain:
             self._release_unproven = True
         return errors

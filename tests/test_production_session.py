@@ -149,9 +149,15 @@ class FakeClient:
         self.snapshot_error_at = snapshot_error_at
         self.close_calls = 0
         self.snapshot_calls = 0
+        self._cleanup_complete = True
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self._cleanup_complete
 
     async def connect(self) -> None:
         self.events.append("client_connect")
+        self._cleanup_complete = False
 
     async def preflight(self, *, require_connected: bool = True):
         self.events.append("preflight")
@@ -172,7 +178,9 @@ class FakeClient:
         self.events.append("client_close")
         self.close_calls += 1
         if self.close_error is not None:
+            self._cleanup_complete = False
             raise self.close_error
+        self._cleanup_complete = True
 
 
 class FakeRegistration:
@@ -189,11 +197,17 @@ class FakeRegistration:
         self.register_calls = 0
         self.unregister_calls = 0
         self.registered_count = 0
+        self._cleanup_complete = True
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self._cleanup_complete
 
     async def register(self, selected_state) -> None:
         self.events.append("register")
         self.register_calls += 1
         self.selected_state = selected_state
+        self._cleanup_complete = False
         if self.register_error is not None:
             raise self.register_error
 
@@ -201,7 +215,9 @@ class FakeRegistration:
         self.events.append("unregister")
         self.unregister_calls += 1
         if self.unregister_error is not None:
+            self._cleanup_complete = False
             raise self.unregister_error
+        self._cleanup_complete = True
 
 
 class FakeTransport:
@@ -243,10 +259,16 @@ class FakeTransport:
             preserved_txwin_size=True,
             verified=imtu == 2048,
         )
+        self._cleanup_complete = True
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self._cleanup_complete
 
     async def open(self, local_address: str, remote_address: str) -> None:
         self.events.append("transport_open")
         self.open_calls.append((local_address, remote_address))
+        self._cleanup_complete = False
         if self.open_error is not None:
             raise self.open_error
 
@@ -283,7 +305,9 @@ class FakeTransport:
         self.events.append("transport_close")
         self.close_calls += 1
         if self.close_error is not None:
+            self._cleanup_complete = False
             raise self.close_error
+        self._cleanup_complete = True
 
 
 class FakeHandshake:
@@ -1148,7 +1172,7 @@ class ProductionStaticSafetyTests(unittest.TestCase):
                 "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
             ),
             "src/airpods_hr/bluez_coexistence.py": (
-                "55824df2b95d698e60e972d52c500c7ef3e5901cb75793663bd6d9401e26305d"
+                "4fd967c6350a90b511b51064a5718c68b284517682eb4f15770a05c50351b2d2"
             ),
             "src/airpods_hr/monitor_cli.py": (
                 "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"

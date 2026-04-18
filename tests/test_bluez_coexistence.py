@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from xml.etree import ElementTree
 
+from dbus_next.errors import DBusError
+
 from airpods_hr.aap import (
     AAP_FRAME_SUMMARY_LIMIT,
     AAP_HANDSHAKE_ACK,
@@ -208,6 +210,7 @@ class FakeSocket:
         l2cap_getsockopt_results: list[bytes | BaseException] | None = None,
         l2cap_setsockopt_error: BaseException | None = None,
         local_endpoint: tuple[object, ...] | None = None,
+        close_results: list[BaseException | None] | None = None,
     ) -> None:
         self.frames = list(frames or [])
         self.connect_error = connect_error
@@ -216,6 +219,7 @@ class FakeSocket:
         self.l2cap_setsockopt_error = l2cap_setsockopt_error
         self.l2cap_options = l2cap_options()
         self.local_endpoint = local_endpoint
+        self.close_results = list(close_results or [])
         self.bound_endpoint: tuple[str, int] | None = None
         self.events: list[object] = []
         self.sent: list[bytes] = []
@@ -276,6 +280,10 @@ class FakeSocket:
     def close(self) -> None:
         self.close_calls += 1
         self.events.append("close")
+        if self.close_results:
+            result = self.close_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
 
 
 class FakeSocketModule:
@@ -811,6 +819,71 @@ class BlueZStateTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.category, CoexistenceCategory.PREFLIGHT_FAILED
         )
 
+    async def test_connect_rollback_failure_remains_unproven(self) -> None:
+        bus = SimpleNamespace(
+            connect=AsyncMock(),
+            disconnect=Mock(side_effect=[RuntimeError("disconnect failed"), None]),
+        )
+        bus.connect.return_value = bus
+        client = DBusNextBlueZCoexistenceClient()
+        client.get_managed_objects = AsyncMock(
+            side_effect=TimeoutError("managed objects unavailable")
+        )
+
+        with patch("dbus_next.aio.MessageBus", return_value=bus):
+            with self.assertRaises(CoexistenceFailure) as raised:
+                await client.connect()
+
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.BLUEZ_NOT_AVAILABLE
+        )
+        self.assertFalse(client.cleanup_complete)
+        client.close()
+        self.assertFalse(client.cleanup_complete)
+        self.assertEqual(bus.disconnect.call_count, 2)
+
+    async def test_profile_export_rollback_failure_preserves_primary(self) -> None:
+        manager = SimpleNamespace(
+            call_register_profile=AsyncMock(
+                side_effect=TimeoutError("registration reply timed out")
+            )
+        )
+        bus = SimpleNamespace(
+            export=Mock(),
+            unexport=Mock(side_effect=RuntimeError("unexport failed")),
+        )
+        client = DBusNextBlueZCoexistenceClient()
+        client._bus = bus
+        client._profile_manager = manager
+        client._variant = lambda _signature, value: value
+        record = build_bluez_sdp_service_records(
+            USBAdapterIdentity(0x1234, 0x5678, 0x9ABC)
+        )[0]
+
+        with self.assertRaises(TimeoutError) as raised:
+            await client.register_profile("/test/profile", SimpleNamespace(), record)
+
+        self.assertIn("profile export rollback", " ".join(raised.exception.__notes__))
+        self.assertFalse(client.cleanup_complete)
+
+    async def test_unregister_does_not_exist_is_positive_release(self) -> None:
+        manager = SimpleNamespace(
+            call_unregister_profile=AsyncMock(
+                side_effect=DBusError(
+                    "org.bluez.Error.DoesNotExist", "already removed"
+                )
+            )
+        )
+        bus = SimpleNamespace(unexport=Mock())
+        client = DBusNextBlueZCoexistenceClient()
+        client._bus = bus
+        client._profile_manager = manager
+        profile = SimpleNamespace()
+
+        await client.unregister_profile("/test/profile", profile)
+
+        bus.unexport.assert_called_once_with("/test/profile", profile)
+
 
 class ProfileLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_records_register_and_unregister_once_each(self) -> None:
@@ -822,14 +895,17 @@ class ProfileLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await registration.register(missing_state)
         self.assertEqual(profile_client.register_profile.await_count, 4)
         self.assertEqual(registration.registered_count, 4)
+        self.assertFalse(registration.cleanup_complete)
         first_profile = profile_client.register_profile.await_args_list[0].args[1]
         first_profile.Release()
         first_profile.Release()
         self.assertTrue(first_profile.released)
         await registration.unregister()
         self.assertEqual(profile_client.unregister_profile.await_count, 4)
+        self.assertTrue(registration.cleanup_complete)
         await registration.unregister()
         self.assertEqual(profile_client.unregister_profile.await_count, 4)
+        self.assertTrue(registration.cleanup_complete)
 
     async def test_existing_adapter_identity_needs_no_duplicate_profile(self) -> None:
         profile_client = SimpleNamespace(
@@ -874,6 +950,54 @@ class ProfileLifecycleTests(unittest.IsolatedAsyncioTestCase):
             CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
         )
         profile_client.unregister_profile.assert_awaited_once()
+        self.assertTrue(registration.cleanup_complete)
+
+    async def test_partial_registration_rollback_failure_remains_unproven(
+        self,
+    ) -> None:
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(
+                side_effect=[None, TimeoutError("second registration failed")]
+            ),
+            unregister_profile=AsyncMock(
+                side_effect=[RuntimeError("rollback unregister failed"), None]
+            ),
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        missing_state = BlueZCoexistenceState(candidate(), True, True, frozenset())
+
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await registration.register(missing_state)
+
+        self.assertEqual(
+            raised.exception.category,
+            CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
+        )
+        self.assertFalse(registration.cleanup_complete)
+        await registration.unregister()
+        self.assertFalse(registration.cleanup_complete)
+        self.assertEqual(profile_client.unregister_profile.await_count, 2)
+
+    async def test_registration_cancellation_preserves_cleanup_uncertainty(
+        self,
+    ) -> None:
+        cancellation = asyncio.CancelledError()
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(side_effect=[None, cancellation]),
+            unregister_profile=AsyncMock(
+                side_effect=[RuntimeError("rollback unregister failed"), None]
+            ),
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        missing_state = BlueZCoexistenceState(candidate(), True, True, frozenset())
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await registration.register(missing_state)
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertFalse(registration.cleanup_complete)
+        await registration.unregister()
+        self.assertFalse(registration.cleanup_complete)
 
     def test_bluez_xml_records_are_well_formed_and_canonical(self) -> None:
         records = build_bluez_sdp_service_records(
@@ -987,6 +1111,7 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         transport.close()
         transport.close()
         self.assertEqual(fake.close_calls, 1)
+        self.assertTrue(transport.cleanup_complete)
 
     def test_native_l2cap_options_layout_matches_linux_abi(self) -> None:
         self.assertEqual(ctypes.sizeof(_NativeL2CAPOptions), 12)
@@ -1208,6 +1333,50 @@ class KernelL2CAPTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(raised.exception.detail, "errno EACCES (13)")
         self.assertEqual(fake.close_calls, 1)
+
+    async def test_open_rollback_close_failure_remains_unproven(self) -> None:
+        fake = FakeSocket(
+            connect_error=ConnectionError("peer unavailable"),
+            close_results=[RuntimeError("socket close failed"), None],
+        )
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake),
+        )
+
+        with self.assertRaises(CoexistenceFailure) as raised:
+            await transport.open(
+                LOCAL_ADAPTER_ADDRESS, REMOTE_AIRPODS_ADDRESS
+            )
+
+        self.assertEqual(
+            raised.exception.category, CoexistenceCategory.L2CAP_CONNECT_FAILED
+        )
+        self.assertFalse(transport.cleanup_complete)
+        transport.close()
+        self.assertFalse(transport.cleanup_complete)
+        self.assertEqual(fake.close_calls, 2)
+
+    async def test_open_cancellation_preserves_cleanup_uncertainty(self) -> None:
+        cancellation = asyncio.CancelledError()
+        fake = FakeSocket(
+            connect_error=cancellation,
+            close_results=[RuntimeError("socket close failed"), None],
+        )
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=fake),
+        )
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await transport.open(
+                LOCAL_ADAPTER_ADDRESS, REMOTE_AIRPODS_ADDRESS
+            )
+
+        self.assertIs(raised.exception, cancellation)
+        self.assertFalse(transport.cleanup_complete)
+        transport.close()
+        self.assertFalse(transport.cleanup_complete)
 
     async def test_host_missing_bluetooth_api_is_socket_failure(self) -> None:
         transport = KernelL2CAPTransport(

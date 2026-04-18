@@ -38,10 +38,10 @@ FIELDS = (
 )
 FROZEN_SHA256 = {
     "src/airpods_hr/production_session.py": (
-        "72a14219cb9936b1a1d75cf156f74105cbcc5762ba611e47eac83e08beb6fcd5"
+        "f79e1cae91650459be0c016e53dea0aa10322e3159b17eb0c6857e3919266c4f"
     ),
     "src/airpods_hr/bluez_coexistence.py": (
-        "55824df2b95d698e60e972d52c500c7ef3e5901cb75793663bd6d9401e26305d"
+        "4fd967c6350a90b511b51064a5718c68b284517682eb4f15770a05c50351b2d2"
     ),
     "src/airpods_hr/protocol.py": (
         "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"

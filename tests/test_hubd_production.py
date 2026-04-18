@@ -16,8 +16,9 @@ import tomllib
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from airpods_hr._hubd import production as hubd_production
 from airpods_hr._hubd.production import (
@@ -32,6 +33,10 @@ from airpods_hr._hubd.server import (
     AirPodsHubDaemon,
     DaemonState,
     SessionOperationError,
+)
+from airpods_hr.bluez_coexistence import (
+    BlueZCompatibilityRegistration,
+    KernelL2CAPTransport,
 )
 from airpods_hr.heartrate import HeartRateReport
 from airpods_hr.heart_rate_session import (
@@ -55,6 +60,7 @@ from tests.test_production_session import (
     FakeTransport,
     make_session,
 )
+from tests.test_bluez_coexistence import FakeSocket, FakeSocketModule
 from tools import probe_hubd_production
 from tools.probe_hubd_production import (
     CLIENT_TIMEOUT_MARGIN,
@@ -70,7 +76,7 @@ from tools.probe_hubd_production import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "72a14219cb9936b1a1d75cf156f74105cbcc5762ba611e47eac83e08beb6fcd5"
+    "f79e1cae91650459be0c016e53dea0aa10322e3159b17eb0c6857e3919266c4f"
 )
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
@@ -355,6 +361,83 @@ class ProbeClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProductionCleanupRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def assert_nested_cleanup_forbids_replacement(
+        self, failed: InternalProductionSession
+    ) -> None:
+        replacement, *_ = make_session()
+        builder = SequenceBuilder([failed, replacement])
+        factory = ProductionSessionFactory(
+            ProductionHubConfig(),
+            output=lambda _message: None,
+            builder=builder,
+        )
+
+        async def no_delay(_delay: float) -> None:
+            await asyncio.sleep(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = AirPodsHubDaemon(
+                factory,
+                Path(directory) / "hubd.sock",
+                session_error_is_recoverable=(
+                    hubd_production._is_recoverable_production_error
+                ),
+                session_cleanup_completed=(
+                    hubd_production._production_cleanup_completed
+                ),
+                recovery_sleep=no_delay,
+            )
+            try:
+                with self.assertRaises(SessionOperationError):
+                    await daemon.start()
+
+                self.assertEqual(factory.calls, 1)
+                self.assertEqual(builder.calls, 1)
+                self.assertIs(daemon.session, failed)
+                self.assertIs(daemon.state, DaemonState.FAILED)
+                self.assertIs(failed.state, ProductionSessionState.FAILED)
+                self.assertFalse(failed.cleanup_complete)
+                self.assertFalse(daemon.report_reader_active)
+                self.assertFalse(daemon.recovery_active)
+            finally:
+                await daemon.shutdown()
+                daemon._release_process_lock()
+
+    async def test_nested_transport_cleanup_failure_forbids_replacement(
+        self,
+    ) -> None:
+        events: list[str] = []
+        socket = FakeSocket(
+            connect_error=ConnectionError("peer unavailable"),
+            close_results=[RuntimeError("nested close failed"), None],
+        )
+        transport = KernelL2CAPTransport(
+            socket_module=FakeSocketModule,
+            socket_factory=Mock(return_value=socket),
+        )
+        failed, *_ = make_session(events=events, transport=transport)
+
+        await self.assert_nested_cleanup_forbids_replacement(failed)
+        self.assertEqual(socket.close_calls, 2)
+
+    async def test_nested_registration_cleanup_failure_forbids_replacement(
+        self,
+    ) -> None:
+        events: list[str] = []
+        profile_client = SimpleNamespace(
+            register_profile=AsyncMock(
+                side_effect=[None, TimeoutError("second registration failed")]
+            ),
+            unregister_profile=AsyncMock(
+                side_effect=[RuntimeError("nested unregister failed"), None]
+            ),
+        )
+        registration = BlueZCompatibilityRegistration(profile_client)
+        failed, *_ = make_session(events=events, registration=registration)
+
+        await self.assert_nested_cleanup_forbids_replacement(failed)
+        self.assertEqual(profile_client.unregister_profile.await_count, 2)
+
     async def test_incomplete_initial_cleanup_forbids_replacement(self) -> None:
         boundaries = (
             "collection_exit",

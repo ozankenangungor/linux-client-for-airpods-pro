@@ -231,6 +231,9 @@ class _ExperimentalACKOnlyActivationContext:
 
 
 class BlueZStateClient(Protocol):
+    @property
+    def cleanup_complete(self) -> bool: ...
+
     async def connect(self) -> None: ...
 
     def close(self) -> None: ...
@@ -246,6 +249,9 @@ class BlueZStateClient(Protocol):
 
 class CompatibilityRegistration(Protocol):
     @property
+    def cleanup_complete(self) -> bool: ...
+
+    @property
     def registered_count(self) -> int: ...
 
     async def register(self, state: BlueZCoexistenceState) -> None: ...
@@ -254,6 +260,9 @@ class CompatibilityRegistration(Protocol):
 
 
 class CoexistenceTransport(Protocol):
+    @property
+    def cleanup_complete(self) -> bool: ...
+
     @property
     def application_payloads_sent(self) -> int: ...
 
@@ -312,6 +321,11 @@ class DBusNextBlueZCoexistenceClient:
         self._bus: Any | None = None
         self._variant: Any | None = None
         self._profile_manager: Any | None = None
+        self._release_unproven = False
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return not self._release_unproven and self._bus is None
 
     async def connect(self) -> None:
         if self._bus is not None:
@@ -324,7 +338,15 @@ class DBusNextBlueZCoexistenceClient:
             self._variant = Variant
             await self.get_managed_objects()
         except Exception as error:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "BlueZ client rollback cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+                if not isinstance(cleanup_error, Exception):
+                    raise
             raise CoexistenceFailure(
                 CoexistenceCategory.BLUEZ_NOT_AVAILABLE,
                 CoexistencePhase.PREFLIGHT,
@@ -333,7 +355,11 @@ class DBusNextBlueZCoexistenceClient:
 
     def close(self) -> None:
         if self._bus is not None:
-            self._bus.disconnect()
+            try:
+                self._bus.disconnect()
+            except BaseException:
+                self._release_unproven = True
+                raise
         self._bus = None
         self._variant = None
         self._profile_manager = None
@@ -479,8 +505,17 @@ class DBusNextBlueZCoexistenceClient:
             await self._profile_manager.call_register_profile(
                 object_path, record.uuid, options
             )
-        except BaseException:
-            self._bus.unexport(object_path, profile)
+        except BaseException as error:
+            try:
+                self._bus.unexport(object_path, profile)
+            except BaseException as cleanup_error:
+                self._release_unproven = True
+                error.add_note(
+                    "profile export rollback cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+                if not isinstance(cleanup_error, Exception):
+                    raise
             raise
 
     async def unregister_profile(
@@ -488,13 +523,24 @@ class DBusNextBlueZCoexistenceClient:
     ) -> None:
         if self._bus is None or self._profile_manager is None:
             return
+        primary_error: BaseException | None = None
         try:
             await self._profile_manager.call_unregister_profile(object_path)
         except Exception as error:
             if getattr(error, "type", "") != "org.bluez.Error.DoesNotExist":
-                raise
-        finally:
+                primary_error = error
+        except BaseException as error:
+            primary_error = error
+        try:
             self._bus.unexport(object_path, profile)
+        except BaseException as cleanup_error:
+            self._release_unproven = True
+            if primary_error is not None:
+                primary_error.add_note("profile unexport cleanup also failed")
+                raise primary_error
+            raise cleanup_error
+        if primary_error is not None:
+            raise primary_error
 
 
 class _BlueZProfileObject(ServiceInterface):
@@ -541,6 +587,11 @@ class BlueZCompatibilityRegistration:
         self._registered: list[tuple[str, _BlueZProfileObject]] = []
         self._registered_total = 0
         self._registration_attempted = False
+        self._release_unproven = False
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return not self._release_unproven and not self._registered
 
     @property
     def registered_count(self) -> int:
@@ -576,8 +627,15 @@ class BlueZCompatibilityRegistration:
         except BaseException as error:
             try:
                 await self.unregister()
-            except BaseException:
-                pass
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "compatibility registration rollback also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+                if not isinstance(cleanup_error, Exception):
+                    raise
+            if not isinstance(error, Exception):
+                raise
             raise CoexistenceFailure(
                 CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
                 CoexistencePhase.PROFILE_REGISTRATION,
@@ -586,8 +644,7 @@ class BlueZCompatibilityRegistration:
 
     async def unregister(self) -> None:
         errors: list[BaseException] = []
-        while self._registered:
-            object_path, profile = self._registered.pop()
+        for object_path, profile in reversed(tuple(self._registered)):
             try:
                 await asyncio.wait_for(
                     self._client.unregister_profile(object_path, profile),
@@ -595,7 +652,20 @@ class BlueZCompatibilityRegistration:
                 )
             except BaseException as error:
                 errors.append(error)
+                self._release_unproven = True
+            else:
+                self._registered.remove((object_path, profile))
         if errors:
+            control_flow = next(
+                (error for error in errors if not isinstance(error, Exception)),
+                None,
+            )
+            if control_flow is not None:
+                if len(errors) > 1:
+                    control_flow.add_note(
+                        "compatibility cleanup also reported another error"
+                    )
+                raise control_flow
             raise CoexistenceFailure(
                 CoexistenceCategory.CLEANUP_FAILED,
                 CoexistencePhase.CLEANUP,
@@ -631,6 +701,7 @@ class KernelL2CAPTransport:
         self._socket: Any | None = None
         self._collecting = False
         self._closed = False
+        self._release_unproven = False
         self._application_payloads_sent = 0
         self.dropped_frames = 0
         self._stream_summary_limit = stream_summary_limit
@@ -657,6 +728,10 @@ class KernelL2CAPTransport:
     @property
     def application_payloads_sent(self) -> int:
         return self._application_payloads_sent
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return not self._release_unproven and self._socket is None
 
     @property
     def pending_receive_frames(self) -> int:
@@ -816,12 +891,13 @@ class KernelL2CAPTransport:
         try:
             sock.bind((local_address, 0))
         except Exception as error:
-            self.close()
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_BIND_FAILED,
                 CoexistencePhase.L2CAP_CONNECTION,
                 _safe_error_detail(error),
-            ) from error
+            )
+            self._rollback_open(failure)
+            raise failure from error
         try:
             security = self._SECURITY_STRUCT.pack(
                 self._required_constant("BT_SECURITY_MEDIUM"), 0
@@ -832,22 +908,24 @@ class KernelL2CAPTransport:
                 security,
             )
         except Exception as error:
-            self.close()
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_SECURITY_FAILED,
                 CoexistencePhase.L2CAP_CONNECTION,
                 _safe_error_detail(error),
-            ) from error
+            )
+            self._rollback_open(failure)
+            raise failure from error
         try:
             self._set_local_rx_imtu(sock)
         except Exception as error:
-            self.close()
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_LOCAL_RX_MTU_FAILED,
                 CoexistencePhase.L2CAP_CONNECTION,
                 _safe_error_detail(error),
                 l2cap_local_rx_observation=self._local_rx_observation,
-            ) from error
+            )
+            self._rollback_open(failure)
+            raise failure from error
         try:
             sock.settimeout(self._connect_timeout)
             await asyncio.wait_for(
@@ -857,14 +935,18 @@ class KernelL2CAPTransport:
                 timeout=self._connect_timeout,
             )
         except BaseException as error:
-            self.close()
             if isinstance(error, asyncio.CancelledError):
+                self._rollback_open(error)
                 raise
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_CONNECT_FAILED,
                 CoexistencePhase.L2CAP_CONNECTION,
                 _safe_error_detail(error),
-            ) from error
+            )
+            self._rollback_open(failure)
+            if not isinstance(error, Exception):
+                raise
+            raise failure from error
         try:
             local_endpoint = sock.getsockname()
             if (
@@ -876,19 +958,21 @@ class KernelL2CAPTransport:
             selected_adapter = BluetoothAddress.parse(local_address)
             routed_adapter = BluetoothAddress.parse(local_endpoint[0])
         except (InvalidBluetoothAddressError, ValueError, OSError) as error:
-            self.close()
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_ROUTE_MISMATCH,
                 CoexistencePhase.L2CAP_CONNECTION,
                 _safe_error_detail(error),
-            ) from error
+            )
+            self._rollback_open(failure)
+            raise failure from error
         if routed_adapter != selected_adapter:
-            self.close()
-            raise CoexistenceFailure(
+            failure = CoexistenceFailure(
                 CoexistenceCategory.L2CAP_ROUTE_MISMATCH,
                 CoexistencePhase.L2CAP_CONNECTION,
                 "connected socket used a different local adapter",
             )
+            self._rollback_open(failure)
+            raise failure
 
     @asynccontextmanager
     async def collect(self) -> AsyncIterator[KernelL2CAPTransport]:
@@ -961,10 +1045,25 @@ class KernelL2CAPTransport:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self._socket is not None:
-            self._socket.close()
+            try:
+                self._socket.close()
+            except BaseException:
+                self._release_unproven = True
+                raise
             self._socket = None
+        self._closed = True
+
+    def _rollback_open(self, primary_error: BaseException) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "L2CAP open rollback cleanup also failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+            if not isinstance(cleanup_error, Exception):
+                raise
 
     def _send(self, payload: bytes) -> None:
         if not self._collecting or self._socket is None or self._closed:
