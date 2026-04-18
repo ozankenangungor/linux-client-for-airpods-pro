@@ -76,7 +76,7 @@ from tools.probe_hubd_production import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "f79e1cae91650459be0c016e53dea0aa10322e3159b17eb0c6857e3919266c4f"
+    "ea3a2d237bb542b41d3b81e3cb4197ead00d31f0eddbb468ca9c133c98c59651"
 )
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
@@ -671,6 +671,29 @@ class ProductionFactoryTests(unittest.TestCase):
             hubd_production._is_recoverable_production_error(RuntimeError())
         )
 
+    def test_epoch_refresh_eligibility_is_exact_and_provenance_gated(self) -> None:
+        for category in ProductionSessionCategory:
+            error = ProductionSessionError(
+                category, "test", recoverable=True
+            )
+            expected = category is ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            self.assertIs(
+                hubd_production._production_epoch_refresh_is_eligible(error),
+                expected,
+            )
+        self.assertFalse(
+            hubd_production._production_epoch_refresh_is_eligible(
+                ProductionSessionError(
+                    ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT,
+                    "test",
+                    recoverable=False,
+                )
+            )
+        )
+        self.assertFalse(
+            hubd_production._production_epoch_refresh_is_eligible(TimeoutError())
+        )
+
     def test_production_cleanup_requires_closed_state_and_release_proof(
         self,
     ) -> None:
@@ -925,8 +948,9 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom)
         }
-        self.assertNotIn("airpods_hr.bluez_coexistence", imports)
+        self.assertIn("airpods_hr.bluez_coexistence", imports)
         source = integration.read_text(encoding="utf-8")
+        self.assertIn("BlueZConnectionEpochRefresher", source)
         for forbidden in (
             "KernelL2CAPTransport",
             "BlueZCompatibilityRegistration",

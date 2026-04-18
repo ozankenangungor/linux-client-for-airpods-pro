@@ -664,7 +664,7 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
                 "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
             ),
             "src/airpods_hr/bluez_coexistence.py": (
-                "4fd967c6350a90b511b51064a5718c68b284517682eb4f15770a05c50351b2d2"
+                "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
             ),
             "src/airpods_hr/heartrate.py": (
                 "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"

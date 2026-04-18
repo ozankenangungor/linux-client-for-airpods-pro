@@ -28,6 +28,10 @@ from airpods_hr._hubd.protocol import (
     response,
 )
 from airpods_hr._hubd.session import (
+    ConnectionEpochRefresher,
+    ConnectionEpochRefreshError,
+    ConnectionEpochRefreshOutcome,
+    EpochRefreshEligibility,
     RecoverySleeper,
     SensorSession,
     SessionCleanupVerifier,
@@ -80,6 +84,10 @@ def _never_recover(_error: BaseException) -> bool:
 def _cleanup_not_verified(
     _session: SensorSession, _error: BaseException
 ) -> bool:
+    return False
+
+
+def _never_refresh(_error: BaseException) -> bool:
     return False
 
 
@@ -180,6 +188,11 @@ class _Client:
     writer_task: asyncio.Task[None] | None = None
 
 
+@dataclass(slots=True)
+class _RecoveryEpisode:
+    epoch_refresh_used: bool = False
+
+
 class AirPodsHubDaemon:
     """Own one injected session and fan its reports out over local JSONL IPC."""
 
@@ -192,6 +205,8 @@ class AirPodsHubDaemon:
         operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
         session_error_is_recoverable: SessionErrorClassifier = _never_recover,
         session_cleanup_completed: SessionCleanupVerifier = _cleanup_not_verified,
+        epoch_refresh_is_eligible: EpochRefreshEligibility = _never_refresh,
+        connection_epoch_refresher: ConnectionEpochRefresher | None = None,
         recovery_delays: tuple[float, ...] = DEFAULT_RECOVERY_DELAYS,
         recovery_sleep: RecoverySleeper = asyncio.sleep,
         lifecycle_output: LifecycleOutput = _discard_output,
@@ -212,6 +227,8 @@ class AirPodsHubDaemon:
         self._operation_timeout = operation_timeout
         self._session_error_is_recoverable = session_error_is_recoverable
         self._session_cleanup_completed = session_cleanup_completed
+        self._epoch_refresh_is_eligible = epoch_refresh_is_eligible
+        self._connection_epoch_refresher = connection_epoch_refresher
         self._recovery_delays = recovery_delays
         self._recovery_sleep = recovery_sleep
         self._lifecycle_output = lifecycle_output
@@ -276,6 +293,7 @@ class AirPodsHubDaemon:
                     cleanup_socket=False,
                 )
                 owned_listener = None
+            episode = _RecoveryEpisode()
             while True:
                 try:
                     async with self._lifecycle_lock:
@@ -289,6 +307,7 @@ class AirPodsHubDaemon:
                         ) from error
                     if not self._session_error_is_recoverable(error):
                         raise
+                    await self._prepare_recovery_retry(error, episode)
                     self._lifecycle_output(
                         "initial session establishment failed: recoverable="
                         f"{self._safe_error_name(error)}"
@@ -753,7 +772,7 @@ class AirPodsHubDaemon:
             f"HR session lost: recoverable={self._safe_error_name(error)}"
         )
         task = asyncio.create_task(
-            self._recover_session(), name="airpods-hubd-session-recovery"
+            self._recover_session(error), name="airpods-hubd-session-recovery"
         )
         self._recovery_task = task
         task.add_done_callback(self._recovery_finished)
@@ -762,8 +781,9 @@ class AirPodsHubDaemon:
         if self._recovery_task is task:
             self._recovery_task = None
 
-    async def _recover_session(self) -> None:
+    async def _recover_session(self, triggering_error: BaseException) -> None:
         attempt = 0
+        episode = _RecoveryEpisode()
         try:
             if not await self._dispose_current_session():
                 self._lifecycle_output(
@@ -772,6 +792,7 @@ class AirPodsHubDaemon:
                 async with self._lifecycle_lock:
                     self._fail_terminal_locked()
                 return
+            await self._prepare_recovery_retry(triggering_error, episode)
             while not self._shutdown_requested:
                 await self._wait_before_recovery()
                 if self._shutdown_requested:
@@ -803,12 +824,53 @@ class AirPodsHubDaemon:
                         f"recovery attempt {attempt} failed: "
                         f"{self._safe_error_name(error)}"
                     )
+                    await self._prepare_recovery_retry(error, episode)
                     continue
                 self._reset_recovery_backoff()
                 self._lifecycle_output("session restored")
                 return
         except asyncio.CancelledError:
             raise
+        except Exception as error:
+            self._lifecycle_output(
+                "terminal session failure: " f"{self._safe_error_name(error)}"
+            )
+            async with self._lifecycle_lock:
+                self._fail_terminal_locked()
+
+    async def _prepare_recovery_retry(
+        self, error: BaseException, episode: _RecoveryEpisode
+    ) -> None:
+        if episode.epoch_refresh_used or not self._epoch_refresh_is_eligible(error):
+            return
+        refresher = self._connection_epoch_refresher
+        if refresher is None:
+            raise RuntimeError("eligible epoch refresh has no configured refresher")
+        episode.epoch_refresh_used = True
+        self._lifecycle_output(
+            "descriptor bootstrap stalled on connected target; "
+            "connection epoch refresh requested"
+        )
+        try:
+            outcome = await refresher.refresh()
+        except asyncio.CancelledError:
+            raise
+        except ConnectionEpochRefreshError as refresh_error:
+            self._lifecycle_output(
+                "connection epoch refresh failed: "
+                f"{refresh_error.stage.value}"
+            )
+            return
+        if outcome is ConnectionEpochRefreshOutcome.ALREADY_DISCONNECTED:
+            self._lifecycle_output(
+                "connection epoch refresh skipped: target already disconnected"
+            )
+            return
+        if outcome is not ConnectionEpochRefreshOutcome.REFRESHED:
+            raise RuntimeError("connection epoch refresher returned invalid outcome")
+        self._lifecycle_output(
+            "target device reconnected; session restoration resumed"
+        )
 
     async def _dispose_current_session(self) -> bool:
         async with self._lifecycle_lock:

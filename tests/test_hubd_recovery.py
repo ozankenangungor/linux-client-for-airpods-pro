@@ -11,12 +11,20 @@ from typing import Any
 
 from dbus_next.errors import DBusError
 
-from airpods_hr._hubd.production import _is_recoverable_production_error
+from airpods_hr._hubd.production import (
+    _is_recoverable_production_error,
+    _production_epoch_refresh_is_eligible,
+)
 from airpods_hr._hubd.protocol import PROTOCOL_VERSION
 from airpods_hr._hubd.server import (
     AirPodsHubDaemon,
     DaemonState,
     SessionOperationError,
+)
+from airpods_hr._hubd.session import (
+    ConnectionEpochRefreshError,
+    ConnectionEpochRefreshOutcome,
+    ConnectionEpochRefreshStage,
 )
 from airpods_hr.bluez_coexistence import (
     CoexistenceCategory,
@@ -147,6 +155,46 @@ class BlockingSleeper(ImmediateSleeper):
             raise
 
 
+class RecordingEpochRefresher:
+    def __init__(
+        self,
+        *,
+        outcome: ConnectionEpochRefreshOutcome = (
+            ConnectionEpochRefreshOutcome.REFRESHED
+        ),
+        error: BaseException | None = None,
+        blocked: bool = False,
+    ) -> None:
+        self.outcome = outcome
+        self.error = error
+        self.blocked = blocked
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def refresh(self) -> ConnectionEpochRefreshOutcome:
+        self.calls += 1
+        self.entered.set()
+        if self.blocked:
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        if self.error is not None:
+            raise self.error
+        return self.outcome
+
+
+def production_error(
+    category: ProductionSessionCategory,
+) -> ProductionSessionError:
+    return ProductionSessionError(
+        category, "synthetic", recoverable=True
+    )
+
+
 class JsonClient:
     def __init__(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -236,6 +284,30 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 error, RecoverableSessionFailure
             ),
             recovery_sleep=sleeper,
+        )
+        self.daemon = daemon
+        return daemon, factory
+
+    def make_epoch_daemon(
+        self,
+        sessions: list[ScriptedSession],
+        sleeper: ImmediateSleeper,
+        refresher: RecordingEpochRefresher,
+        *,
+        cleanup_completed=None,
+    ) -> tuple[AirPodsHubDaemon, ScriptedFactory]:
+        factory = ScriptedFactory(sessions)
+        kwargs: dict[str, Any] = {}
+        if cleanup_completed is not None:
+            kwargs["session_cleanup_completed"] = cleanup_completed
+        daemon = AirPodsHubDaemon(
+            factory,
+            self.socket_path,
+            session_error_is_recoverable=_is_recoverable_production_error,
+            epoch_refresh_is_eligible=_production_epoch_refresh_is_eligible,
+            connection_epoch_refresher=refresher,
+            recovery_sleep=sleeper,
+            **kwargs,
         )
         self.daemon = daemon
         return daemon, factory
@@ -537,6 +609,219 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(lambda: daemon.session is restored)
         restored.inject(canonical_report(91))
         self.assertEqual((await subscribed.read())["bpm"], 91)
+
+    async def test_initial_descriptor_timeout_refreshes_once_after_cleanup(
+        self,
+    ) -> None:
+        refresher = RecordingEpochRefresher()
+        sleeper = ImmediateSleeper()
+        failed = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            )
+        )
+        restored = ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [failed, restored], sleeper, refresher
+        )
+
+        await daemon.start()
+
+        self.assertEqual(failed.events, ["open", "close"])
+        self.assertEqual(refresher.calls, 1)
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(sleeper.delays, [1.0])
+        self.assertIs(daemon.session, restored)
+
+    async def test_incomplete_cleanup_vetoes_refresh_and_replacement(self) -> None:
+        refresher = RecordingEpochRefresher()
+        sleeper = ImmediateSleeper()
+        failed = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            ),
+            close_error=RuntimeError("cleanup unproven"),
+        )
+        unused = ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [failed, unused],
+            sleeper,
+            refresher,
+            cleanup_completed=lambda _session, _error: False,
+        )
+
+        with self.assertRaises(SessionOperationError):
+            await daemon.start()
+
+        self.assertEqual(refresher.calls, 0)
+        self.assertEqual(factory.calls, 1)
+        self.assertIs(daemon.session, failed)
+        self.assertEqual(sleeper.delays, [])
+        failed.close_error = None
+
+    async def test_refresh_failure_and_second_timeout_use_one_allowance(
+        self,
+    ) -> None:
+        refresher = RecordingEpochRefresher(
+            error=ConnectionEpochRefreshError(
+                ConnectionEpochRefreshStage.CONNECTED_STATE_PROOF
+            )
+        )
+        sleeper = ImmediateSleeper()
+        first = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            )
+        )
+        second = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            )
+        )
+        restored = ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [first, second, restored], sleeper, refresher
+        )
+
+        await daemon.start()
+
+        self.assertEqual(refresher.calls, 1)
+        self.assertEqual(factory.calls, 3)
+        self.assertEqual(sleeper.delays, [1.0, 2.0])
+        self.assertIs(daemon.session, restored)
+
+    async def test_disconnected_preflight_never_refreshes_epoch(self) -> None:
+        refresher = RecordingEpochRefresher()
+        sleeper = ImmediateSleeper()
+        failed = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.PREFLIGHT_FAILED
+            )
+        )
+        restored = ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [failed, restored], sleeper, refresher
+        )
+
+        await daemon.start()
+
+        self.assertEqual(refresher.calls, 0)
+        self.assertEqual(factory.calls, 2)
+        self.assertEqual(sleeper.delays, [1.0])
+
+    async def test_runtime_refresh_preserves_subscriber_and_control_plane(
+        self,
+    ) -> None:
+        refresher = RecordingEpochRefresher(blocked=True)
+        sleeper = ImmediateSleeper()
+        initial, restored = ScriptedSession(), ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [initial, restored], sleeper, refresher
+        )
+        await daemon.start()
+        subscribed = await self.client()
+        self.assertTrue((await self.subscribe(subscribed))["ok"])
+
+        initial.inject(
+            production_error(ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT)
+        )
+        await asyncio.wait_for(refresher.entered.wait(), timeout=1)
+        observer = await self.client()
+
+        hello = await observer.request("hello")
+        ping = await observer.request("ping")
+        status = await observer.request("status")
+        unavailable = await self.subscribe(observer)
+
+        self.assertTrue(hello["ok"])
+        self.assertTrue(ping["pong"])
+        self.assertEqual(status["state"], "starting")
+        self.assertEqual(status["subscriber_count"], 1)
+        self.assertEqual(unavailable["error"]["code"], "service_unavailable")
+        self.assertEqual(factory.calls, 1)
+        refresher.release.set()
+        await self.wait_for(lambda: daemon.session is restored)
+        restored.inject(canonical_report(94))
+        self.assertEqual((await subscribed.read())["bpm"], 94)
+        self.assertEqual(daemon.subscriber_count, 1)
+        self.assertEqual(refresher.calls, 1)
+        self.assertEqual(factory.maximum_active_sessions, 1)
+
+    async def test_successful_restore_allows_one_refresh_in_later_episode(
+        self,
+    ) -> None:
+        refresher = RecordingEpochRefresher()
+        sleeper = ImmediateSleeper()
+        initial, first_restore, second_restore = (
+            ScriptedSession(),
+            ScriptedSession(),
+            ScriptedSession(),
+        )
+        daemon, _factory = self.make_epoch_daemon(
+            [initial, first_restore, second_restore], sleeper, refresher
+        )
+        await daemon.start()
+        client = await self.client()
+        self.assertTrue((await self.subscribe(client))["ok"])
+
+        initial.inject(
+            production_error(ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT)
+        )
+        await self.wait_for(lambda: daemon.session is first_restore)
+        first_restore.inject(
+            production_error(ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT)
+        )
+        await self.wait_for(lambda: daemon.session is second_restore)
+
+        self.assertEqual(refresher.calls, 2)
+        self.assertEqual(sleeper.delays, [1.0, 1.0])
+
+    async def test_shutdown_cancels_blocked_refresher_without_retry(self) -> None:
+        refresher = RecordingEpochRefresher(blocked=True)
+        sleeper = ImmediateSleeper()
+        initial, unused = ScriptedSession(), ScriptedSession()
+        daemon, factory = self.make_epoch_daemon(
+            [initial, unused], sleeper, refresher
+        )
+        await daemon.start()
+        client = await self.client()
+        self.assertTrue((await self.subscribe(client))["ok"])
+
+        initial.inject(
+            production_error(ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT)
+        )
+        await asyncio.wait_for(refresher.entered.wait(), timeout=1)
+        await daemon.shutdown()
+
+        self.assertTrue(refresher.cancelled)
+        self.assertEqual(refresher.calls, 1)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(sleeper.delays, [])
+        self.assertFalse(daemon.recovery_active)
+        self.assertEqual(daemon.state, DaemonState.STOPPED)
+
+    async def test_unexpected_refresher_bug_is_terminal_not_recoverable(
+        self,
+    ) -> None:
+        refresher = RecordingEpochRefresher(
+            error=AssertionError("synthetic refresher invariant")
+        )
+        sleeper = ImmediateSleeper()
+        failed = ScriptedSession(
+            open_error=production_error(
+                ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+            )
+        )
+        daemon, factory = self.make_epoch_daemon(
+            [failed], sleeper, refresher
+        )
+
+        with self.assertRaises(SessionOperationError):
+            await daemon.start()
+
+        self.assertEqual(refresher.calls, 1)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(sleeper.delays, [])
 
     async def test_repeated_recovery_and_shutdown_release_every_session(self) -> None:
         sleeper = ImmediateSleeper()

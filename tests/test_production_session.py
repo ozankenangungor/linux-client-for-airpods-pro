@@ -20,6 +20,7 @@ from airpods_hr.aap import (
     AAPDescriptorObservationTimeoutError,
     AAPHandshakeResult,
     AAPHandshakeSession,
+    AAPHandshakeTimeoutError,
     DescriptorEvidence,
     HandshakeObservation,
 )
@@ -599,13 +600,95 @@ class ProductionSessionStateTests(unittest.IsolatedAsyncioTestCase):
         session, client, _, transport, _, _ = make_session(
             events=events, handshake=handshake
         )
-        with self.assertRaises(ProductionSessionError):
+        with self.assertRaises(ProductionSessionError) as raised:
             await session.open()
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT,
+        )
+        self.assertTrue(raised.exception.recoverable)
         self.assertEqual(handshake.calls, 1)
         self.assertEqual(transport.commands, [])
         self.assertNotIn("device_connect", events)
         self.assertNotIn("device_disconnect", events)
         self.assertEqual(client.close_calls, 1)
+
+    async def test_aap_ack_timeout_has_specific_recoverable_category(self) -> None:
+        events: list[str] = []
+        handshake = FakeHandshake(
+            events, error=AAPHandshakeTimeoutError("exact ACK absent")
+        )
+        session, *_ = make_session(events=events, handshake=handshake)
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category, ProductionSessionCategory.AAP_ACK_TIMEOUT
+        )
+        self.assertTrue(raised.exception.recoverable)
+        self.assertIsInstance(
+            raised.exception.__cause__, AAPHandshakeTimeoutError
+        )
+
+    async def test_aap_timeout_type_outside_handshake_keeps_phase_category(
+        self,
+    ) -> None:
+        events: list[str] = []
+        session, *_ = make_session(
+            events=events,
+            client=FakeClient(
+                events,
+                preflight_error=AAPHandshakeTimeoutError("synthetic preflight"),
+            ),
+        )
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.PREFLIGHT_FAILED,
+        )
+        self.assertTrue(raised.exception.recoverable)
+
+    async def test_descriptor_timeout_without_ack_is_not_epoch_eligible(
+        self,
+    ) -> None:
+        events: list[str] = []
+        observation = HandshakeObservation(
+            ack_observed=False,
+            evidence=DescriptorEvidence(sensor_framework=True),
+        )
+        handshake = FakeHandshake(
+            events, error=AAPDescriptorObservationTimeoutError(observation)
+        )
+        session, *_ = make_session(events=events, handshake=handshake)
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+        )
+        self.assertTrue(raised.exception.recoverable)
+
+    async def test_generic_descriptor_failure_keeps_generic_category(self) -> None:
+        events: list[str] = []
+        handshake = FakeHandshake(
+            events, error=RuntimeError("synthetic implementation failure")
+        )
+        session, *_ = make_session(events=events, handshake=handshake)
+
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+
+        self.assertEqual(
+            raised.exception.category,
+            ProductionSessionCategory.DESCRIPTOR_HANDSHAKE_FAILED,
+        )
+        self.assertFalse(raised.exception.recoverable)
 
     async def test_unverified_local_rx_imtu_fails_before_handshake(self) -> None:
         events: list[str] = []
@@ -1172,7 +1255,7 @@ class ProductionStaticSafetyTests(unittest.TestCase):
                 "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
             ),
             "src/airpods_hr/bluez_coexistence.py": (
-                "4fd967c6350a90b511b51064a5718c68b284517682eb4f15770a05c50351b2d2"
+                "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
             ),
             "src/airpods_hr/monitor_cli.py": (
                 "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"

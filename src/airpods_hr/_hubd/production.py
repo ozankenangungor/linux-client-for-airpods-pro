@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from airpods_hr._hubd.server import AirPodsHubDaemon
+from airpods_hr.bluez_coexistence import BlueZConnectionEpochRefresher
 from airpods_hr.production_session import (
     DEFAULT_DBUS_TIMEOUT,
     DEFAULT_HANDSHAKE_TIMEOUT,
@@ -14,6 +15,7 @@ from airpods_hr.production_session import (
     DEFAULT_START_TIMEOUT,
     DEFAULT_STOP_TIMEOUT,
     InternalProductionSession,
+    ProductionSessionCategory,
     ProductionSessionError,
     ProductionSessionState,
     create_production_session,
@@ -141,6 +143,14 @@ def _production_cleanup_completed(
     )
 
 
+def _production_epoch_refresh_is_eligible(error: BaseException) -> bool:
+    return (
+        isinstance(error, ProductionSessionError)
+        and error.recoverable is True
+        and error.category is ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionHub:
     """The private daemon and its observable production session factory."""
@@ -160,12 +170,18 @@ def create_production_hub(
 
     selected = config or ProductionHubConfig()
     factory = ProductionSessionFactory(selected, output=output, builder=builder)
+    epoch_refresher = BlueZConnectionEpochRefresher(
+        dbus_timeout=selected.dbus_timeout,
+        state_timeout=selected.connect_timeout,
+    )
     daemon = AirPodsHubDaemon(
         factory,
         socket_path,
         operation_timeout=selected.daemon_operation_timeout,
         session_error_is_recoverable=_is_recoverable_production_error,
         session_cleanup_completed=_production_cleanup_completed,
+        epoch_refresh_is_eligible=_production_epoch_refresh_is_eligible,
+        connection_epoch_refresher=epoch_refresher,
         lifecycle_output=output,
     )
     return ProductionHub(daemon=daemon, factory=factory)

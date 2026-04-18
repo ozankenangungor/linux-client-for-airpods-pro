@@ -56,6 +56,7 @@ DEFAULT_REPORT_TIMEOUT = 5.0
 DEFAULT_START_TIMEOUT = 15.0
 DEFAULT_STOP_TIMEOUT = 5.0
 EXPECTED_LOCAL_RX_IMTU = 2048
+_DESCRIPTOR_HANDSHAKE_PHASE = "descriptor_handshake"
 
 
 class ProductionSessionState(StrEnum):
@@ -73,6 +74,8 @@ class ProductionSessionCategory(StrEnum):
     PREFLIGHT_FAILED = "preflight_failed"
     REGISTRATION_FAILED = "registration_failed"
     TRANSPORT_FAILED = "transport_failed"
+    AAP_ACK_TIMEOUT = "aap_ack_timeout"
+    AAP_DESCRIPTOR_TIMEOUT = "aap_descriptor_timeout"
     DESCRIPTOR_HANDSHAKE_FAILED = "descriptor_handshake_failed"
     ACTIVATION_FAILED = "activation_failed"
     RECEIVE_FAILED = "receive_failed"
@@ -406,7 +409,7 @@ class InternalProductionSession:
                 await self._collection_context.__aenter__()
                 self._collection_entered = True
 
-                phase = "descriptor_handshake"
+                phase = _DESCRIPTOR_HANDSHAKE_PHASE
                 handshake = await self._handshake_session.run_collected(
                     self._transport
                 )
@@ -429,9 +432,19 @@ class InternalProductionSession:
                     raise control_flow
                 if isinstance(error, ProductionSessionError):
                     raise
-                raise _translate_session_error(
-                    self._open_category(phase), phase, error
-                ) from error
+                category = self._open_category(phase)
+                if (
+                    phase == _DESCRIPTOR_HANDSHAKE_PHASE
+                    and isinstance(error, AAPHandshakeTimeoutError)
+                ):
+                    category = ProductionSessionCategory.AAP_ACK_TIMEOUT
+                elif (
+                    phase == _DESCRIPTOR_HANDSHAKE_PHASE
+                    and isinstance(error, AAPDescriptorObservationTimeoutError)
+                    and error.observation.ack_observed is True
+                ):
+                    category = ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
+                raise _translate_session_error(category, phase, error) from error
 
             self.state = ProductionSessionState.READY
             self._output("SESSION READY: descriptor handshake complete")

@@ -37,7 +37,7 @@ from tools.probe_session_reopen import build_parser, main, run_probe
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "f79e1cae91650459be0c016e53dea0aa10322e3159b17eb0c6857e3919266c4f"
+    "ea3a2d237bb542b41d3b81e3cb4197ead00d31f0eddbb468ca9c133c98c59651"
 )
 FROZEN_SHA256 = {
     "src/airpods_hr/protocol.py": (
@@ -47,7 +47,7 @@ FROZEN_SHA256 = {
         "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
     ),
     "src/airpods_hr/bluez_coexistence.py": (
-        "4fd967c6350a90b511b51064a5718c68b284517682eb4f15770a05c50351b2d2"
+        "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
     ),
     "src/airpods_hr/monitor_cli.py": (
         "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
