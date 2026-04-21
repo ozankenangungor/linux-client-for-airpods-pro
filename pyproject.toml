@@ -1,19 +1,20 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
 
 [project]
 name = "airpods-hr-linux"
 version = "0.1.0"
-description = "Experimental AirPods Pro 3 heart-rate research tools for Linux"
+description = "Experimental AirPods Pro 3 heart-rate access for Linux"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
+keywords = ["airpods", "heart-rate", "linux", "bluetooth"]
 authors = [
-    { name = "AirPods HR Linux contributors" },
+    { name = "Ozan Kenan Güngör" },
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
@@ -23,6 +24,11 @@ dependencies = [
     "bumble==0.0.234",
     "dbus-next>=0.2.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+Repository = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+Issues = "https://github.com/ozankenangungor/linux-client-for-airpods-pro/issues"
 
 [project.optional-dependencies]
 handoff-probe = [
@@ -35,5 +41,12 @@ airpods-hr = "airpods_hr.cli:main"
 airpods-hubd = "airpods_hr._hubd.main:main"
 airpods-hubd-service = "airpods_hr.service_installer:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+compatibility = "manylinux_2_34"
+manifest-path = "crates/airpods-aap-py/Cargo.toml"
+python-source = "src"
+python-packages = ["airpods_hr"]
+module-name = "airpods_hr._airpods_aap_core"
+bindings = "pyo3"
+include = [{ path = "LICENSE", format = "sdist" }]
+exclude = ["**/tests/**", "**/__pycache__/**", "**/*.pyc"]

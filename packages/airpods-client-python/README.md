@@ -1,7 +1,7 @@
 # airpods-client for Python
 
-`airpods-client` 0.1 is the supported first Python SDK surface for consuming
-heart-rate events from an already-running `airpods-hubd`. It uses only the
+`airpods-client` 0.1 is the Python SDK for Linux Client for AirPods Pro. It
+consumes heart-rate events from an already-running `airpods-hubd`. It uses the
 Python standard library and communicates through the local Unix JSONL socket.
 It does not own Bluetooth, start the daemon, call systemd, or reconnect
 automatically.
@@ -42,9 +42,16 @@ The default socket is `$XDG_RUNTIME_DIR/airpods-hubd.sock`. Use
 The SDK returns typed errors when the runtime directory or daemon is absent;
 it has no `/tmp`, TCP, autostart, or Bluetooth fallback.
 
-The v0.1 surface is documented in `docs/sdk-v0.1-api.md` in the source
-repository. Patch releases in the v0.1 line should not intentionally break
-that surface. A future v0.2 may make deliberate breaking changes. The daemon
-protocol remains experimental and is versioned in coordination with the SDKs.
-This repository packaging candidate has not been published, and no external
-package-name availability is claimed.
+Patch releases in the v0.1 line should not intentionally break that surface. A
+future v0.2 may make deliberate breaking changes. The daemon protocol remains
+experimental and is versioned in coordination with the SDKs.
+The package is unpublished. Install it from `packages/airpods-client-python`
+or a locally built wheel until publication.
+
+## Verification
+
+Run the client verification suite:
+
+```console
+python -m unittest tests.test_python_client tests.test_sdk_v01_contract
+```

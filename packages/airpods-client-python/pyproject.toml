@@ -10,8 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
+keywords = ["airpods", "heart-rate", "asyncio", "unix-socket"]
 authors = [
-    { name = "AirPods HR Linux contributors" },
+    { name = "Ozan Kenan Güngör" },
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -24,6 +25,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+Repository = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+Issues = "https://github.com/ozankenangungor/linux-client-for-airpods-pro/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,10 +1,10 @@
 # airpods-client
 
-`airpods-client` 0.1 is the supported first Rust SDK surface for the local
-`airpods-hubd` Unix JSONL interface. `airpods-hubd` must already be running.
+`airpods-client` 0.1 is the Rust SDK for Linux Client for AirPods Pro. It uses
+the local `airpods-hubd` Unix JSONL interface. The daemon must already be running.
 The crate does not open Bluetooth, start the daemon, call systemd, or reconnect
-automatically. It is packaging-ready in this repository but has not been
-published, and no external registry-name availability is claimed.
+automatically. The crate is unpublished; use `crates/airpods-client` as a local
+path dependency until publication.
 
 ```rust,no_run
 use airpods_client::AirPodsClient;
