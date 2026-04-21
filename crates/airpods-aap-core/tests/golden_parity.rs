@@ -3,7 +3,7 @@ use airpods_aap_core::{
     parse_heart_rate_packet,
 };
 
-const GOLDEN_CORPUS: &str = include_str!("../../../testdata/hr_report_golden.tsv");
+const GOLDEN_CORPUS: &str = include_str!("../../../tests/testdata/hr_report_golden.tsv");
 
 #[derive(Debug)]
 struct GoldenCase {

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import copy
+import io
 import inspect
 import os
 import subprocess
 import sys
+import tarfile
+import tempfile
 import tomllib
 import unittest
+from pathlib import Path
 
 from tools import validate_release
 
@@ -301,6 +305,52 @@ class ManifestSchemaTests(unittest.TestCase):
         broken["artifacts"][0]["filename"] = "/home/person/private.whl"
         with self.assertRaises(validate_release.ValidationError):
             validate_release.validate_manifest(broken)
+
+
+class SdistPolicyTests(unittest.TestCase):
+    @staticmethod
+    def write_sdist(path: Path, members: tuple[str, ...]) -> None:
+        with tarfile.open(path, "w:gz") as archive:
+            for name in members:
+                content = b"test fixture\n"
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+
+    def test_python_sdists_reject_repository_tests(self) -> None:
+        cases = (
+            ("airpods-hr-linux", "airpods_hr_linux-0.1.0", "airpods_hr"),
+            ("airpods-client", "airpods_client-0.1.0", "airpods_client"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for package, root, import_name in cases:
+                with self.subTest(package=package):
+                    path = Path(directory) / f"{import_name}.tar.gz"
+                    self.write_sdist(
+                        path,
+                        (
+                            f"{root}/LICENSE",
+                            f"{root}/src/{import_name}/__init__.py",
+                            f"{root}/tests/test_example.py",
+                        ),
+                    )
+                    with self.assertRaisesRegex(
+                        validate_release.ValidationError,
+                        "generated/private material",
+                    ):
+                        validate_release.audit_sdist(path, package=package)
+
+    def test_minimal_production_sdist_without_tests_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "airpods_hr_linux-0.1.0.tar.gz"
+            self.write_sdist(
+                path,
+                (
+                    "airpods_hr_linux-0.1.0/LICENSE",
+                    "airpods_hr_linux-0.1.0/src/airpods_hr/__init__.py",
+                ),
+            )
+            validate_release.audit_sdist(path, package="airpods-hr-linux")
 
 
 if __name__ == "__main__":

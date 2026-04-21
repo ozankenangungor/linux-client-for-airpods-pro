@@ -470,7 +470,7 @@ def audit_sdist(path: Path, *, package: str) -> None:
         for name in names
     ):
         fail(f"unsafe sdist members in {path.name}")
-    forbidden_parts = {"captures", "dumps", "target", "__pycache__"}
+    forbidden_parts = {"tests", "captures", "dumps", "target", "__pycache__"}
     forbidden_suffixes = (".log", ".pcap", ".pcapng", ".btsnoop", ".pem", ".key")
     for name in names:
         parts = {part.lower() for part in PurePosixPath(name).parts}
