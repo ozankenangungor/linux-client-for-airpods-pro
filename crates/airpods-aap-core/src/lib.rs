@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 //! Platform-independent types and parsers for proven AAP wire structures.
 //!
-//! This crate owns production heart-rate parsing and performs no operating-system
-//! I/O. Python retains the public models, errors, and Linux integration.
+//! This crate owns production heart-rate parsing and pure AAP frame analysis.
+//! It performs no operating-system I/O. Python retains the public models,
+//! errors, and Linux integration.
 
+mod analysis;
 mod heart_rate;
+
+pub use analysis::DescriptorEvidence;
 
 pub use heart_rate::{
     HEART_RATE_MARKER, HEART_RATE_REPORT_ID, HEART_RATE_REPORT_SIZE, HeartRateParseError,
