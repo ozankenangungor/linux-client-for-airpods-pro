@@ -654,7 +654,7 @@ class SemanticsProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticsStaticSafetyTests(unittest.TestCase):
-    def test_frozen_protocol_parser_transport_and_monitor_hashes(self) -> None:
+    def test_frozen_protocol_transport_and_monitor_hashes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         expected = {
             "src/airpods_hr/protocol.py": (
@@ -666,9 +666,7 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
             "src/airpods_hr/bluez_coexistence.py": (
                 "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
             ),
-            "src/airpods_hr/heartrate.py": (
-                "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
-            ),
+            # Iteration 10.1 parser compatibility is covered by golden and native tests.
             "src/airpods_hr/aap.py": (
                 "a48cbb25a76e85d251d02611f04cd344b4f1704176b3a501226ab9dd1de2d28b"
             ),

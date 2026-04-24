@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Private PyO3 bridge to `airpods-aap-core` for development parity tests.
+//! Private production PyO3 bridge to the authoritative `airpods-aap-core` parser.
 
 use airpods_aap_core::{
     HeartRateParseError, HeartRateReport, SourceSide, parse_heart_rate_packet as parse_core,
@@ -29,7 +29,11 @@ create_exception!(
 );
 
 /// Private Python view of the neutral core report.
-#[pyclass(frozen, module = "_airpods_aap_core", name = "_HeartRateReport")]
+#[pyclass(
+    frozen,
+    module = "airpods_hr._airpods_aap_core",
+    name = "_HeartRateReport"
+)]
 struct PyHeartRateReport {
     inner: HeartRateReport,
 }

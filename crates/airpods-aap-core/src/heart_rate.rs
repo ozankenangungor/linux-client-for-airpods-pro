@@ -48,7 +48,7 @@ impl HeartRateReport {
     }
 }
 
-/// Failures exposed by the authoritative Python parser contract.
+/// Failures mapped to the public Python parser exception categories.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeartRateParseError {
     MarkerNotFound,
@@ -75,7 +75,7 @@ impl std::error::Error for HeartRateParseError {}
 
 /// Finds and decodes the first canonical heart-rate report in an AAP packet.
 ///
-/// This deliberately mirrors the frozen Python parser: it searches for the
+/// This preserves the established Python API contract: it searches for the
 /// marker, requires at least 18 bytes after that marker, validates report ID
 /// `0x01`, and ignores bytes after the report slice.
 pub fn parse_heart_rate_packet(packet: &[u8]) -> Result<HeartRateReport, HeartRateParseError> {

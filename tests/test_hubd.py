@@ -1398,10 +1398,14 @@ class SocketPathSafetyTests(unittest.TestCase):
         for path in production_files:
             self.assertNotIn("airpods_hr._hubd", path.read_text(), path.name)
 
-    def test_python_production_code_does_not_select_rust_parser(self) -> None:
+    def test_only_public_parser_adapter_imports_native_bridge(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src"
-        for path in root.rglob("*.py"):
-            self.assertNotIn("_airpods_aap_core", path.read_text(), str(path))
+        native_importers = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*.py")
+            if "_airpods_aap_core" in path.read_text()
+        }
+        self.assertEqual(native_importers, {"airpods_hr/heartrate.py"})
 
 
 class HubProbeTests(unittest.TestCase):

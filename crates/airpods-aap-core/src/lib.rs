@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! Platform-independent types and parsers for proven AAP wire structures.
 //!
-//! This crate performs no operating-system I/O. The Python implementation in
-//! the repository remains authoritative for production behavior.
+//! This crate owns production heart-rate parsing and performs no operating-system
+//! I/O. Python retains the public models, errors, and Linux integration.
 
 mod heart_rate;
 

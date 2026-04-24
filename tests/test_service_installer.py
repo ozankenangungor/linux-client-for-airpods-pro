@@ -572,7 +572,7 @@ class PackageBoundaryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(
-            project["tool"]["setuptools"]["packages"]["find"]["where"], ["src"]
+            project["tool"]["maturin"]["python-packages"], ["airpods_hr"]
         )
         self.assertFalse((root / "src/airpods_client").exists())
         self.assertTrue(

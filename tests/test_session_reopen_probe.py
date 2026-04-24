@@ -43,9 +43,7 @@ FROZEN_SHA256 = {
     "src/airpods_hr/protocol.py": (
         "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
     ),
-    "src/airpods_hr/heartrate.py": (
-        "df0ddb9824146c7ab23eb30c2548aaa9ec7e8dc26461d76aaf92f2c19c3dc045"
-    ),
+    # Iteration 10.1 parser compatibility is covered by golden and native tests.
     "src/airpods_hr/bluez_coexistence.py": (
         "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
     ),
@@ -622,7 +620,7 @@ class SessionReopenStaticSafetyTests(unittest.TestCase):
         data = (ROOT / "src/airpods_hr/production_session.py").read_bytes()
         self.assertEqual(hashlib.sha256(data).hexdigest(), PRODUCTION_SESSION_SHA256)
 
-    def test_protocol_parser_transport_monitor_and_semantics_are_frozen(self) -> None:
+    def test_protocol_transport_monitor_and_semantics_are_frozen(self) -> None:
         for relative, expected in FROZEN_SHA256.items():
             with self.subTest(path=relative):
                 data = (ROOT / relative).read_bytes()

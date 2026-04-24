@@ -1,12 +1,8 @@
-"""Hardware-independent parsing for observed AAP heart-rate reports."""
+"""Public Python models and errors for the authoritative Rust heart-rate parser."""
 
 from dataclasses import dataclass, field
 
-from airpods_hr.protocol import (
-    HEART_RATE_MARKER,
-    HEART_RATE_REPORT_ID,
-    HEART_RATE_REPORT_SIZE,
-)
+import airpods_hr._airpods_aap_core as _rust_core
 
 
 class HeartRateParseError(ValueError):
@@ -61,29 +57,21 @@ def parse_heart_rate_packet(packet: bytes) -> HeartRateReport:
     if not isinstance(packet, bytes):
         raise TypeError("packet must be a bytes object")
 
-    marker_offset = packet.find(HEART_RATE_MARKER)
-    if marker_offset < 0:
-        raise HeartRateMarkerNotFoundError("heart-rate marker not found")
-
-    report_offset = marker_offset + len(HEART_RATE_MARKER)
-    report = packet[report_offset : report_offset + HEART_RATE_REPORT_SIZE]
-    if len(report) != HEART_RATE_REPORT_SIZE:
-        raise HeartRateReportTruncatedError(
-            f"heart-rate report is truncated: expected "
-            f"{HEART_RATE_REPORT_SIZE} bytes, found {len(report)}"
-        )
-
-    if report[0] != HEART_RATE_REPORT_ID:
-        raise HeartRateReportIDError(
-            f"unexpected heart-rate report ID: 0x{report[0]:02x}"
-        )
+    try:
+        report = _rust_core.parse_heart_rate_packet(packet)
+    except _rust_core.MarkerNotFoundError as error:
+        raise HeartRateMarkerNotFoundError(str(error)) from None
+    except _rust_core.TruncatedReportError as error:
+        raise HeartRateReportTruncatedError(str(error)) from None
+    except _rust_core.InvalidReportIdError as error:
+        raise HeartRateReportIDError(str(error)) from None
 
     return HeartRateReport(
-        bpm=report[1],
-        aux=report[2],
-        sequence=int.from_bytes(report[3:5], "little"),
-        field_5=report[5],
-        timestamp_ticks=int.from_bytes(report[6:14], "little"),
-        flags=int.from_bytes(report[14:18], "little"),
-        raw_report=report,
+        bpm=report.bpm,
+        aux=report.aux,
+        sequence=report.sequence,
+        field_5=report.field_5,
+        timestamp_ticks=report.timestamp_ticks,
+        flags=report.flags,
+        raw_report=report.raw_report,
     )

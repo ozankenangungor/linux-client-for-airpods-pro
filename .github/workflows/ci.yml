@@ -30,20 +30,14 @@ jobs:
           python-version: "3.14"
           cache: pip
       - uses: dtolnay/rust-toolchain@1.97.0
-      - run: python -m pip install -e . maturin==1.15.0
-      - name: Build and install private FFI parity wheel
-        working-directory: crates/airpods-aap-py
-        run: |
-          maturin build --release --locked \
-            --interpreter "${{ steps.setup-python.outputs.python-path }}" \
-            --out "${{ runner.temp }}/ffi-wheel"
-          python -m pip install --no-deps "${{ runner.temp }}/ffi-wheel/"*.whl
-      - name: Verify native FFI binding
+      - name: Build and install production package (editable)
+        run: python -m pip install -e . --config-settings=build-args=--locked
+      - name: Verify production native parser
         run: >-
-          python -c 'import inspect, pathlib, sys; import _airpods_aap_core as ffi;
+          python -c 'import inspect, sys; import airpods_hr.heartrate;
+          ffi = sys.modules["airpods_hr._airpods_aap_core"];
           assert sys.version_info[:2] == (3, 14);
           assert inspect.isbuiltin(ffi.parse_heart_rate_packet);
-          assert pathlib.Path(ffi.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve());
           print(f"python={sys.executable} ffi={ffi.__file__}")'
       - run: python tools/validate_release.py --scope python
 
@@ -90,7 +84,7 @@ jobs:
           python-version: "3.14"
           cache: pip
       - uses: dtolnay/rust-toolchain@1.97.0
-      - run: python -m pip install -e .
+      - run: python -m pip install -e . --config-settings=build-args=--locked
       - run: python tools/validate_release.py --scope cross-language
 
   release-artifacts:
