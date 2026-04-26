@@ -8,7 +8,9 @@
 mod analysis;
 mod heart_rate;
 
-pub use analysis::DescriptorEvidence;
+pub use analysis::{
+    AapFrameSummary, AapType2bFrameSummary, DescriptorEvidence, RecordSuffixSummary,
+};
 
 pub use heart_rate::{
     HEART_RATE_MARKER, HEART_RATE_REPORT_ID, HEART_RATE_REPORT_SIZE, HeartRateParseError,
