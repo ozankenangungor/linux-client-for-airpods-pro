@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import unittest
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -25,7 +26,10 @@ from airpods_hr.aap import (
     BumbleAAPTransport,
     DescriptorEvidence,
     HandshakeObservation,
+    RecordSuffixSummary,
 )
+import airpods_hr._airpods_aap_core as _rust_core
+import airpods_hr.aap as aap_module
 from airpods_hr.aap_channel import AAPChannelSession
 from airpods_hr.aap_channel import AAPChannelOpenError
 from airpods_hr.authentication import AuthenticatedClassicContext
@@ -359,6 +363,20 @@ class HandshakeProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DescriptorEvidenceTests(unittest.TestCase):
+    def test_native_merge_preserves_model_and_accumulates(self) -> None:
+        with patch.object(_rust_core, "merge_descriptor_evidence", wraps=_rust_core.merge_descriptor_evidence) as native:
+            evidence = DescriptorEvidence(heart_rate=True).merged(b"ReportDescriptor")
+        native.assert_called_once_with(b"ReportDescriptor", False, False, True, False)
+        self.assertIs(type(evidence), DescriptorEvidence)
+        self.assertEqual(evidence, DescriptorEvidence(True, False, True, False))
+        self.assertFalse(evidence.required)
+        self.assertTrue(evidence.merged(b"HeartRateService").required)
+
+    def test_native_failure_propagates(self) -> None:
+        with patch.object(_rust_core, "merge_descriptor_evidence", side_effect=RuntimeError("native failed")):
+            with self.assertRaisesRegex(RuntimeError, "native failed"):
+                DescriptorEvidence().merged(b"AccessoryService")
+
     def test_heart_rate_service_evidence(self) -> None:
         evidence = DescriptorEvidence().merged(b"xHeartRateService\x00")
         self.assertTrue(evidence.heart_rate_service)
@@ -390,7 +408,50 @@ class DescriptorEvidenceTests(unittest.TestCase):
         self.assertNotIn("com.apple", rendered)
 
 
+class AAPModelCompatibilityTests(unittest.TestCase):
+    def test_dataclass_contract_and_defaults(self) -> None:
+        expected = {
+            DescriptorEvidence: ("sensor_framework", "heart_rate_service", "heart_rate", "heartrate_access"),
+            RecordSuffixSummary: ("suffix_field_u8", "suffix_field_u16", "count"),
+            AAPType2BFrameSummary: ("frame_length", "header_u8_6", "declared_body_length_u16_7_8", "actual_body_length_after_offset_17", "declared_body_length_consistent", "body_aligned_to_17_bytes", "record_count_17", "record_suffix_distinct_count", "record_suffix_histogram", "unit_bytes_8_13_uniform"),
+            AAPFrameSummary: ("length", "header_u16_2_3", "header_u16_4_5", "type_2b_summary"),
+        }
+        for model, names in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(tuple(field.name for field in fields(model)), names)
+                self.assertFalse(hasattr(model(*([None] * len(names))), "__dict__"))
+                with self.assertRaises(FrozenInstanceError):
+                    model(*([None] * len(names))).__setattr__(names[0], True)
+        self.assertEqual(DescriptorEvidence(), DescriptorEvidence(False, False, False, False))
+        self.assertEqual(AAPFrameSummary(3), AAPFrameSummary(3, None, None, None))
+        self.assertEqual(AAPFrameSummary(3).type_2b_summary, None)
+        self.assertEqual(RecordSuffixSummary(1, 2, 3), RecordSuffixSummary(1, 2, 3))
+
+    def test_python_models_remain_the_caller_boundary(self) -> None:
+        self.assertNotIn("_airpods_aap_core", inspect.getsource(aap_module.AAPHandshakeSession))
+        self.assertNotIn("_airpods_aap_core", inspect.getsource(aap_module.AAPHandshakeProbeSession))
+        source = inspect.getsource(aap_module)
+        for migrated in ("SENSOR_FRAMEWORK_MARKERS", "_HEART_RATE_MARKER", "AAP_TYPE_2B_BODY_OFFSET", "suffix_counts", "first_hidden_start"):
+            self.assertNotIn(migrated, source)
+
+
 class AAPFrameSummaryTests(unittest.TestCase):
+    def test_native_summary_returns_python_models(self) -> None:
+        frame = make_synthetic_type_2b_frame([(0x10, 0x1234)])
+        with patch.object(_rust_core, "summarize_aap_frame", wraps=_rust_core.summarize_aap_frame) as native:
+            summary = AAPFrameSummary.from_frame(frame)
+        native.assert_called_once_with(frame)
+        self.assertIs(type(summary), AAPFrameSummary)
+        self.assertIs(type(summary.type_2b_summary), AAPType2BFrameSummary)
+        self.assertIs(type(summary.type_2b_summary.record_suffix_histogram), tuple)
+        self.assertIs(type(summary.type_2b_summary.record_suffix_histogram[0]), RecordSuffixSummary)
+        self.assertEqual(summary.type_2b_summary.record_suffix_histogram, (RecordSuffixSummary(0x10, 0x1234, 1),))
+
+    def test_native_failure_propagates(self) -> None:
+        with patch.object(_rust_core, "summarize_aap_frame", side_effect=RuntimeError("native failed")):
+            with self.assertRaisesRegex(RuntimeError, "native failed"):
+                AAPFrameSummary.from_frame(b"short")
+
     def test_summary_exposes_only_length_and_neutral_header_fields(self) -> None:
         synthetic_payload = bytes.fromhex("04 00 04 00 2B 00") + bytes(351)
 
@@ -416,6 +477,18 @@ class AAPFrameSummaryTests(unittest.TestCase):
 
 
 class AAPType2BFrameSummaryTests(unittest.TestCase):
+    def test_direct_constructor_delegates_to_native(self) -> None:
+        frame = make_synthetic_type_2b_frame([(0xff, 0xffff)])
+        with patch.object(_rust_core, "summarize_type_2b_frame", wraps=_rust_core.summarize_type_2b_frame) as native:
+            summary = AAPType2BFrameSummary.from_frame(frame)
+        native.assert_called_once_with(frame)
+        self.assertEqual(summary, AAPFrameSummary.from_frame(frame).type_2b_summary)
+
+    def test_direct_native_failure_propagates(self) -> None:
+        with patch.object(_rust_core, "summarize_type_2b_frame", side_effect=RuntimeError("native failed")):
+            with self.assertRaisesRegex(RuntimeError, "native failed"):
+                AAPType2BFrameSummary.from_frame(b"short")
+
     def test_non_type_2b_frame_has_no_structural_summary(self) -> None:
         frame = bytearray(20)
         frame[4:6] = (0x002A).to_bytes(2, "little")

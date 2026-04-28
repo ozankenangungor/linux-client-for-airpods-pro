@@ -667,9 +667,7 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
                 "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
             ),
             # Iteration 10.1 parser compatibility is covered by golden and native tests.
-            "src/airpods_hr/aap.py": (
-                "a48cbb25a76e85d251d02611f04cd344b4f1704176b3a501226ab9dd1de2d28b"
-            ),
+            # Iteration 10.2 AAP analysis is covered by native and compatibility tests.
             "src/airpods_hr/heart_rate_session.py": (
                 "80e7031a8688444180dd23e3c22c9d7a062009869403aeb257602c07f547bf8f"
             ),
