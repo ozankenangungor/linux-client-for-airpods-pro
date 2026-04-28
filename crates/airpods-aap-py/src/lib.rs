@@ -2,13 +2,13 @@
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
 use airpods_aap_core::{
-    AapFrameSummary, AapType2bFrameSummary, DescriptorEvidence, HeartRateParseError,
-    HeartRateReport, SourceSide, parse_heart_rate_packet as parse_core,
+    AapFrameSummary, AapType2bFrameSummary, ControlFrameSummary, DescriptorEvidence,
+    HeartRateParseError, HeartRateReport, SourceSide, parse_heart_rate_packet as parse_core,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple};
 
 create_exception!(
     _airpods_aap_core,
@@ -185,6 +185,140 @@ fn summarize_aap_frame(
     )
 }
 
+/// Convert only the core model's fields; all frame interpretation stays in core.
+#[pyfunction]
+fn summarize_control_frame<'py>(
+    py: Python<'py>,
+    frame: &Bound<'py, PyBytes>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let summary = ControlFrameSummary::from_frame(frame.as_bytes());
+    let result = PyDict::new(py);
+    result.set_item("length", summary.length)?;
+    result.set_item("header_u16_2_3", summary.header_u16_2_3)?;
+    result.set_item("header_u16_4_5", summary.header_u16_4_5)?;
+    result.set_item("word_u16_8_9", summary.word_u16_8_9)?;
+    result.set_item("word_u16_10_11", summary.word_u16_10_11)?;
+    result.set_item(
+        "outer_service_envelope_match",
+        summary.outer_service_envelope_match,
+    )?;
+    result.set_item("fixed_word_10_00_match", summary.fixed_word_10_00_match)?;
+    result.set_item(
+        "trailing_length_consistent",
+        summary.trailing_length_consistent,
+    )?;
+    result.set_item("tag_08_at_offset_12", summary.tag_08_at_offset_12)?;
+    result.set_item("service_ack_suffix_0e", summary.service_ack_suffix_0e)?;
+    result.set_item("service_ack_suffix_13", summary.service_ack_suffix_13)?;
+    result.set_item(
+        "candidate_identifier_terminated",
+        summary.candidate_identifier_terminated,
+    )?;
+    result.set_item(
+        "candidate_identifier_octets",
+        summary.candidate_identifier_octets,
+    )?;
+    result.set_item(
+        "candidate_identifier_canonical",
+        summary.candidate_identifier_canonical,
+    )?;
+    result.set_item(
+        "identifier_is_current_canonical_1_or_2",
+        summary.identifier_is_current_canonical_1_or_2,
+    )?;
+    result.set_item("post_identifier_length", summary.post_identifier_length)?;
+    result.set_item(
+        "post_identifier_prefix_octet_0",
+        summary.post_identifier_prefix_octet_0,
+    )?;
+    result.set_item(
+        "post_identifier_prefix_octet_1",
+        summary.post_identifier_prefix_octet_1,
+    )?;
+    result.set_item(
+        "post_identifier_starts_10_01",
+        summary.post_identifier_starts_10_01,
+    )?;
+    result.set_item(
+        "post_identifier_prefix_is_observed",
+        summary.post_identifier_prefix_is_observed,
+    )?;
+    result.set_item(
+        "post_identifier_field_tag",
+        summary.post_identifier_field_tag,
+    )?;
+    result.set_item(
+        "post_identifier_field_parameter",
+        summary.post_identifier_field_parameter,
+    )?;
+    result.set_item(
+        "remainder_is_ack_0e_shape",
+        summary.remainder_is_ack_0e_shape,
+    )?;
+    result.set_item(
+        "remainder_is_ack_13_shape",
+        summary.remainder_is_ack_13_shape,
+    )?;
+    result.set_item(
+        "remainder_is_bootstrap_10_shape",
+        summary.remainder_is_bootstrap_10_shape,
+    )?;
+    result.set_item(
+        "remainder_is_bootstrap_11_12_13_shape",
+        summary.remainder_is_bootstrap_11_12_13_shape,
+    )?;
+    result.set_item("terminal_tag_08", summary.terminal_tag_08)?;
+    result.set_item("terminal_value", summary.terminal_value)?;
+    result.set_item(
+        "observed_62_02_08_group_count",
+        summary.observed_62_02_08_group_count,
+    )?;
+    result.set_item(
+        "observed_62_02_08_terminal_values",
+        summary
+            .observed_62_02_08_terminal_values
+            .map(|values| PyTuple::new(py, values))
+            .transpose()?,
+    )?;
+    result.set_item(
+        "observed_62_02_08_group_offsets",
+        summary
+            .observed_62_02_08_group_offsets
+            .map(|values| PyTuple::new(py, values))
+            .transpose()?,
+    )?;
+    result.set_item(
+        "bootstrap_tail_10_suffix_present",
+        summary.bootstrap_tail_10_suffix_present,
+    )?;
+    result.set_item(
+        "bootstrap_tail_11_12_13_suffix_present",
+        summary.bootstrap_tail_11_12_13_suffix_present,
+    )?;
+    result.set_item("bootstrap_tail_10", summary.bootstrap_tail_10)?;
+    result.set_item("bootstrap_tail_11_12_13", summary.bootstrap_tail_11_12_13)?;
+    result.set_item(
+        "heart_rate_marker_present",
+        summary.heart_rate_marker_present,
+    )?;
+    Ok(result)
+}
+
+#[pyfunction]
+fn is_observed_service_ack(frame: &Bound<'_, PyBytes>, service_id: u8) -> bool {
+    airpods_aap_core::is_observed_service_ack(frame.as_bytes(), service_id)
+}
+
+#[pyfunction]
+fn is_service_ack_candidate_shape(frame: &Bound<'_, PyBytes>) -> bool {
+    airpods_aap_core::is_service_ack_candidate_shape(frame.as_bytes())
+}
+
+#[pyfunction]
+fn is_connect4_ack(frame: &Bound<'_, PyBytes>) -> bool {
+    airpods_aap_core::is_connect4_ack(frame.as_bytes())
+}
+
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyHeartRateReport>()?;
@@ -204,5 +338,9 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(merge_descriptor_evidence, module)?)?;
     module.add_function(wrap_pyfunction!(summarize_type_2b_frame, module)?)?;
     module.add_function(wrap_pyfunction!(summarize_aap_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(summarize_control_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(is_observed_service_ack, module)?)?;
+    module.add_function(wrap_pyfunction!(is_service_ack_candidate_shape, module)?)?;
+    module.add_function(wrap_pyfunction!(is_connect4_ack, module)?)?;
     Ok(())
 }
