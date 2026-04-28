@@ -6,10 +6,14 @@
 //! errors, and Linux integration.
 
 mod analysis;
+mod control;
 mod heart_rate;
 
 pub use analysis::{
     AapFrameSummary, AapType2bFrameSummary, DescriptorEvidence, RecordSuffixSummary,
+};
+pub use control::{
+    ControlFrameSummary, is_connect4_ack, is_observed_service_ack, is_service_ack_candidate_shape,
 };
 
 pub use heart_rate::{
