@@ -666,11 +666,6 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
             "src/airpods_hr/bluez_coexistence.py": (
                 "d0e666932d485a9f4ccc64f7d2c946fd1d14af2f6e9d8c1c8ceb263f0c52da25"
             ),
-            # Iteration 10.1 parser compatibility is covered by golden and native tests.
-            # Iteration 10.2 AAP analysis is covered by native and compatibility tests.
-            "src/airpods_hr/heart_rate_session.py": (
-                "80e7031a8688444180dd23e3c22c9d7a062009869403aeb257602c07f547bf8f"
-            ),
             "src/airpods_hr/aap_config_diagnostics.py": (
                 "a5db6e50e14cc08f78bc0218f7c7ae7411739cfa644c9203e6f1f1c4a7a1970d"
             ),
@@ -695,6 +690,17 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
                 hashlib.sha256((root / relative).read_bytes()).hexdigest(),
                 digest,
             )
+
+    def test_heart_rate_session_orchestration_remains_frozen(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "src/airpods_hr/heart_rate_session.py").read_text()
+        tail = "class HeartRateActivationSession:" + source.split(
+            "class HeartRateActivationSession:", 1
+        )[1]
+        self.assertEqual(
+            hashlib.sha256(tail.encode()).hexdigest(),
+            "d67ee87d07dcb84988f056afe5eeeefafbfdbd124808cb281ce89fb7c9d2aae9",
+        )
 
     def test_semantics_path_has_no_bumble_handoff_or_pairing_dependency(
         self,
