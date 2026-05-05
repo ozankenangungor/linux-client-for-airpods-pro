@@ -5,10 +5,15 @@
 //! It performs no operating-system I/O. Python retains the public models,
 //! errors, and Linux integration.
 
+mod activation;
 mod analysis;
 mod control;
 mod heart_rate;
 
+pub use activation::{
+    ActivationCommand, ActivationEvent, ActivationState, SentCommands, TransitionError, advance,
+    plan_activation_send, plan_cleanup_send,
+};
 pub use analysis::{
     AapFrameSummary, AapType2bFrameSummary, DescriptorEvidence, RecordSuffixSummary,
 };
