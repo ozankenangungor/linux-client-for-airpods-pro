@@ -2,13 +2,87 @@
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
 use airpods_aap_core::{
-    AapFrameSummary, AapType2bFrameSummary, ControlFrameSummary, DescriptorEvidence,
-    HeartRateParseError, HeartRateReport, SourceSide, parse_heart_rate_packet as parse_core,
+    AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
+    ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, SentCommands,
+    SourceSide, TransitionError, advance, parse_heart_rate_packet as parse_core,
+    plan_activation_send, plan_cleanup_send,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple};
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyModule, PyTuple};
+
+fn neutral_u8(value: &Bound<'_, PyAny>) -> PyResult<u8> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("invalid transition identity"));
+    }
+    value
+        .extract::<u8>()
+        .map_err(|_| PyValueError::new_err("invalid transition identity"))
+}
+
+fn neutral_u16(value: &Bound<'_, PyAny>) -> PyResult<u16> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("invalid sent-command mask"));
+    }
+    value
+        .extract::<u16>()
+        .map_err(|_| PyValueError::new_err("invalid sent-command mask"))
+}
+
+fn transition_error(error: TransitionError) -> PyErr {
+    // Numeric categories are private to the bridge. Public messages live in Python.
+    PyValueError::new_err(match error {
+        TransitionError::InvalidActivation => 1,
+        TransitionError::ActivationOnCleanupPath => 2,
+        TransitionError::DuplicateCleanup => 3,
+        TransitionError::StopHrRequiresStartHr => 4,
+        TransitionError::HrOffRequiresHrOn => 5,
+        TransitionError::InvalidAdvance => 6,
+        TransitionError::UnknownIdentity => 7,
+        TransitionError::UnknownSentBits => 8,
+    })
+}
+
+#[pyfunction]
+fn plan_activation_transition(
+    state: &Bound<'_, PyAny>,
+    sent: &Bound<'_, PyAny>,
+    command: &Bound<'_, PyAny>,
+) -> PyResult<u8> {
+    let state = ActivationState::try_from(neutral_u8(state)?).map_err(transition_error)?;
+    let sent = SentCommands::try_from(neutral_u16(sent)?).map_err(transition_error)?;
+    let command = ActivationCommand::try_from(neutral_u8(command)?).map_err(transition_error)?;
+    plan_activation_send(state, sent, command)
+        .map(|next| next as u8)
+        .map_err(transition_error)
+}
+
+#[pyfunction]
+fn plan_cleanup_transition(
+    state: &Bound<'_, PyAny>,
+    sent: &Bound<'_, PyAny>,
+    command: &Bound<'_, PyAny>,
+) -> PyResult<u8> {
+    let state = ActivationState::try_from(neutral_u8(state)?).map_err(transition_error)?;
+    let sent = SentCommands::try_from(neutral_u16(sent)?).map_err(transition_error)?;
+    let command = ActivationCommand::try_from(neutral_u8(command)?).map_err(transition_error)?;
+    plan_cleanup_send(state, sent, command)
+        .map(|next| next as u8)
+        .map_err(transition_error)
+}
+
+#[pyfunction]
+fn advance_activation_transition(
+    state: &Bound<'_, PyAny>,
+    event: &Bound<'_, PyAny>,
+) -> PyResult<u8> {
+    let state = ActivationState::try_from(neutral_u8(state)?).map_err(transition_error)?;
+    let event = ActivationEvent::try_from(neutral_u8(event)?).map_err(transition_error)?;
+    advance(state, event)
+        .map(|next| next as u8)
+        .map_err(transition_error)
+}
 
 create_exception!(
     _airpods_aap_core,
@@ -321,6 +395,9 @@ fn is_connect4_ack(frame: &Bound<'_, PyBytes>) -> bool {
 
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(plan_activation_transition, module)?)?;
+    module.add_function(wrap_pyfunction!(plan_cleanup_transition, module)?)?;
+    module.add_function(wrap_pyfunction!(advance_activation_transition, module)?)?;
     module.add_class::<PyHeartRateReport>()?;
     module.add(
         "MarkerNotFoundError",
