@@ -3,9 +3,11 @@
 
 use airpods_aap_core::{
     AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
-    ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, SentCommands,
-    SourceSide, TransitionError, advance, parse_heart_rate_packet as parse_core,
-    plan_activation_send, plan_cleanup_send,
+    ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, ProductionError,
+    ProductionEvent, ProductionOperation, ProductionState, SentCommands, SourceSide,
+    TransitionError, advance, parse_heart_rate_packet as parse_core, plan_activation_send,
+    plan_cleanup_send, production_operation as check_production_operation,
+    production_transition as advance_production,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
@@ -42,6 +44,45 @@ fn transition_error(error: TransitionError) -> PyErr {
         TransitionError::UnknownIdentity => 7,
         TransitionError::UnknownSentBits => 8,
     })
+}
+
+fn production_error(error: ProductionError) -> PyErr {
+    PyValueError::new_err(match error {
+        ProductionError::UnknownIdentity => 7,
+        ProductionError::InvalidOperation => 9,
+        ProductionError::InvalidTransition => 10,
+    })
+}
+
+/// Private identity inputs follow `neutral_u8`: booleans and non-u8 values
+/// raise ValueError("invalid transition identity"); unknown u8 IDs raise
+/// ValueError(7), illegal operations ValueError(9), illegal events ValueError(10).
+#[pyfunction]
+fn production_operation(state: &Bound<'_, PyAny>, operation: &Bound<'_, PyAny>) -> PyResult<u8> {
+    let state = ProductionState::try_from(neutral_u8(state)?).map_err(production_error)?;
+    let operation =
+        ProductionOperation::try_from(neutral_u8(operation)?).map_err(production_error)?;
+    check_production_operation(state, operation)
+        .map(|next| next as u8)
+        .map_err(production_error)
+}
+
+/// `cleanup_complete` must be a Python bool, even when the event ignores it.
+#[pyfunction]
+fn production_transition(
+    state: &Bound<'_, PyAny>,
+    event: &Bound<'_, PyAny>,
+    cleanup_complete: &Bound<'_, PyAny>,
+) -> PyResult<u8> {
+    let state = ProductionState::try_from(neutral_u8(state)?).map_err(production_error)?;
+    let event = ProductionEvent::try_from(neutral_u8(event)?).map_err(production_error)?;
+    if !cleanup_complete.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("invalid cleanup_complete flag"));
+    }
+    let cleanup_complete = cleanup_complete.extract::<bool>()?;
+    advance_production(state, event, cleanup_complete)
+        .map(|next| next as u8)
+        .map_err(production_error)
 }
 
 #[pyfunction]
@@ -398,6 +439,8 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(plan_activation_transition, module)?)?;
     module.add_function(wrap_pyfunction!(plan_cleanup_transition, module)?)?;
     module.add_function(wrap_pyfunction!(advance_activation_transition, module)?)?;
+    module.add_function(wrap_pyfunction!(production_operation, module)?)?;
+    module.add_function(wrap_pyfunction!(production_transition, module)?)?;
     module.add_class::<PyHeartRateReport>()?;
     module.add(
         "MarkerNotFoundError",
