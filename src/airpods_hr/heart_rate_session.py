@@ -195,6 +195,42 @@ class HeartRateActivationState(IntEnum):
     COMPLETE = 15
 
 
+_TRANSITION_ERRORS = {
+    1: "invalid or duplicate HR activation transition",
+    2: "activation command cannot use cleanup path",
+    3: "duplicate HR cleanup command",
+    4: "STOP_HR requires START_HR",
+    5: "HR_OFF requires HR_ON",
+    6: "invalid HR state advancement",
+}
+_COMMAND_IDENTITIES = {command: index for index, command in enumerate(HeartRateCommand)}
+_STOP_HEAD_ACK = 0
+_CONNECT4_ACK = 1
+_START_HR_ACK = 2
+_STREAM_COMPLETE = 3
+_STOP_HR_ACK = 4
+_COMPLETE = 5
+
+
+def _sent_mask(sent: set[HeartRateCommand]) -> int:
+    """Encode declaration-order command identities; no transition decisions."""
+
+    return sum(1 << _COMMAND_IDENTITIES[command] for command in sent)
+
+
+def _native_state(call: Callable[..., int], *args: int) -> HeartRateActivationState:
+    try:
+        return HeartRateActivationState(call(*args))
+    except ValueError as error:
+        raise HeartRateStateError(
+            _TRANSITION_ERRORS.get(error.args[0], "invalid HR state advancement")
+        ) from error
+
+
+def _command_id(command: HeartRateCommand) -> int:
+    return _COMMAND_IDENTITIES[command]
+
+
 class HeartRateCompletion(StrEnum):
     TARGET_REACHED = "target_reached"
     PARTIAL = "partial"
@@ -365,8 +401,6 @@ class HeartRateActivationSession:
             self._send_activation(
                 transport,
                 HeartRateCommand.STOP_HEAD,
-                HeartRateActivationState.DESCRIPTORS_READY,
-                HeartRateActivationState.STOP_HEAD_SENT,
             )
             stop_head_sent_at = self._clock()
             await self._wait_required_ack(
@@ -376,52 +410,40 @@ class HeartRateActivationSession:
                 stop_head_sent_at=stop_head_sent_at,
                 frames_queued_before_stop_head=frames_queued_before_stop_head,
             )
-            self.state = HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED
+            self._advance(_STOP_HEAD_ACK)
             self._emit(HeartRateProgress.STOP_HEAD_ACKNOWLEDGED)
 
             self._send_activation(
                 transport,
                 HeartRateCommand.CONNECT0,
-                HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED,
-                HeartRateActivationState.CONNECT0_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.CAPS0,
-                HeartRateActivationState.CONNECT0_SENT,
-                HeartRateActivationState.CAPS0_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.CONNECT4,
-                HeartRateActivationState.CAPS0_SENT,
-                HeartRateActivationState.CONNECT4_SENT,
             )
             await self._wait_required_ack(
                 transport,
                 is_connect4_ack,
                 HeartRateConnectAckTimeoutError,
             )
-            self.state = HeartRateActivationState.CONNECT4_ACKNOWLEDGED
+            self._advance(_CONNECT4_ACK)
             self._emit(HeartRateProgress.CONTROL_CHANNELS_READY)
 
             self._send_activation(
                 transport,
                 HeartRateCommand.CAPS4,
-                HeartRateActivationState.CONNECT4_ACKNOWLEDGED,
-                HeartRateActivationState.CAPS4_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.HR_ON,
-                HeartRateActivationState.CAPS4_SENT,
-                HeartRateActivationState.HR_ON_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.START_HR,
-                HeartRateActivationState.HR_ON_SENT,
-                HeartRateActivationState.START_HR_SENT,
             )
             await self._wait_required_ack(
                 transport,
@@ -430,7 +452,7 @@ class HeartRateActivationSession:
                 ),
                 HeartRateStartAckTimeoutError,
             )
-            self.state = HeartRateActivationState.START_ACKNOWLEDGED
+            self._advance(_START_HR_ACK)
             self._emit(HeartRateProgress.START_ACKNOWLEDGED)
 
             (
@@ -444,7 +466,7 @@ class HeartRateActivationSession:
                     malformed_hr_frames=malformed_hr_frames,
                     control_frames_observed=self._control_frames_observed,
                 )
-            self.state = HeartRateActivationState.STREAM_COMPLETE
+            self._advance(_STREAM_COMPLETE)
         except BaseException as error:
             primary_error = error
             raise
@@ -452,12 +474,11 @@ class HeartRateActivationSession:
             if HeartRateCommand.START_HR in self._sent:
                 try:
                     self._send_cleanup(transport, HeartRateCommand.STOP_HR)
-                    self.state = HeartRateActivationState.STOP_HR_SENT
                     stop_acknowledged = await self._wait_optional_stop_ack(
                         transport
                     )
                     if stop_acknowledged:
-                        self.state = HeartRateActivationState.STOP_HR_ACKNOWLEDGED
+                        self._advance(_STOP_HR_ACK)
                         self._emit(HeartRateProgress.STOP_ACKNOWLEDGED)
                     else:
                         self._emit(HeartRateProgress.STOP_ACK_MISSING)
@@ -467,7 +488,6 @@ class HeartRateActivationSession:
             if HeartRateCommand.HR_ON in self._sent:
                 try:
                     self._send_cleanup(transport, HeartRateCommand.HR_OFF)
-                    self.state = HeartRateActivationState.HR_OFF_SENT
                     self._emit(HeartRateProgress.HR_OFF_SENT)
                 except BaseException as error:
                     cleanup_errors.append(error)
@@ -482,7 +502,7 @@ class HeartRateActivationSession:
                         "heart-rate stop cleanup failed"
                     ) from cleanup_errors[-1]
 
-        self.state = HeartRateActivationState.COMPLETE
+        self._advance(_COMPLETE)
         if transport.application_payloads_sent != 10:
             raise HeartRateStateError(
                 "successful heart-rate session sent an unexpected payload count"
@@ -503,15 +523,22 @@ class HeartRateActivationSession:
             malformed_hr_frames=malformed_hr_frames,
         )
 
+    def _advance(self, event: int) -> None:
+        self.state = _native_state(
+            _native.advance_activation_transition, int(self.state), event
+        )
+
     def _send_activation(
         self,
         transport: CollectedHeartRateTransport,
         command: HeartRateCommand,
-        expected: HeartRateActivationState,
-        next_state: HeartRateActivationState,
     ) -> None:
-        if self.state is not expected or command in self._sent:
-            raise HeartRateStateError("invalid or duplicate HR activation transition")
+        next_state = _native_state(
+            _native.plan_activation_transition,
+            int(self.state),
+            _sent_mask(self._sent),
+            _command_id(command),
+        )
         transport.send_heart_rate_command(command)
         self._sent.add(command)
         self.state = next_state
@@ -521,17 +548,15 @@ class HeartRateActivationSession:
         transport: CollectedHeartRateTransport,
         command: HeartRateCommand,
     ) -> None:
-        if command not in (HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF):
-            raise HeartRateStateError("activation command cannot use cleanup path")
-        if command in self._sent:
-            raise HeartRateStateError("duplicate HR cleanup command")
-        if command is HeartRateCommand.STOP_HR:
-            if HeartRateCommand.START_HR not in self._sent:
-                raise HeartRateStateError("STOP_HR requires START_HR")
-        elif HeartRateCommand.HR_ON not in self._sent:
-            raise HeartRateStateError("HR_OFF requires HR_ON")
+        next_state = _native_state(
+            _native.plan_cleanup_transition,
+            int(self.state),
+            _sent_mask(self._sent),
+            _command_id(command),
+        )
         transport.send_heart_rate_command(command)
         self._sent.add(command)
+        self.state = next_state
 
     async def _wait_required_ack(
         self,
@@ -702,8 +727,6 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
             self._send_activation(
                 transport,
                 HeartRateCommand.STOP_HEAD,
-                HeartRateActivationState.DESCRIPTORS_READY,
-                HeartRateActivationState.STOP_HEAD_SENT,
             )
             stop_head_sent_at = self._clock()
             await self._wait_required_ack(
@@ -713,52 +736,40 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
                 stop_head_sent_at=stop_head_sent_at,
                 frames_queued_before_stop_head=frames_queued_before_stop_head,
             )
-            self.state = HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED
+            self._advance(_STOP_HEAD_ACK)
             self._emit(HeartRateProgress.STOP_HEAD_ACKNOWLEDGED)
 
             self._send_activation(
                 transport,
                 HeartRateCommand.CONNECT0,
-                HeartRateActivationState.STOP_HEAD_ACKNOWLEDGED,
-                HeartRateActivationState.CONNECT0_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.CAPS0,
-                HeartRateActivationState.CONNECT0_SENT,
-                HeartRateActivationState.CAPS0_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.CONNECT4,
-                HeartRateActivationState.CAPS0_SENT,
-                HeartRateActivationState.CONNECT4_SENT,
             )
             await self._wait_required_ack(
                 transport,
                 is_connect4_ack,
                 HeartRateConnectAckTimeoutError,
             )
-            self.state = HeartRateActivationState.CONNECT4_ACKNOWLEDGED
+            self._advance(_CONNECT4_ACK)
             self._emit(HeartRateProgress.CONTROL_CHANNELS_READY)
 
             self._send_activation(
                 transport,
                 HeartRateCommand.CAPS4,
-                HeartRateActivationState.CONNECT4_ACKNOWLEDGED,
-                HeartRateActivationState.CAPS4_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.HR_ON,
-                HeartRateActivationState.CAPS4_SENT,
-                HeartRateActivationState.HR_ON_SENT,
             )
             self._send_activation(
                 transport,
                 HeartRateCommand.START_HR,
-                HeartRateActivationState.HR_ON_SENT,
-                HeartRateActivationState.START_HR_SENT,
             )
             await self._wait_required_ack(
                 transport,
@@ -767,7 +778,7 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
                 ),
                 HeartRateStartAckTimeoutError,
             )
-            self.state = HeartRateActivationState.START_ACKNOWLEDGED
+            self._advance(_START_HR_ACK)
             self._emit(HeartRateProgress.START_ACKNOWLEDGED)
 
             while not stop_event.is_set():
@@ -785,7 +796,7 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
                     continue
                 samples_observed += 1
                 self._emit(HeartRateProgress.SAMPLE, report)
-            self.state = HeartRateActivationState.STREAM_COMPLETE
+            self._advance(_STREAM_COMPLETE)
         except BaseException as error:
             primary_error = error
             raise
@@ -793,12 +804,11 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
             if HeartRateCommand.START_HR in self._sent:
                 try:
                     self._send_cleanup(transport, HeartRateCommand.STOP_HR)
-                    self.state = HeartRateActivationState.STOP_HR_SENT
                     stop_acknowledged = await self._wait_optional_stop_ack(
                         transport
                     )
                     if stop_acknowledged:
-                        self.state = HeartRateActivationState.STOP_HR_ACKNOWLEDGED
+                        self._advance(_STOP_HR_ACK)
                         self._emit(HeartRateProgress.STOP_ACKNOWLEDGED)
                     else:
                         self._emit(HeartRateProgress.STOP_ACK_MISSING)
@@ -810,7 +820,6 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
             if HeartRateCommand.HR_ON in self._sent:
                 try:
                     self._send_cleanup(transport, HeartRateCommand.HR_OFF)
-                    self.state = HeartRateActivationState.HR_OFF_SENT
                     self._emit(HeartRateProgress.HR_OFF_SENT)
                 except asyncio.CancelledError as error:
                     cleanup_cancellation = error
@@ -833,7 +842,7 @@ class HeartRateMonitorActivationSession(HeartRateActivationSession):
                         "heart-rate stop cleanup failed"
                     ) from cleanup_errors[-1]
 
-        self.state = HeartRateActivationState.COMPLETE
+        self._advance(_COMPLETE)
         if transport.application_payloads_sent != 10:
             raise HeartRateStateError(
                 "successful heart-rate monitor sent an unexpected payload count"

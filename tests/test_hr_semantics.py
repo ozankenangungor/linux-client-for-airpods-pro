@@ -699,7 +699,7 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
         )[1]
         self.assertEqual(
             hashlib.sha256(tail.encode()).hexdigest(),
-            "d67ee87d07dcb84988f056afe5eeeefafbfdbd124808cb281ce89fb7c9d2aae9",
+            "28ed4077035611f980ec62030d92aefc584fa7d3528fe2dab79ff1b32d6d11fd",
         )
 
     def test_semantics_path_has_no_bumble_handoff_or_pairing_dependency(

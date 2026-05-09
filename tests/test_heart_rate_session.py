@@ -26,6 +26,7 @@ from airpods_hr.heart_rate_session import (
     DEFAULT_SAMPLE_TARGET,
     DEFAULT_STREAM_TIMEOUT,
     HeartRateActivationSession,
+    HeartRateActivationState,
     HeartRateBootstrapAckTimeoutError,
     HeartRateCleanupError,
     HeartRateCompletion,
@@ -949,7 +950,8 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock()
         transport = FakeCollectedTransport(successful_frames(), clock)
 
-        result = await self.make_session(clock).run_collected(
+        session = self.make_session(clock)
+        result = await session.run_collected(
             transport, completed_handshake()
         )
 
@@ -970,6 +972,7 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.application_payloads_sent, 10)
         self.assertEqual(result.completion, HeartRateCompletion.TARGET_REACHED)
         self.assertTrue(result.stop_acknowledged)
+        self.assertIs(session.state, HeartRateActivationState.COMPLETE)
 
     async def test_real_literal_acknowledgements_drive_full_session(self) -> None:
         clock = FakeClock(now=2)
@@ -1143,10 +1146,12 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)], clock
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateNoSamplesError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
+        self.assertIs(session.state, HeartRateActivationState.HR_OFF_SENT)
 
         self.assertEqual(
             transport.commands[-2:],
@@ -1169,12 +1174,14 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(now=2)
         transport = FakeCollectedTransport([], clock)
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateBootstrapAckTimeoutError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
         self.assertEqual(transport.commands, [HeartRateCommand.STOP_HEAD])
+        self.assertIs(session.state, HeartRateActivationState.STOP_HEAD_SENT)
 
     async def test_stop_timeout_carries_bounded_safe_relative_diagnostics(
         self,
@@ -1218,13 +1225,15 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(now=2)
         transport = FakeCollectedTransport([service_ack(0x0E)], clock)
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateConnectAckTimeoutError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
         self.assertEqual(clock.now, 5)
         self.assertNotIn(HeartRateCommand.HR_ON, transport.commands)
+        self.assertIs(session.state, HeartRateActivationState.CONNECT4_SENT)
 
     async def test_failure_after_hr_on_before_start_sends_only_hr_off(self) -> None:
         clock = FakeClock(now=2)
@@ -1234,8 +1243,9 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             fail_send={HeartRateCommand.START_HR},
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(RuntimeError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
@@ -1244,6 +1254,8 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             [HeartRateCommand.HR_ON, HeartRateCommand.HR_OFF],
         )
         self.assertNotIn(HeartRateCommand.STOP_HR, transport.commands)
+        self.assertIs(session.state, HeartRateActivationState.HR_OFF_SENT)
+        self.assertNotIn(HeartRateCommand.START_HR, session._sent)
 
     async def test_start_timeout_attempts_stop_then_hr_off(self) -> None:
         clock = FakeClock(now=2)
@@ -1251,8 +1263,9 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             [service_ack(0x0E), CONNECT4_ACK], clock
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateStartAckTimeoutError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
@@ -1260,6 +1273,7 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             transport.commands[-2:],
             [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
         )
+        self.assertIs(session.state, HeartRateActivationState.HR_OFF_SENT)
 
     async def test_stop_ack_timeout_still_sends_hr_off(self) -> None:
         clock = FakeClock(now=2)
@@ -1267,7 +1281,8 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             successful_frames(include_stop_ack=False), clock
         )
 
-        result = await self.make_session(clock).run_collected(
+        session = self.make_session(clock)
+        result = await session.run_collected(
             transport, completed_handshake()
         )
 
@@ -1276,6 +1291,7 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             transport.commands[-2:],
             [HeartRateCommand.STOP_HR, HeartRateCommand.HR_OFF],
         )
+        self.assertIs(session.state, HeartRateActivationState.COMPLETE)
 
     async def test_primary_failure_is_not_masked_by_cleanup_failure(self) -> None:
         clock = FakeClock(now=2)
@@ -1285,12 +1301,15 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             fail_send={HeartRateCommand.HR_OFF},
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateNoSamplesError) as raised:
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
         self.assertTrue(any("cleanup" in note for note in raised.exception.__notes__))
+        self.assertIs(session.state, HeartRateActivationState.STOP_HR_SENT)
+        self.assertNotIn(HeartRateCommand.HR_OFF, session._sent)
 
     async def test_stop_send_failure_still_attempts_hr_off(self) -> None:
         clock = FakeClock(now=2)
@@ -1300,12 +1319,15 @@ class HeartRateActivationTests(unittest.IsolatedAsyncioTestCase):
             fail_send={HeartRateCommand.STOP_HR},
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateCleanupError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake()
             )
 
         self.assertIn(HeartRateCommand.HR_OFF, transport.commands)
+        self.assertIs(session.state, HeartRateActivationState.HR_OFF_SENT)
+        self.assertNotIn(HeartRateCommand.STOP_HR, session._sent)
 
     async def test_cancellation_after_start_attempts_both_cleanup_commands(self) -> None:
         clock = FakeClock(now=2)
@@ -1533,11 +1555,13 @@ class HeartRateMonitorActivationTests(unittest.IsolatedAsyncioTestCase):
         transport = FakeCollectedTransport(
             successful_frames(1, include_stop_ack=False), clock
         )
-        result = await self.make_session(clock, progress=progress).run_collected(
+        session = self.make_session(clock, progress=progress)
+        result = await session.run_collected(
             transport, completed_handshake(), stop_event
         )
 
         self.assertFalse(result.stop_acknowledged)
+        self.assertIs(session.state, HeartRateActivationState.COMPLETE)
         self.assertEqual(result.application_payloads_sent, 10)
         self.assertEqual(
             transport.commands[-2:],
@@ -1565,13 +1589,16 @@ class HeartRateMonitorActivationTests(unittest.IsolatedAsyncioTestCase):
             [service_ack(0x0E), CONNECT4_ACK, service_ack(0x13)], clock
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(HeartRateCleanupError):
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake(), stop_event
             )
 
         self.assertEqual(transport.attempts.count(HeartRateCommand.STOP_HR), 1)
         self.assertEqual(transport.attempts.count(HeartRateCommand.HR_OFF), 1)
+        self.assertIs(session.state, HeartRateActivationState.HR_OFF_SENT)
+        self.assertNotIn(HeartRateCommand.STOP_HR, session._sent)
 
     async def test_receive_failure_preserves_primary_after_cleanup(self) -> None:
         class MonitorReceiveError(RuntimeError):
@@ -1602,14 +1629,17 @@ class HeartRateMonitorActivationTests(unittest.IsolatedAsyncioTestCase):
             clock,
         )
 
+        session = self.make_session(clock)
         with self.assertRaises(MonitorReceiveError) as raised:
-            await self.make_session(clock).run_collected(
+            await session.run_collected(
                 transport, completed_handshake(), asyncio.Event()
             )
 
         self.assertEqual(transport.attempts.count(HeartRateCommand.STOP_HR), 1)
         self.assertEqual(transport.attempts.count(HeartRateCommand.HR_OFF), 1)
         self.assertTrue(any("cleanup" in note for note in raised.exception.__notes__))
+        self.assertIs(session.state, HeartRateActivationState.STOP_HR_ACKNOWLEDGED)
+        self.assertNotIn(HeartRateCommand.HR_OFF, session._sent)
 
     async def test_progress_callback_failure_preserves_primary(self) -> None:
         class ProgressError(RuntimeError):
