@@ -10,10 +10,12 @@ import errno
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 
 from dbus_next.errors import DBusError
+
+from airpods_hr import _airpods_aap_core as _native
 
 from airpods_hr.aap import (
     AAPDescriptorObservationTimeoutError,
@@ -67,6 +69,30 @@ class ProductionSessionState(StrEnum):
     STREAMING = "streaming"
     STOPPING = "stopping"
     FAILED = "failed"
+
+
+# Numeric identities are private FFI keys, not another lifecycle policy table.
+_NATIVE_STATES = tuple(ProductionSessionState)
+
+
+class _ProductionOperation(IntEnum):
+    OPEN = 0
+    START = 1
+    RECEIVE_REPORT = 2
+    STOP = 3
+    CLOSE = 4
+
+
+class _ProductionEvent(IntEnum):
+    OPEN_BEGIN = 0
+    OPEN_SUCCEEDED = 1
+    OPERATION_FAILED = 2
+    START_BEGIN = 3
+    START_SUCCEEDED = 4
+    RECEIVE_ACTIVATION_FAILED = 5
+    STOP_BEGIN = 6
+    STOP_SUCCEEDED = 7
+    CLOSE_FINALIZED = 8
 
 
 class ProductionSessionCategory(StrEnum):
@@ -353,10 +379,39 @@ class InternalProductionSession:
             and self._transport.cleanup_complete
         )
 
+    def _require_operation(self, operation: str) -> None:
+        try:
+            _native.production_operation(
+                _NATIVE_STATES.index(self.state),
+                _ProductionOperation[operation.upper()].value,
+            )
+        except ValueError as error:
+            if error.args == (9,):
+                raise ProductionSessionStateError(operation, self.state) from error
+            raise ProductionSessionError(
+                ProductionSessionCategory.INVALID_STATE,
+                operation,
+                "native lifecycle operation failed",
+            ) from error
+
+    def _advance(
+        self, event: _ProductionEvent, *, cleanup_complete: bool = False
+    ) -> None:
+        try:
+            next_state = _native.production_transition(
+                _NATIVE_STATES.index(self.state), event.value, cleanup_complete
+            )
+            self.state = _NATIVE_STATES[next_state]
+        except (ValueError, IndexError, TypeError) as error:
+            raise ProductionSessionError(
+                ProductionSessionCategory.INVALID_STATE,
+                "lifecycle",
+                "native lifecycle transition failed",
+            ) from error
+
     async def open(self) -> None:
         async with self._lifecycle_lock:
-            if self.state is not ProductionSessionState.CLOSED:
-                raise ProductionSessionStateError("open", self.state)
+            self._require_operation("open")
             if self._open_attempted:
                 raise ProductionSessionError(
                     ProductionSessionCategory.INVALID_STATE,
@@ -364,7 +419,7 @@ class InternalProductionSession:
                     "session objects are single-use after close or open failure",
                 )
             self._open_attempted = True
-            self.state = ProductionSessionState.OPENING
+            self._advance(_ProductionEvent.OPEN_BEGIN)
             phase = "bluez_connect"
             try:
                 self._output("OPEN SESSION: BlueZ preflight")
@@ -446,15 +501,14 @@ class InternalProductionSession:
                     category = ProductionSessionCategory.AAP_DESCRIPTOR_TIMEOUT
                 raise _translate_session_error(category, phase, error) from error
 
-            self.state = ProductionSessionState.READY
+            self._advance(_ProductionEvent.OPEN_SUCCEEDED)
             self._output("SESSION READY: descriptor handshake complete")
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
-            if self.state is not ProductionSessionState.READY:
-                raise ProductionSessionStateError("start", self.state)
+            self._require_operation("start")
             assert self._handshake is not None
-            self.state = ProductionSessionState.STARTING
+            self._advance(_ProductionEvent.START_BEGIN)
             loop = asyncio.get_running_loop()
             self._activation_stop = asyncio.Event()
             self._activation_started = loop.create_future()
@@ -498,15 +552,14 @@ class InternalProductionSession:
                     error,
                 ) from error
             self._hr_activations += 1
-            self.state = ProductionSessionState.STREAMING
+            self._advance(_ProductionEvent.START_SUCCEEDED)
 
     async def receive_report(
         self, timeout: float = DEFAULT_REPORT_TIMEOUT
     ) -> HeartRateReport:
         if timeout <= 0:
             raise ValueError("report timeout must be positive")
-        if self.state is not ProductionSessionState.STREAMING:
-            raise ProductionSessionStateError("receive_report", self.state)
+        self._require_operation("receive_report")
         if self._receive_in_progress:
             raise ProductionSessionError(
                 ProductionSessionCategory.INVALID_STATE,
@@ -536,7 +589,7 @@ class InternalProductionSession:
                     control_flow = _nested_control_flow(error)
                     if control_flow is not None:
                         raise control_flow
-                    self.state = ProductionSessionState.FAILED
+                    self._advance(_ProductionEvent.RECEIVE_ACTIVATION_FAILED)
                     raise _translate_session_error(
                         ProductionSessionCategory.RECEIVE_FAILED,
                         "receive_report",
@@ -565,8 +618,7 @@ class InternalProductionSession:
 
     async def stop(self) -> None:
         async with self._lifecycle_lock:
-            if self.state is not ProductionSessionState.STREAMING:
-                raise ProductionSessionStateError("stop", self.state)
+            self._require_operation("stop")
             try:
                 await self._stop_locked()
             except asyncio.CancelledError as error:
@@ -587,6 +639,7 @@ class InternalProductionSession:
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
+            self._require_operation("close")
             if self.state is ProductionSessionState.CLOSED:
                 return
             errors: list[BaseException] = []
@@ -601,10 +654,9 @@ class InternalProductionSession:
                 except BaseException as error:
                     errors.append(error)
             errors.extend(await self._cleanup_resources())
-            self.state = (
-                ProductionSessionState.CLOSED
-                if self.cleanup_complete
-                else ProductionSessionState.FAILED
+            self._advance(
+                _ProductionEvent.CLOSE_FINALIZED,
+                cleanup_complete=self.cleanup_complete,
             )
             cancellation = next(
                 (
@@ -649,7 +701,7 @@ class InternalProductionSession:
     async def _stop_locked(self) -> None:
         assert self._activation_stop is not None
         assert self._activation_task is not None
-        self.state = ProductionSessionState.STOPPING
+        self._advance(_ProductionEvent.STOP_BEGIN)
         self._activation_stop.set()
         try:
             result = await asyncio.wait_for(
@@ -673,7 +725,7 @@ class InternalProductionSession:
             )
         self._hr_stops += 1
         self._clear_activation()
-        self.state = ProductionSessionState.READY
+        self._advance(_ProductionEvent.STOP_SUCCEEDED)
 
     async def _abort_activation(self) -> None:
         if self._activation_stop is not None:
@@ -794,7 +846,7 @@ class InternalProductionSession:
 
     async def _record_failed_operation(self, error: BaseException) -> None:
         cleanup_errors = await self._cleanup_resources()
-        self.state = ProductionSessionState.FAILED
+        self._advance(_ProductionEvent.OPERATION_FAILED)
         self._annotate_cleanup(error, cleanup_errors)
         cancellation = next(
             (

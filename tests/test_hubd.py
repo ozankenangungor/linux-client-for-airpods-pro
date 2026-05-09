@@ -1398,7 +1398,7 @@ class SocketPathSafetyTests(unittest.TestCase):
         for path in production_files:
             self.assertNotIn("airpods_hr._hubd", path.read_text(), path.name)
 
-    def test_only_python_analysis_adapters_import_native_bridge(self) -> None:
+    def test_only_python_policy_and_analysis_adapters_import_native_bridge(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src"
         native_importers = {
             path.relative_to(root).as_posix()
@@ -1411,6 +1411,7 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/heartrate.py",
                 "airpods_hr/aap.py",
                 "airpods_hr/heart_rate_session.py",
+                "airpods_hr/production_session.py",
             },
         )
 

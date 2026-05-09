@@ -76,7 +76,7 @@ from tools.probe_hubd_production import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SESSION_SHA256 = (
-    "ea3a2d237bb542b41d3b81e3cb4197ead00d31f0eddbb468ca9c133c98c59651"
+    "858be76ebaddb4e0f6f9a50b4b3ba47a29ef00fd6242ca4498658f660e41bd02"
 )
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"

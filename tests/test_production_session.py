@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import errno
 import hashlib
+import subprocess
 import unittest
 from contextlib import asynccontextmanager, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import ClassVar
+from unittest.mock import AsyncMock, patch
 
 from dbus_next.errors import DBusError
 
+from airpods_hr import production_session as production_module
 from airpods_hr.aap import (
     AAP_HANDSHAKE_ACK,
     AAPDescriptorObservationTimeoutError,
@@ -56,6 +60,8 @@ from airpods_hr.protocol import (
 )
 from tools.probe_production_session import build_parser, main, run_probe
 
+
+native_core = production_module._native
 
 LOCAL_ADDRESS = "00:11:22:33:44:55"
 REMOTE_ADDRESS = "AA:BB:CC:DD:EE:FF"
@@ -1240,6 +1246,665 @@ class ProductionProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main([], stream=second), 0)
         self.assertEqual(first.getvalue(), second.getvalue())
         self.assertIn("DRY RUN", first.getvalue())
+
+
+# Differential expectations from the pre-10.5 Python guards and assignments in
+# 280204e76019b2d8afceebdbe752f6d9372c298a (not from the Rust tables).
+LIFECYCLE_STATES = tuple(ProductionSessionState)
+LIFECYCLE_OPERATIONS = ("open", "start", "receive_report", "stop", "close")
+LIFECYCLE_EVENTS = (
+    "OPEN_BEGIN",
+    "OPEN_SUCCEEDED",
+    "OPERATION_FAILED",
+    "START_BEGIN",
+    "START_SUCCEEDED",
+    "RECEIVE_ACTIVATION_FAILED",
+    "STOP_BEGIN",
+    "STOP_SUCCEEDED",
+    "CLOSE_FINALIZED",
+)
+PARENT_LEGAL_OPERATIONS = {
+    "closed": frozenset({"open", "close"}),
+    "opening": frozenset({"close"}),
+    "ready": frozenset({"start", "close"}),
+    "starting": frozenset({"close"}),
+    "streaming": frozenset({"receive_report", "stop", "close"}),
+    "stopping": frozenset({"close"}),
+    "failed": frozenset({"close"}),
+}
+# _record_failed_operation assigned FAILED unconditionally in the parent, but
+# only OPENING, STARTING and STOPPING reach it through public operations;
+# FAILED is also possible if an unlocked receive fails during stop cleanup.
+# receive_report's failure assignment was unconditional (even after a racing
+# stop/close). close() returned early from CLOSED without finalizing.
+PARENT_TRANSITIONS = {
+    ("closed", "OPEN_BEGIN"): "opening",
+    ("opening", "OPEN_SUCCEEDED"): "ready",
+    ("opening", "OPERATION_FAILED"): "failed",
+    ("starting", "OPERATION_FAILED"): "failed",
+    ("stopping", "OPERATION_FAILED"): "failed",
+    ("failed", "OPERATION_FAILED"): "failed",
+    ("ready", "START_BEGIN"): "starting",
+    ("starting", "START_SUCCEEDED"): "streaming",
+    ("streaming", "STOP_BEGIN"): "stopping",
+    ("stopping", "STOP_SUCCEEDED"): "ready",
+}
+
+
+class ProductionLifecycleNativeTests(unittest.TestCase):
+    """Exercise every native identity through the Python FFI, not a mock."""
+
+    def test_parent_operation_table_and_session_adapter_for_all_35_pairs(self) -> None:
+        self.assertEqual(len(LIFECYCLE_STATES), 7)
+        self.assertEqual(len(LIFECYCLE_OPERATIONS), 5)
+        self.assertEqual(set(PARENT_LEGAL_OPERATIONS), {state.value for state in LIFECYCLE_STATES})
+        self.assertEqual(tuple(production_module._NATIVE_STATES), LIFECYCLE_STATES)
+        self.assertEqual(
+            tuple(operation.value for operation in production_module._ProductionOperation),
+            tuple(range(5)),
+        )
+        for state_id, session_state in enumerate(LIFECYCLE_STATES):
+            for operation_id, operation in enumerate(LIFECYCLE_OPERATIONS):
+                with self.subTest(state=session_state, operation=operation):
+                    session, *_ = make_session()
+                    session.state = session_state
+                    legal = operation in PARENT_LEGAL_OPERATIONS[session_state.value]
+                    if legal:
+                        self.assertEqual(
+                            native_core.production_operation(state_id, operation_id),
+                            state_id,
+                        )
+                        with patch.object(
+                            native_core,
+                            "production_operation",
+                            wraps=native_core.production_operation,
+                        ) as called:
+                            session._require_operation(operation)
+                        called.assert_called_once_with(state_id, operation_id)
+                    else:
+                        with self.assertRaises(ValueError) as native_error:
+                            native_core.production_operation(state_id, operation_id)
+                        self.assertEqual(native_error.exception.args, (9,))
+                        with (
+                            patch.object(
+                                native_core,
+                                "production_operation",
+                                wraps=native_core.production_operation,
+                            ) as called,
+                            self.assertRaises(ProductionSessionStateError) as raised,
+                        ):
+                            session._require_operation(operation)
+                        called.assert_called_once_with(state_id, operation_id)
+                        self.assertEqual(raised.exception.category, ProductionSessionCategory.INVALID_STATE)
+                        self.assertEqual(raised.exception.phase, operation)
+                        self.assertEqual(raised.exception.detail, f"state={session_state.value}")
+                        self.assertIsInstance(raised.exception.__cause__, ValueError)
+                        self.assertEqual(getattr(raised.exception.__cause__, "args", None), (9,))
+                    self.assertIs(session.state, session_state)
+
+    def test_parent_event_table_and_session_adapter_for_all_126_cases(self) -> None:
+        self.assertEqual(len(LIFECYCLE_EVENTS), 9)
+        self.assertEqual(
+            tuple(event.name for event in production_module._ProductionEvent),
+            LIFECYCLE_EVENTS,
+        )
+        self.assertEqual(
+            tuple(event.value for event in production_module._ProductionEvent),
+            tuple(range(9)),
+        )
+        for state_id, session_state in enumerate(LIFECYCLE_STATES):
+            for event_id, event_name in enumerate(LIFECYCLE_EVENTS):
+                for cleanup_complete in (False, True):
+                    with self.subTest(state=session_state, event=event_name, cleanup=cleanup_complete):
+                        session, *_ = make_session()
+                        session.state = session_state
+                        if event_name == "RECEIVE_ACTIVATION_FAILED":
+                            next_state = "failed"
+                        elif event_name == "CLOSE_FINALIZED" and state_id != 0:
+                            next_state = "closed" if cleanup_complete else "failed"
+                        else:
+                            next_state = PARENT_TRANSITIONS.get((session_state.value, event_name))
+                        if next_state is None:
+                            with self.assertRaises(ValueError) as native_error:
+                                native_core.production_transition(state_id, event_id, cleanup_complete)
+                            self.assertEqual(native_error.exception.args, (10,))
+                            with (
+                                patch.object(
+                                    native_core,
+                                    "production_transition",
+                                    wraps=native_core.production_transition,
+                                ) as called,
+                                self.assertRaises(ProductionSessionError) as raised,
+                            ):
+                                session._advance(
+                                    production_module._ProductionEvent(event_id),
+                                    cleanup_complete=cleanup_complete,
+                                )
+                            called.assert_called_once_with(state_id, event_id, cleanup_complete)
+                            self.assertEqual(raised.exception.category, ProductionSessionCategory.INVALID_STATE)
+                            self.assertEqual(raised.exception.phase, "lifecycle")
+                            self.assertEqual(raised.exception.detail, "native lifecycle transition failed")
+                            self.assertEqual(getattr(raised.exception.__cause__, "args", None), (10,))
+                            self.assertIs(session.state, session_state)
+                        else:
+                            expected = ProductionSessionState(next_state)
+                            self.assertEqual(
+                                native_core.production_transition(state_id, event_id, cleanup_complete),
+                                LIFECYCLE_STATES.index(expected),
+                            )
+                            with patch.object(
+                                native_core,
+                                "production_transition",
+                                wraps=native_core.production_transition,
+                            ) as called:
+                                session._advance(
+                                    production_module._ProductionEvent(event_id),
+                                    cleanup_complete=cleanup_complete,
+                                )
+                            called.assert_called_once_with(state_id, event_id, cleanup_complete)
+                            self.assertIs(session.state, expected)
+
+    def test_unknown_native_identities_and_python_ffi_types(self) -> None:
+        for identity in range(256):
+            if identity >= 7:
+                with self.subTest(kind="state", identity=identity):
+                    with self.assertRaises(ValueError) as raised:
+                        native_core.production_operation(identity, 4)
+                    self.assertEqual(raised.exception.args, (7,))
+                    with self.assertRaises(ValueError) as raised:
+                        native_core.production_transition(identity, 5, False)
+                    self.assertEqual(raised.exception.args, (7,))
+            if identity >= 5:
+                with self.subTest(kind="operation", identity=identity):
+                    with self.assertRaises(ValueError) as raised:
+                        native_core.production_operation(0, identity)
+                    self.assertEqual(raised.exception.args, (7,))
+            if identity >= 9:
+                with self.subTest(kind="event", identity=identity):
+                    with self.assertRaises(ValueError) as raised:
+                        native_core.production_transition(0, identity, False)
+                    self.assertEqual(raised.exception.args, (7,))
+        for invalid in (True, False, -1, 256, None, 0.0, "0", b"0"):
+            with self.subTest(invalid=invalid):
+                for function, args in (
+                    (native_core.production_operation, (invalid, 4)),
+                    (native_core.production_operation, (0, invalid)),
+                    (native_core.production_transition, (invalid, 5, False)),
+                    (native_core.production_transition, (0, invalid, False)),
+                ):
+                    with self.assertRaises(ValueError) as raised:
+                        function(*args)
+                    self.assertEqual(raised.exception.args, ("invalid transition identity",))
+        for invalid in (0, 1, None, "true", 1.0):
+            with self.subTest(cleanup_complete=invalid):
+                with self.assertRaises(ValueError) as raised:
+                    native_core.production_transition(0, 0, invalid)
+                self.assertEqual(raised.exception.args, ("invalid cleanup_complete flag",))
+
+    def test_adapter_rejects_unknown_state_native_errors_and_bad_return(self) -> None:
+        session, *_ = make_session()
+        session.state = "unknown"
+        with self.assertRaises(ProductionSessionError) as raised:
+            session._require_operation("open")
+        self.assertEqual(raised.exception.detail, "native lifecycle operation failed")
+        with self.assertRaises(ProductionSessionError) as raised:
+            session._advance(production_module._ProductionEvent.OPEN_BEGIN)
+        self.assertEqual(raised.exception.detail, "native lifecycle transition failed")
+        session.state = ProductionSessionState.CLOSED
+        with (
+            patch.object(native_core, "production_transition", return_value=255),
+            self.assertRaises(ProductionSessionError) as raised,
+        ):
+            session._advance(production_module._ProductionEvent.OPEN_BEGIN)
+        self.assertIsInstance(raised.exception.__cause__, IndexError)
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+
+class ProductionLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_from_closed_is_a_noop_without_finalization(self) -> None:
+        session, client, registration, transport, _, _ = make_session()
+        with patch.object(
+            native_core,
+            "production_transition",
+            wraps=native_core.production_transition,
+        ) as called:
+            await session.close()
+        called.assert_not_called()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+        self.assertEqual(
+            (client.close_calls, registration.unregister_calls, transport.close_calls),
+            (0, 0, 0),
+        )
+
+    async def test_single_use_after_close_and_after_failed_open(self) -> None:
+        session, client, _, transport, handshake, _ = make_session()
+        await session.open()
+        await session.close()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.open()
+        self.assertEqual(raised.exception.category, ProductionSessionCategory.INVALID_STATE)
+        self.assertEqual(raised.exception.phase, "open")
+        self.assertEqual(raised.exception.detail, "session objects are single-use after close or open failure")
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+        self.assertEqual((client.close_calls, len(transport.open_calls), handshake.calls), (1, 1, 1))
+
+        events: list[str] = []
+        failed, failed_client, _, _, _, _ = make_session(
+            events=events, client=FakeClient(events, preflight_error=TimeoutError())
+        )
+        with self.assertRaises(ProductionSessionError):
+            await failed.open()
+        await failed.close()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await failed.open()
+        self.assertEqual(raised.exception.detail, "session objects are single-use after close or open failure")
+        self.assertEqual(events.count("client_connect"), 1)
+        self.assertEqual(failed_client.close_calls, 1)
+
+    async def test_start_timeout_cleans_and_keeps_activation_count_zero(self) -> None:
+        class NoStartAck:
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake
+                await stop_event.wait()
+                return SimpleNamespace(stop_acknowledged=False)
+
+        session, client, registration, transport, _, _ = make_session(
+            monitor_factory=lambda progress: NoStartAck(), start_timeout=0.01,
+        )
+        await session.open()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.start()
+        self.assertEqual(raised.exception.category, ProductionSessionCategory.ACTIVATION_FAILED)
+        self.assertEqual(raised.exception.detail, "TimeoutError")
+        self.assertTrue(raised.exception.recoverable)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertEqual(session.counters.hr_activations, 0)
+        self.assertIsNone(session._activation_task)
+        self.assertEqual((transport.close_calls, registration.unregister_calls, client.close_calls), (1, 1, 1))
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+    async def test_activation_ends_before_start_ack_and_fails_closed(self) -> None:
+        class EarlyEnd:
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake, stop_event
+                return SimpleNamespace(stop_acknowledged=False)
+
+        session, client, registration, transport, _, _ = make_session(
+            monitor_factory=lambda progress: EarlyEnd()
+        )
+        await session.open()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.start()
+        self.assertEqual(raised.exception.category, ProductionSessionCategory.ACTIVATION_FAILED)
+        self.assertEqual(raised.exception.detail, "RuntimeError")
+        self.assertFalse(raised.exception.recoverable)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertEqual(session.counters.hr_activations, 0)
+        self.assertEqual((transport.close_calls, registration.unregister_calls, client.close_calls), (1, 1, 1))
+
+    async def test_receive_timeout_keeps_streaming_and_ended_activation_does_not_fail_state(self) -> None:
+        finish = asyncio.Event()
+
+        class EndsAfterStartAck:
+            def __init__(self, progress):
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake, stop_event
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await finish.wait()
+                return SimpleNamespace(stop_acknowledged=True)
+
+        session, _, _, _, _, _ = make_session(monitor_factory=EndsAfterStartAck)
+        await session.open()
+        await session.start()
+        with self.assertRaises(ProductionSessionError) as timed_out:
+            await session.receive_report(timeout=0.01)
+        self.assertEqual(timed_out.exception.category, ProductionSessionCategory.RECEIVE_FAILED)
+        self.assertEqual(timed_out.exception.detail, "no heart-rate report arrived before timeout")
+        self.assertTrue(timed_out.exception.recoverable)
+        self.assertIs(session.state, ProductionSessionState.STREAMING)
+        self.assertEqual(session.counters.reports_received, 0)
+        self.assertFalse(session._receive_in_progress)
+
+        finish.set()
+        with self.assertRaises(ProductionSessionError) as ended:
+            await session.receive_report(timeout=1)
+        self.assertEqual(ended.exception.detail, "activation ended before a report arrived")
+        self.assertTrue(ended.exception.recoverable)
+        self.assertIs(session.state, ProductionSessionState.STREAMING)
+        self.assertEqual(session.counters.reports_received, 0)
+        await session.stop()
+        self.assertIs(session.state, ProductionSessionState.READY)
+        await session.close()
+
+    async def test_receive_failure_racing_stop_cleanup_keeps_original_stop_error(self) -> None:
+        class FailsOnStop:
+            def __init__(self, progress):
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await stop_event.wait()
+                raise RuntimeError("activation failed during stop")
+
+        session, *_ = make_session(monitor_factory=FailsOnStop)
+        await session.open()
+        await session.start()
+        cleanup_pending = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        original_cleanup = session._cleanup_resources
+
+        async def wait_before_cleanup():
+            cleanup_pending.set()
+            await allow_cleanup.wait()
+            return await original_cleanup()
+
+        with patch.object(session, "_cleanup_resources", side_effect=wait_before_cleanup):
+            report_task = asyncio.create_task(session.receive_report(timeout=1))
+            await asyncio.sleep(0)
+            stop_task = asyncio.create_task(session.stop())
+            await asyncio.wait_for(cleanup_pending.wait(), timeout=1)
+            with self.assertRaises(ProductionSessionError) as report_error:
+                await asyncio.wait_for(report_task, timeout=1)
+            self.assertEqual(report_error.exception.category, ProductionSessionCategory.RECEIVE_FAILED)
+            self.assertIs(session.state, ProductionSessionState.FAILED)
+            allow_cleanup.set()
+            with self.assertRaises(ProductionSessionError) as stop_error:
+                await asyncio.wait_for(stop_task, timeout=1)
+        self.assertEqual(stop_error.exception.category, ProductionSessionCategory.STOP_FAILED)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+    async def test_missing_stop_ack_retains_recoverable_stop_error(self) -> None:
+        class NoStopAck:
+            def __init__(self, progress):
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await stop_event.wait()
+                return SimpleNamespace(stop_acknowledged=False)
+
+        session, client, registration, transport, _, _ = make_session(
+            monitor_factory=NoStopAck
+        )
+        await session.open()
+        await session.start()
+        with self.assertRaises(ProductionSessionError) as raised:
+            await session.stop()
+        self.assertEqual(raised.exception.category, ProductionSessionCategory.STOP_FAILED)
+        self.assertEqual(raised.exception.detail, "canonical STOP_HR acknowledgement was not observed")
+        self.assertTrue(raised.exception.recoverable)
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertEqual((session.counters.hr_activations, session.counters.hr_stops), (1, 0))
+        self.assertEqual((transport.close_calls, registration.unregister_calls, client.close_calls), (1, 1, 1))
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+    async def test_stop_timeout_preserves_nested_cancellation_and_releases_resources(self) -> None:
+        class NeverStops:
+            def __init__(self, progress):
+                self.progress = progress
+
+            async def run_collected(self, transport, handshake, stop_event):
+                del transport, handshake, stop_event
+                self.progress(HeartRateProgress.START_ACKNOWLEDGED, None)
+                await asyncio.Event().wait()
+
+        session, client, registration, transport, _, _ = make_session(
+            monitor_factory=NeverStops, stop_timeout=0.01,
+        )
+        await session.open()
+        await session.start()
+        # asyncio.wait_for(shield(...)) embeds cancellation in the timeout's
+        # context; the parent's _nested_control_flow deliberately propagates it.
+        with self.assertRaises(asyncio.CancelledError):
+            await session.stop()
+        self.assertIs(session.state, ProductionSessionState.FAILED)
+        self.assertEqual((session.counters.hr_activations, session.counters.hr_stops), (1, 0))
+        self.assertIsNone(session._activation_task)
+        self.assertEqual((transport.close_calls, registration.unregister_calls, client.close_calls), (1, 1, 1))
+        await session.close()
+        self.assertIs(session.state, ProductionSessionState.CLOSED)
+
+
+class ProductionLifecycleParentASTTests(unittest.TestCase):
+    """Freeze parent work other than the precise Iteration 10.5 policy substitutions."""
+
+    PARENT = "280204e76019b2d8afceebdbe752f6d9372c298a"
+    # Each old statement is taken from the parent's AST, not from its line
+    # numbers. Rewriting the *expected* tree prevents a broad normalization
+    # from hiding changed awaits, exception handling, cleanup or counters.
+    SUBSTITUTIONS: ClassVar[dict[str, tuple[tuple[str, str], ...]]] = {
+        "open": (
+            (
+                'if self.state is not ProductionSessionState.CLOSED:\n'
+                '    raise ProductionSessionStateError("open", self.state)',
+                'self._require_operation("open")',
+            ),
+            ('self.state = ProductionSessionState.OPENING',
+             'self._advance(_ProductionEvent.OPEN_BEGIN)'),
+            ('self.state = ProductionSessionState.READY',
+             'self._advance(_ProductionEvent.OPEN_SUCCEEDED)'),
+        ),
+        "start": (
+            (
+                'if self.state is not ProductionSessionState.READY:\n'
+                '    raise ProductionSessionStateError("start", self.state)',
+                'self._require_operation("start")',
+            ),
+            ('self.state = ProductionSessionState.STARTING',
+             'self._advance(_ProductionEvent.START_BEGIN)'),
+            ('self.state = ProductionSessionState.STREAMING',
+             'self._advance(_ProductionEvent.START_SUCCEEDED)'),
+        ),
+        "receive_report": (
+            (
+                'if self.state is not ProductionSessionState.STREAMING:\n'
+                '    raise ProductionSessionStateError("receive_report", self.state)',
+                'self._require_operation("receive_report")',
+            ),
+            ('self.state = ProductionSessionState.FAILED',
+             'self._advance(_ProductionEvent.RECEIVE_ACTIVATION_FAILED)'),
+        ),
+        "stop": (
+            (
+                'if self.state is not ProductionSessionState.STREAMING:\n'
+                '    raise ProductionSessionStateError("stop", self.state)',
+                'self._require_operation("stop")',
+            ),
+        ),
+        "close": (
+            (
+                'if self.state is ProductionSessionState.CLOSED:\n    return',
+                'self._require_operation("close")\n'
+                'if self.state is ProductionSessionState.CLOSED:\n    return',
+            ),
+            (
+                'self.state = ProductionSessionState.CLOSED '
+                'if self.cleanup_complete else ProductionSessionState.FAILED',
+                'self._advance(_ProductionEvent.CLOSE_FINALIZED, '
+                'cleanup_complete=self.cleanup_complete)',
+            ),
+        ),
+        "_stop_locked": (
+            ('self.state = ProductionSessionState.STOPPING',
+             'self._advance(_ProductionEvent.STOP_BEGIN)'),
+            ('self.state = ProductionSessionState.READY',
+             'self._advance(_ProductionEvent.STOP_SUCCEEDED)'),
+        ),
+        "_record_failed_operation": (
+            ('self.state = ProductionSessionState.FAILED',
+             'self._advance(_ProductionEvent.OPERATION_FAILED)'),
+        ),
+    }
+    # These four methods are deliberately not transformed: their full AST is
+    # compared to the parent along with __init__, cleanup_complete and all
+    # other methods. No new await/cancellation/resource/counter paths allowed.
+    UNCHANGED_LIFECYCLE_METHODS: ClassVar[set[str]] = {
+        "_wait_for_activation_start",
+        "_abort_activation",
+        "_cancel_activation_task",
+        "_cleanup_resources",
+    }
+    ADAPTERS: ClassVar[tuple[str, str]] = (
+        (
+            'def _require_operation(self, operation: str) -> None:\n'
+        '    try:\n'
+        '        _native.production_operation(\n'
+        '            _NATIVE_STATES.index(self.state),\n'
+        '            _ProductionOperation[operation.upper()].value,\n'
+        '        )\n'
+        '    except ValueError as error:\n'
+        '        if error.args == (9,):\n'
+        '            raise ProductionSessionStateError(operation, self.state) from error\n'
+        '        raise ProductionSessionError(\n'
+        '            ProductionSessionCategory.INVALID_STATE,\n'
+        '            operation,\n'
+        '            "native lifecycle operation failed",\n'
+            '        ) from error\n'
+        ),
+        (
+            'def _advance(self, event: _ProductionEvent, *, cleanup_complete: bool = False) -> None:\n'
+        '    try:\n'
+        '        next_state = _native.production_transition(\n'
+        '            _NATIVE_STATES.index(self.state), event.value, cleanup_complete\n'
+        '        )\n'
+        '        self.state = _NATIVE_STATES[next_state]\n'
+        '    except (ValueError, IndexError, TypeError) as error:\n'
+        '        raise ProductionSessionError(\n'
+        '            ProductionSessionCategory.INVALID_STATE,\n'
+        '            "lifecycle",\n'
+        '            "native lifecycle transition failed",\n'
+            '        ) from error\n'
+        ),
+    )
+    NEW_TOP_LEVEL: ClassVar[tuple[str, ...]] = (
+        'from airpods_hr import _airpods_aap_core as _native',
+        '_NATIVE_STATES = tuple(ProductionSessionState)',
+        (
+            'class _ProductionOperation(IntEnum):\n'
+            '    OPEN = 0\n    START = 1\n    RECEIVE_REPORT = 2\n    STOP = 3\n    CLOSE = 4'
+        ),
+        (
+            'class _ProductionEvent(IntEnum):\n'
+        '    OPEN_BEGIN = 0\n    OPEN_SUCCEEDED = 1\n    OPERATION_FAILED = 2\n'
+        '    START_BEGIN = 3\n    START_SUCCEEDED = 4\n'
+        '    RECEIVE_ACTIVATION_FAILED = 5\n    STOP_BEGIN = 6\n'
+            '    STOP_SUCCEEDED = 7\n    CLOSE_FINALIZED = 8'
+        ),
+    )
+
+    @staticmethod
+    def _dump(node: ast.AST) -> str:
+        return ast.dump(node, include_attributes=False)
+
+    def test_only_whitelisted_parent_ast_guards_and_assignments_changed(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        parent_source = subprocess.run(
+            ["git", "--no-pager", "show", f"{self.PARENT}:src/airpods_hr/production_session.py"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout
+        parent = ast.parse(parent_source)
+        current = ast.parse(
+            (root / "src/airpods_hr/production_session.py").read_text(encoding="utf-8")
+        )
+        parent_class = next(
+            n for n in parent.body
+            if isinstance(n, ast.ClassDef) and n.name == "InternalProductionSession"
+        )
+        current_class = next(
+            n for n in current.body
+            if isinstance(n, ast.ClassDef) and n.name == "InternalProductionSession"
+        )
+        method_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+        parent_methods = [n for n in parent_class.body if isinstance(n, method_types)]
+        current_methods = [n for n in current_class.body if isinstance(n, method_types)]
+        self.assertEqual(
+            [self._dump(n) for n in current_class.body if not isinstance(n, method_types)],
+            [self._dump(n) for n in parent_class.body if not isinstance(n, method_types)],
+        )
+        self.assertTrue(self.UNCHANGED_LIFECYCLE_METHODS.isdisjoint(self.SUBSTITUTIONS))
+        self.assertTrue(self.UNCHANGED_LIFECYCLE_METHODS <= {n.name for n in parent_methods})
+        self.assertEqual(
+            set(self.SUBSTITUTIONS),
+            {"open", "start", "receive_report", "stop", "close",
+             "_stop_locked", "_record_failed_operation"},
+        )
+        adapters = {"_require_operation", "_advance"}
+        self.assertEqual(
+            [n.name for n in current_methods if n.name not in adapters],
+            [n.name for n in parent_methods],
+        )
+        self.assertEqual(
+            [n.name for n in current_methods if n.name in adapters],
+            ["_require_operation", "_advance"],
+        )
+        for source, name in zip(self.ADAPTERS, ("_require_operation", "_advance"), strict=True):
+            actual = next(n for n in current_methods if n.name == name)
+            self.assertEqual(self._dump(actual), self._dump(ast.parse(source).body[0]), name)
+
+        class ReplaceOnlyListedStatements(ast.NodeTransformer):
+            def __init__(self, substitutions):
+                self.replacements = {
+                    ast.dump(ast.parse(before).body[0]): ast.parse(after).body
+                    for before, after in substitutions
+                }
+                self.seen = {key: 0 for key in self.replacements}
+
+            def visit(self, node):
+                if isinstance(node, ast.stmt):
+                    key = ast.dump(node)
+                    if key in self.replacements:
+                        self.seen[key] += 1
+                        return copy.deepcopy(self.replacements[key])
+                return super().visit(node)
+
+        current_by_name = {n.name: n for n in current_methods}
+        for old in parent_methods:
+            expected = copy.deepcopy(old)
+            if old.name in self.SUBSTITUTIONS:
+                transform = ReplaceOnlyListedStatements(self.SUBSTITUTIONS[old.name])
+                expected = transform.visit(expected)
+                self.assertTrue(
+                    all(count == 1 for count in transform.seen.values()),
+                    (old.name, transform.seen),
+                )
+            self.assertEqual(self._dump(current_by_name[old.name]), self._dump(expected), old.name)
+
+        # Also freeze class decorators/bases and every other top-level statement.
+        expected_class = copy.deepcopy(parent_class)
+        expected_class.body = []
+        actual_class = copy.deepcopy(current_class)
+        actual_class.body = []
+        self.assertEqual(self._dump(actual_class), self._dump(expected_class))
+        parent_rest = [n for n in parent.body if n is not parent_class]
+        current_rest = [n for n in current.body if n is not current_class]
+        for source in self.NEW_TOP_LEVEL:
+            expected = self._dump(ast.parse(source).body[0])
+            matches = [n for n in current_rest if self._dump(n) == expected]
+            self.assertEqual(len(matches), 1, source)
+            current_rest.remove(matches[0])
+        enum_import = next(
+            n for n in current_rest
+            if isinstance(n, ast.ImportFrom) and n.module == "enum"
+        )
+        self.assertEqual(
+            self._dump(enum_import),
+            self._dump(ast.parse('from enum import IntEnum, StrEnum').body[0]),
+        )
+        current_rest[current_rest.index(enum_import)] = ast.parse(
+            'from enum import StrEnum'
+        ).body[0]
+        self.assertEqual(
+            self._dump(ast.Module(body=current_rest, type_ignores=[])),
+            self._dump(ast.Module(body=parent_rest, type_ignores=[])),
+        )
 
 
 class ProductionStaticSafetyTests(unittest.TestCase):
