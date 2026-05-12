@@ -10,6 +10,7 @@ mod analysis;
 mod control;
 mod heart_rate;
 mod production;
+mod recovery;
 
 pub use activation::{
     ActivationCommand, ActivationEvent, ActivationState, SentCommands, TransitionError, advance,
@@ -30,3 +31,4 @@ pub use production::{
     ProductionError, ProductionEvent, ProductionOperation, ProductionState, production_operation,
     production_transition,
 };
+pub use recovery::{RecoveryCauseKind, RecoveryError, classify_coexistence_recovery};
