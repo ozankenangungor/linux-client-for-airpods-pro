@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Protocol-v1 identities, validation and pure daemon decisions. No transport or session effects.
 
-use serde_json :: { Value } ;
+use serde_json :: { Value , json } ;
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_SIZE: usize = 4096;
@@ -194,17 +194,45 @@ pub fn decode_request(frame: &[u8]) -> Result<Value, RequestError> {
     Ok(value)
 }
 
+/// The daemon's source field is an integer; unrecognized values retain their raw identity.
+pub fn source_side(raw: i64) -> (&'static str, Option<i64>) {
+    match raw {
+        1 => ("left", None),
+        2 => ("right", None),
+        _ => ("unknown", Some(raw)),
+    }
+}
 
+/// Fixed daemon-owned replies. Arbitrary extension fields and canonical Python JSON encoding
+/// remain at the compatibility boundary; these constructors own the fixed v1 wire structure.
+pub fn hello_response() -> Value {
+    json!({"protocol_version": PROTOCOL_VERSION, "ok": true, "operation": Operation::Hello.as_str(), "service": "airpods-hubd", "experimental": true})
+}
 
+pub fn ping_response() -> Value {
+    json!({"protocol_version": PROTOCOL_VERSION, "ok": true, "operation": Operation::Ping.as_str(), "pong": true})
+}
 
+pub fn status_response(state: DaemonState, subscriber_count: usize) -> Value {
+    json!({"protocol_version": PROTOCOL_VERSION, "ok": true, "operation": Operation::Status.as_str(), "state": state.as_str(), "subscriber_count": subscriber_count})
+}
 
+pub fn subscription_response(subscribed: bool, already: bool) -> Value {
+    if subscribed {
+        json!({"protocol_version": PROTOCOL_VERSION, "ok": true, "operation": Operation::Subscribe.as_str(), "stream": HEART_RATE_STREAM, "subscribed": true, "already_subscribed": already})
+    } else {
+        json!({"protocol_version": PROTOCOL_VERSION, "ok": true, "operation": Operation::Unsubscribe.as_str(), "stream": HEART_RATE_STREAM, "subscribed": false, "already_unsubscribed": already})
+    }
+}
 
-
-
-
-
-
-
+pub fn heart_rate_event(bpm: i64, raw: i64) -> Value {
+    let (side, unknown) = source_side(raw);
+    let mut event = json!({"protocol_version": PROTOCOL_VERSION, "event": HEART_RATE_STREAM, "bpm": bpm, "source_side": side});
+    if let Some(raw) = unknown {
+        event["source_side_raw"] = json!(raw);
+    }
+    event
+}
 
 
 
@@ -339,7 +367,27 @@ mod tests {
         assert_eq!(value["opaque"]["x"], json!([1, true, null]));
     }
 
-    
+    #[test]
+    fn source_side_exact_and_fixed_messages() {
+        for raw in [i64::MIN, -1, 0, 3, 255, i64::MAX] {
+            assert_eq!(source_side(raw), ("unknown", Some(raw)));
+            assert_eq!(heart_rate_event(169, raw)["source_side_raw"], raw);
+        }
+        assert_eq!(source_side(1), ("left", None));
+        assert_eq!(source_side(2), ("right", None));
+        assert!(heart_rate_event(169, 1).get("source_side_raw").is_none());
+        assert_eq!(hello_response()["service"], "airpods-hubd");
+        assert_eq!(hello_response()["experimental"], true);
+        assert_eq!(ping_response()["pong"], true);
+        assert_eq!(
+            subscription_response(true, true)["already_subscribed"],
+            true
+        );
+        assert_eq!(
+            subscription_response(false, false)["already_unsubscribed"],
+            false
+        );
+    }
 
     
 
