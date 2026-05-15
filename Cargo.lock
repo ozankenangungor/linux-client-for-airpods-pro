@@ -11,7 +11,9 @@ name = "airpods-aap-py"
 version = "0.1.0"
 dependencies = [
  "airpods-aap-core",
+ "airpods-hub-core",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]
@@ -20,6 +22,13 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "airpods-hub-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
