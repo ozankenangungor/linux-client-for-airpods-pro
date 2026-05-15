@@ -4,9 +4,11 @@
 use airpods_aap_core::{
     AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
     ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, ProductionError,
-    ProductionEvent, ProductionOperation, ProductionState, SentCommands, SourceSide,
-    TransitionError, advance, parse_heart_rate_packet as parse_core, plan_activation_send,
-    plan_cleanup_send, production_operation as check_production_operation,
+    ProductionEvent, ProductionOperation, ProductionState, RecoveryCauseKind, RecoveryError,
+    SentCommands, SourceSide, TransitionError, advance,
+    classify_coexistence_recovery as classify_core_coexistence_recovery,
+    parse_heart_rate_packet as parse_core, plan_activation_send, plan_cleanup_send,
+    production_operation as check_production_operation,
     production_transition as advance_production,
 };
 use pyo3::create_exception;
@@ -52,6 +54,59 @@ fn production_error(error: ProductionError) -> PyErr {
         ProductionError::InvalidOperation => 9,
         ProductionError::InvalidTransition => 10,
     })
+}
+
+fn recovery_error(error: RecoveryError) -> PyErr {
+    match error {
+        RecoveryError::UnknownIdentity => PyValueError::new_err(7),
+    }
+}
+
+/// Accept only neutral values; core owns all recovery policy and identity validation.
+#[pyfunction]
+fn classify_coexistence_recovery(
+    category: &Bound<'_, PyAny>,
+    cause_kind: &Bound<'_, PyAny>,
+    nested_recoverable: &Bound<'_, PyAny>,
+    errno: &Bound<'_, PyAny>,
+    dbus_error_name: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let category = neutral_u8(category)?;
+    let cause_kind =
+        RecoveryCauseKind::try_from(neutral_u8(cause_kind)?).map_err(recovery_error)?;
+    if !nested_recoverable.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("invalid nested_recoverable flag"));
+    }
+    let nested_recoverable = nested_recoverable.extract::<bool>()?;
+    let errno = if errno.is_none() {
+        None
+    } else {
+        if errno.is_instance_of::<PyBool>() {
+            return Err(PyValueError::new_err("invalid errno"));
+        }
+        Some(
+            errno
+                .extract::<i32>()
+                .map_err(|_| PyValueError::new_err("invalid errno"))?,
+        )
+    };
+    let dbus_error_name = if dbus_error_name.is_none() {
+        None
+    } else {
+        Some(
+            dbus_error_name
+                .extract::<&str>()
+                .map_err(|_| PyValueError::new_err("invalid dbus_error_name"))?,
+        )
+    };
+    classify_core_coexistence_recovery(
+        category,
+        cause_kind,
+        nested_recoverable,
+        errno,
+        dbus_error_name,
+    )
+    .map_err(recovery_error)
 }
 
 /// Private identity inputs follow `neutral_u8`: booleans and non-u8 values
@@ -441,6 +496,7 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(advance_activation_transition, module)?)?;
     module.add_function(wrap_pyfunction!(production_operation, module)?)?;
     module.add_function(wrap_pyfunction!(production_transition, module)?)?;
+    module.add_function(wrap_pyfunction!(classify_coexistence_recovery, module)?)?;
     module.add_class::<PyHeartRateReport>()?;
     module.add(
         "MarkerNotFoundError",
