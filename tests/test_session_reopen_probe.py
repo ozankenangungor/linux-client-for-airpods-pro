@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import subprocess
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
@@ -36,9 +37,7 @@ from tools.probe_session_reopen import build_parser, main, run_probe
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION_SESSION_SHA256 = (
-    "858be76ebaddb4e0f6f9a50b4b3ba47a29ef00fd6242ca4498658f660e41bd02"
-)
+PRODUCTION_SESSION_PARENT = "ea54f6376b43c26d99e7fecad2987721e609edf4"
 FROZEN_SHA256 = {
     "src/airpods_hr/protocol.py": (
         "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca"
@@ -617,8 +616,28 @@ class SessionReopenProbeTests(unittest.IsolatedAsyncioTestCase):
 
 class SessionReopenStaticSafetyTests(unittest.TestCase):
     def test_production_core_is_frozen(self) -> None:
-        data = (ROOT / "src/airpods_hr/production_session.py").read_bytes()
-        self.assertEqual(hashlib.sha256(data).hexdigest(), PRODUCTION_SESSION_SHA256)
+        relative = "src/airpods_hr/production_session.py"
+        parent = subprocess.run(
+            ["git", "show", f"{PRODUCTION_SESSION_PARENT}:{relative}"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+        old = ast.parse(parent)
+        new = ast.parse((ROOT / relative).read_text())
+
+        def declarations(tree: ast.Module) -> dict[str, ast.AST]:
+            return {
+                node.name: node for node in tree.body
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
+        before, after = declarations(old), declarations(new)
+        self.assertEqual(set(after), set(before) - {"_is_transient_dbus_error"})
+        for name in set(before) - {"_is_transient_dbus_error", "_is_recoverable_session_error"}:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    ast.dump(before[name], include_attributes=False),
+                    ast.dump(after[name], include_attributes=False),
+                )
 
     def test_protocol_transport_monitor_and_semantics_are_frozen(self) -> None:
         for relative, expected in FROZEN_SHA256.items():

@@ -58,6 +58,7 @@ from tests.test_production_session import (
     FakeHandshake,
     FakeRegistration,
     FakeTransport,
+    assert_only_task_10_6_policy_changed,
     make_session,
 )
 from tests.test_bluez_coexistence import FakeSocket, FakeSocketModule
@@ -75,9 +76,6 @@ from tools.probe_hubd_production import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION_SESSION_SHA256 = (
-    "858be76ebaddb4e0f6f9a50b4b3ba47a29ef00fd6242ca4498658f660e41bd02"
-)
 PACKAGE_INIT_SHA256 = (
     "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
 )
@@ -935,10 +933,7 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
         )
 
     def test_production_session_is_frozen(self) -> None:
-        digest = hashlib.sha256(
-            (ROOT / "src/airpods_hr/production_session.py").read_bytes()
-        ).hexdigest()
-        self.assertEqual(digest, PRODUCTION_SESSION_SHA256)
+        assert_only_task_10_6_policy_changed(self)
 
     def test_integration_duplicates_no_transport_or_protocol_logic(self) -> None:
         integration = ROOT / "src/airpods_hr/_hubd/production.py"

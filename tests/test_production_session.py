@@ -1673,8 +1673,68 @@ class ProductionLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session.state, ProductionSessionState.CLOSED)
 
 
+def assert_only_task_10_6_policy_changed(test: unittest.TestCase) -> None:
+    """Freeze every non-policy node against the exact Iteration 10.6 parent."""
+    root = Path(__file__).resolve().parents[1]
+    path = "src/airpods_hr/production_session.py"
+    parent = ast.parse(subprocess.run(
+        ["git", "--no-pager", "show", f"ea54f6376b43c26d99e7fecad2987721e609edf4:{path}"],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout)
+    current = ast.parse((root / path).read_text(encoding="utf-8"))
+
+    removed_policy = {
+        "_RECOVERABLE_COEXISTENCE_CATEGORIES",
+        "_RECOVERABLE_OS_ERRNOS",
+        "_TRANSIENT_DBUS_ERROR_NAMES",
+        "_is_transient_dbus_error",
+    }
+    changed_policy = "_is_recoverable_session_error"
+    new_policy = "_NATIVE_COEXISTENCE_CATEGORIES"
+
+    def name(node: ast.stmt) -> str | None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                return target.id
+        return None
+
+    def split(tree: ast.Module, allowed: set[str]) -> tuple[dict[str, ast.stmt], list[ast.stmt]]:
+        selected = [node for node in tree.body if name(node) in allowed]
+        test.assertEqual(len(selected), len(allowed))
+        test.assertEqual({name(node) for node in selected}, allowed)
+        return ({name(node): node for node in selected},
+                [node for node in tree.body if name(node) not in allowed])
+
+    old_policy, parent_rest = split(parent, removed_policy | {changed_policy})
+    current_policy, current_rest = split(current, {new_policy, changed_policy})
+    test.assertIsInstance(old_policy[changed_policy], ast.FunctionDef)
+    test.assertIsInstance(current_policy[changed_policy], ast.FunctionDef)
+    test.assertEqual(
+        ast.dump(current_policy[new_policy], include_attributes=False),
+        ast.dump(ast.parse("_NATIVE_COEXISTENCE_CATEGORIES = tuple(CoexistenceCategory)").body[0],
+                 include_attributes=False),
+    )
+    # The removed policy definitions and errno import must not reappear elsewhere.
+    test.assertFalse(removed_policy & {name(node) for node in current_rest})
+    test.assertNotIn(new_policy, {name(node) for node in parent_rest})
+    errno_import = ast.dump(ast.parse("import errno").body[0], include_attributes=False)
+    test.assertEqual(
+        sum(ast.dump(node, include_attributes=False) == errno_import for node in parent_rest), 1
+    )
+    test.assertNotIn(errno_import, [ast.dump(node, include_attributes=False) for node in current_rest])
+    parent_rest = [node for node in parent_rest
+                   if ast.dump(node, include_attributes=False) != errno_import]
+    test.assertEqual(
+        ast.dump(ast.Module(body=current_rest, type_ignores=[]), include_attributes=False),
+        ast.dump(ast.Module(body=parent_rest, type_ignores=[]), include_attributes=False),
+    )
+
+
 class ProductionLifecycleParentASTTests(unittest.TestCase):
-    """Freeze parent work other than the precise Iteration 10.5 policy substitutions."""
+    """Freeze parent lifecycle work other than the precise Iteration 10.5 substitutions."""
 
     PARENT = "280204e76019b2d8afceebdbe752f6d9372c298a"
     # Each old statement is taken from the parent's AST, not from its line
@@ -1784,21 +1844,6 @@ class ProductionLifecycleParentASTTests(unittest.TestCase):
             '        ) from error\n'
         ),
     )
-    NEW_TOP_LEVEL: ClassVar[tuple[str, ...]] = (
-        'from airpods_hr import _airpods_aap_core as _native',
-        '_NATIVE_STATES = tuple(ProductionSessionState)',
-        (
-            'class _ProductionOperation(IntEnum):\n'
-            '    OPEN = 0\n    START = 1\n    RECEIVE_REPORT = 2\n    STOP = 3\n    CLOSE = 4'
-        ),
-        (
-            'class _ProductionEvent(IntEnum):\n'
-        '    OPEN_BEGIN = 0\n    OPEN_SUCCEEDED = 1\n    OPERATION_FAILED = 2\n'
-        '    START_BEGIN = 3\n    START_SUCCEEDED = 4\n'
-        '    RECEIVE_ACTIVATION_FAILED = 5\n    STOP_BEGIN = 6\n'
-            '    STOP_SUCCEEDED = 7\n    CLOSE_FINALIZED = 8'
-        ),
-    )
 
     @staticmethod
     def _dump(node: ast.AST) -> str:
@@ -1877,34 +1922,8 @@ class ProductionLifecycleParentASTTests(unittest.TestCase):
                 )
             self.assertEqual(self._dump(current_by_name[old.name]), self._dump(expected), old.name)
 
-        # Also freeze class decorators/bases and every other top-level statement.
-        expected_class = copy.deepcopy(parent_class)
-        expected_class.body = []
-        actual_class = copy.deepcopy(current_class)
-        actual_class.body = []
-        self.assertEqual(self._dump(actual_class), self._dump(expected_class))
-        parent_rest = [n for n in parent.body if n is not parent_class]
-        current_rest = [n for n in current.body if n is not current_class]
-        for source in self.NEW_TOP_LEVEL:
-            expected = self._dump(ast.parse(source).body[0])
-            matches = [n for n in current_rest if self._dump(n) == expected]
-            self.assertEqual(len(matches), 1, source)
-            current_rest.remove(matches[0])
-        enum_import = next(
-            n for n in current_rest
-            if isinstance(n, ast.ImportFrom) and n.module == "enum"
-        )
-        self.assertEqual(
-            self._dump(enum_import),
-            self._dump(ast.parse('from enum import IntEnum, StrEnum').body[0]),
-        )
-        current_rest[current_rest.index(enum_import)] = ast.parse(
-            'from enum import StrEnum'
-        ).body[0]
-        self.assertEqual(
-            self._dump(ast.Module(body=current_rest, type_ignores=[])),
-            self._dump(ast.Module(body=parent_rest, type_ignores=[])),
-        )
+        # The newer parent freezes class metadata and all unrelated top-level code.
+        assert_only_task_10_6_policy_changed(self)
 
 
 class ProductionStaticSafetyTests(unittest.TestCase):

@@ -6,7 +6,6 @@ This module is deliberately not exported from :mod:`airpods_hr`.  It validates a
 from __future__ import annotations
 
 import asyncio
-import errno
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -139,21 +138,8 @@ class ProductionSessionStateError(ProductionSessionError):
         )
 
 
-_RECOVERABLE_COEXISTENCE_CATEGORIES = frozenset(
-    {
-        CoexistenceCategory.PREFLIGHT_FAILED,
-        CoexistenceCategory.BLUEZ_NOT_AVAILABLE,
-        CoexistenceCategory.AIRPODS_NOT_CONNECTED,
-        CoexistenceCategory.PROFILE_REGISTRATION_FAILED,
-        CoexistenceCategory.L2CAP_BIND_FAILED,
-        CoexistenceCategory.L2CAP_CONNECT_FAILED,
-        CoexistenceCategory.AAP_HANDSHAKE_FAILED,
-        CoexistenceCategory.AAP_DESCRIPTOR_TIMEOUT,
-        CoexistenceCategory.HR_ACTIVATION_FAILED,
-        CoexistenceCategory.HR_TIMEOUT,
-        CoexistenceCategory.BLUEZ_CONNECTION_LOST,
-    }
-)
+# Private FFI identities follow the existing CoexistenceCategory declaration order.
+_NATIVE_COEXISTENCE_CATEGORIES = tuple(CoexistenceCategory)
 
 _RECOVERABLE_SESSION_EXCEPTIONS = (
     AAPHandshakeTimeoutError,
@@ -167,47 +153,6 @@ _RECOVERABLE_SESSION_EXCEPTIONS = (
     ConnectionError,
     TimeoutError,
 )
-
-_RECOVERABLE_OS_ERRNOS = frozenset(
-    {
-        errno.EADDRNOTAVAIL,
-        errno.EAGAIN,
-        errno.EBUSY,
-        errno.ECONNABORTED,
-        errno.ECONNREFUSED,
-        errno.ECONNRESET,
-        errno.EHOSTDOWN,
-        errno.EHOSTUNREACH,
-        errno.EINTR,
-        errno.ENETDOWN,
-        errno.ENETRESET,
-        errno.ENETUNREACH,
-        errno.ENODEV,
-        errno.ENOENT,
-        errno.ENOTCONN,
-        errno.ETIMEDOUT,
-    }
-)
-
-_TRANSIENT_DBUS_ERROR_NAMES = frozenset(
-    {
-        "org.bluez.Error.NotConnected",
-        "org.bluez.Error.NotReady",
-        "org.freedesktop.DBus.Error.Disconnected",
-        "org.freedesktop.DBus.Error.NameHasNoOwner",
-        "org.freedesktop.DBus.Error.NoNetwork",
-        "org.freedesktop.DBus.Error.NoReply",
-        "org.freedesktop.DBus.Error.NoServer",
-        "org.freedesktop.DBus.Error.ServiceUnknown",
-        "org.freedesktop.DBus.Error.Timeout",
-    }
-)
-
-
-def _is_transient_dbus_error(error: BaseException) -> bool:
-    """Accept only D-Bus names that identify temporary service availability."""
-
-    return isinstance(error, DBusError) and error.type in _TRANSIENT_DBUS_ERROR_NAMES
 
 
 def _nested_control_flow(error: Exception) -> BaseException | None:
@@ -232,19 +177,40 @@ def _is_recoverable_session_error(error: BaseException) -> bool:
         return True
     if not isinstance(error, CoexistenceFailure):
         return False
-    if error.category not in _RECOVERABLE_COEXISTENCE_CATEGORIES:
+    # Ask the core before inspecting the cause: terminal categories historically
+    # short-circuit without traversing even a nested coexistence failure.
+    try:
+        category_id = _NATIVE_COEXISTENCE_CATEGORIES.index(error.category)
+    except ValueError:
+        # No neutral identity exists; the parent also treated unknown categories
+        # as terminal without inspecting their cause.
+        return False
+    if not _native.classify_coexistence_recovery(category_id, 0, False, None, None):
         return False
 
     cause = error.__cause__
     if cause is None:
         return True
     if isinstance(cause, CoexistenceFailure):
-        return _is_recoverable_session_error(cause)
-    if isinstance(cause, _RECOVERABLE_SESSION_EXCEPTIONS):
-        return True
-    if isinstance(cause, OSError):
-        return cause.errno in _RECOVERABLE_OS_ERRNOS
-    return _is_transient_dbus_error(cause)
+        cause_kind, nested_recoverable = 1, _is_recoverable_session_error(cause)
+        errno_value, dbus_name = None, None
+    elif isinstance(cause, _RECOVERABLE_SESSION_EXCEPTIONS):
+        cause_kind, nested_recoverable, errno_value, dbus_name = 2, False, None, None
+    elif isinstance(cause, OSError):
+        cause_kind, nested_recoverable, dbus_name = 3, False, None
+        errno_value = cause.errno
+        if isinstance(errno_value, int) and not isinstance(errno_value, bool):
+            errno_value = int(errno_value)
+        if type(errno_value) is not int or not -(1 << 31) <= errno_value < (1 << 31):
+            errno_value = None
+    elif isinstance(cause, DBusError):
+        cause_kind, nested_recoverable, errno_value = 4, False, None
+        dbus_name = cause.type if isinstance(cause.type, str) else None
+    else:
+        cause_kind, nested_recoverable, errno_value, dbus_name = 5, False, None, None
+    return _native.classify_coexistence_recovery(
+        category_id, cause_kind, nested_recoverable, errno_value, dbus_name
+    )
 
 
 def _translate_session_error(
