@@ -1,20 +1,12 @@
 #![forbid(unsafe_code)]
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
-use airpods_aap_core::{
-    AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
-    ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, ProductionError,
-    ProductionEvent, ProductionOperation, ProductionState, RecoveryCauseKind, RecoveryError,
-    SentCommands, SourceSide, TransitionError, advance,
-    classify_coexistence_recovery as classify_core_coexistence_recovery,
-    parse_heart_rate_packet as parse_core, plan_activation_send, plan_cleanup_send,
-    production_operation as check_production_operation,
-    production_transition as advance_production,
-};
-use pyo3::create_exception;
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyModule, PyTuple};
+use airpods_aap_core :: { AapFrameSummary , AapType2bFrameSummary , ActivationCommand , ActivationEvent , ActivationState , ControlFrameSummary , DescriptorEvidence , HeartRateParseError , HeartRateReport , ProductionError , ProductionEvent , ProductionOperation , ProductionState , RecoveryCauseKind , RecoveryError , SentCommands , SourceSide , TransitionError , advance , classify_coexistence_recovery as classify_core_coexistence_recovery , parse_heart_rate_packet as parse_core , plan_activation_send , plan_cleanup_send , production_operation as check_production_operation , production_transition as advance_production } ;
+use airpods_hub_core :: { self as hub , DaemonState , Operation , RequestField } ;
+use pyo3 :: create_exception ;
+use pyo3 :: exceptions :: { PyUnicodeDecodeError , PyValueError } ;
+use pyo3 :: prelude :: * ;
+use pyo3 :: types :: { PyAny , PyBool , PyBytes , PyDict , PyInt , PyModule , PyString , PyTuple } ;
 
 fn neutral_u8(value: &Bound<'_, PyAny>) -> PyResult<u8> {
     if value.is_instance_of::<PyBool>() {
@@ -179,6 +171,13 @@ fn advance_activation_transition(
         .map(|next| next as u8)
         .map_err(transition_error)
 }
+
+create_exception!(
+    _airpods_aap_core,
+    HubRequestError,
+    PyValueError,
+    "Invalid hub request."
+);
 
 create_exception!(
     _airpods_aap_core,
@@ -489,6 +488,120 @@ fn is_connect4_ack(frame: &Bound<'_, PyBytes>) -> bool {
     airpods_aap_core::is_connect4_ack(frame.as_bytes())
 }
 
+fn hub_reject<T>(py: Python<'_>, error: hub::RequestError) -> PyResult<T> {
+    let exception = HubRequestError::new_err(error.message());
+    let value = exception.value(py);
+    value.setattr("code", error.code())?;
+    value.setattr("message", error.message())?;
+    Err(exception)
+}
+
+fn hub_request_field<'a>(value: Option<&'a Bound<'_, PyAny>>) -> RequestField<'a> {
+    match value {
+        None => RequestField::Missing,
+        Some(value) if value.is_instance_of::<PyBool>() => RequestField::Other,
+        Some(value) if value.is_instance_of::<PyInt>() => value
+            .extract::<i64>()
+            .map(RequestField::Integer)
+            .unwrap_or(RequestField::Other),
+        Some(value) if value.is_instance_of::<PyString>() => value
+            .extract::<&str>()
+            .map(RequestField::Text)
+            .unwrap_or(RequestField::NonUtf8Text),
+        Some(_) => RequestField::Other,
+    }
+}
+
+#[pyfunction]
+fn hub_decode_request<'py>(
+    py: Python<'py>,
+    frame: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if let Err(error) = hub::validate_frame_size(frame.len()?) {
+        return hub_reject(py, error);
+    }
+    let json = py.import("json")?;
+    let decoded = match json.call_method1("loads", (frame,)) {
+        Ok(value) => value,
+        Err(error)
+            if error.is_instance_of::<PyUnicodeDecodeError>(py)
+                || error.matches(py, json.getattr("JSONDecodeError")?)? =>
+        {
+            return hub_reject(py, hub::RequestError::InvalidJson);
+        }
+        Err(error) => return Err(error),
+    };
+    let object = match decoded.cast_into::<PyDict>() {
+        Ok(value) => value,
+        Err(_) => return hub_reject(py, hub::RequestError::InvalidRequest),
+    };
+    let version = object.get_item("protocol_version")?;
+    let operation = object.get_item("operation")?;
+    let stream = object.get_item("stream")?;
+    if let Err(error) = hub::validate_fields(
+        hub_request_field(version.as_ref()),
+        hub_request_field(operation.as_ref()),
+        hub_request_field(stream.as_ref()),
+    ) {
+        return hub_reject(py, error);
+    }
+    Ok(object)
+}
+
+#[pyfunction]
+fn hub_validate_request(py: Python<'_>, frame: &Bound<'_, PyBytes>) -> PyResult<()> {
+    hub_decode_request(py, frame.as_any())?;
+    Ok(())
+}
+
+#[pyfunction]
+fn hub_source_side(raw: i64) -> (&'static str, Option<i64>) {
+    hub::source_side(raw)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#[pyfunction]
+fn hub_constants() -> (
+    u64,
+    usize,
+    usize,
+    &'static str,
+    Vec<&'static str>,
+    Vec<&'static str>,
+) {
+    let operations = Operation::ALL.map(Operation::as_str).to_vec();
+    let states = DaemonState::ALL.map(DaemonState::as_str).to_vec();
+    (
+        hub::PROTOCOL_VERSION,
+        hub::MAX_FRAME_SIZE,
+        hub::OUTBOUND_QUEUE_SIZE,
+        hub::HEART_RATE_STREAM,
+        operations,
+        states,
+    )
+}
+
+
+
+
+
+
+
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(plan_activation_transition, module)?)?;
@@ -518,5 +631,10 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(is_observed_service_ack, module)?)?;
     module.add_function(wrap_pyfunction!(is_service_ack_candidate_shape, module)?)?;
     module.add_function(wrap_pyfunction!(is_connect4_ack, module)?)?;
-    Ok(())
+    module.add("HubRequestError", module.py().get_type::<HubRequestError>())?;
+    module.add_function(wrap_pyfunction!(hub_validate_request, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_decode_request, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_source_side, module)?)?;
+                                module.add_function(wrap_pyfunction!(hub_constants, module)?)?;
+            Ok(())
 }
