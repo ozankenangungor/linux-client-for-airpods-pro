@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 //! Protocol-v1 identities, validation and pure daemon decisions. No transport or session effects.
 
-use serde_json :: { Value , json } ;
+use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_SIZE: usize = 4096;
-
+pub const OUTBOUND_QUEUE_SIZE: usize = 16;
 pub const HEART_RATE_STREAM: &str = "heart_rate";
-
+pub const DEFAULT_RECOVERY_DELAYS: [f64; 4] = [1.0, 2.0, 5.0, 10.0];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -234,33 +234,158 @@ pub fn heart_rate_event(bpm: i64, raw: i64) -> Value {
     event
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionError {
+    ConnectionClosing,
+    ServiceFailed,
+    ServiceUnavailable,
+}
 
+impl SubscriptionError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ConnectionClosing => "connection_closing",
+            Self::ServiceFailed => "service_failed",
+            Self::ServiceUnavailable => "service_unavailable",
+        }
+    }
 
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::ConnectionClosing => "connection is closing",
+            Self::ServiceFailed | Self::ServiceUnavailable => "sensor service is unavailable",
+        }
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscribeDecision {
+    Already,
+    Join,
+    Start,
+    Reject(SubscriptionError),
+}
 
+/// The STARTING check precedes the lifecycle lock, even for duplicate subscriptions.
+/// Call this once before acquiring the lock and again under the lock for the remaining states.
+pub fn subscribe_decision(
+    state: DaemonState,
+    subscribed: bool,
+    closing: bool,
+    subscriber_count: usize,
+    has_session: bool,
+) -> SubscribeDecision {
+    if state == DaemonState::Starting {
+        return SubscribeDecision::Reject(SubscriptionError::ServiceUnavailable);
+    }
+    if subscribed {
+        return SubscribeDecision::Already;
+    }
+    if closing {
+        return SubscribeDecision::Reject(SubscriptionError::ConnectionClosing);
+    }
+    if state == DaemonState::Failed {
+        return SubscribeDecision::Reject(SubscriptionError::ServiceFailed);
+    }
+    if !matches!(state, DaemonState::Ready | DaemonState::Streaming) {
+        return SubscribeDecision::Reject(SubscriptionError::ServiceUnavailable);
+    }
+    if subscriber_count != 0 {
+        return SubscribeDecision::Join;
+    }
+    if !has_session {
+        return SubscribeDecision::Reject(SubscriptionError::ServiceUnavailable);
+    }
+    SubscribeDecision::Start
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsubscribeDecision {
+    Already,
+    Remove,
+    Stop,
+}
 
+/// `remaining_subscribers` is measured after removing this client's subscription.
+pub fn unsubscribe_decision(
+    subscribed: bool,
+    remaining_subscribers: usize,
+    state: DaemonState,
+    has_session: bool,
+) -> UnsubscribeDecision {
+    if !subscribed {
+        UnsubscribeDecision::Already
+    } else if remaining_subscribers == 0 && state == DaemonState::Streaming && has_session {
+        UnsubscribeDecision::Stop
+    } else {
+        UnsubscribeDecision::Remove
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreDecision {
+    Shutdown,
+    Ready,
+    StartHeartRate,
+}
 
+pub fn restore_decision(subscriber_count: usize, shutdown_requested: bool) -> RestoreDecision {
+    if shutdown_requested {
+        RestoreDecision::Shutdown
+    } else if subscriber_count == 0 {
+        RestoreDecision::Ready
+    } else {
+        RestoreDecision::StartHeartRate
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryDisposition {
+    Shutdown,
+    Terminal,
+    Retry,
+}
 
+/// Cleanup proof is mandatory before any replacement. The caller still performs classification
+/// and epoch-refresh eligibility checks; this function does not infer either from an exception.
+pub fn recovery_disposition(
+    cleanup_complete: bool,
+    recoverable: bool,
+    shutdown_requested: bool,
+) -> RecoveryDisposition {
+    if shutdown_requested {
+        RecoveryDisposition::Shutdown
+    } else if !cleanup_complete || !recoverable {
+        RecoveryDisposition::Terminal
+    } else {
+        RecoveryDisposition::Retry
+    }
+}
 
+/// Returns no delay when shutting down, otherwise the bounded delay and next index.
+/// The caller executes the sleep. A successful restoration resets its index to zero.
+pub fn recovery_step(
+    index: usize,
+    delays: &[f64],
+    shutdown_requested: bool,
+) -> Option<(f64, usize)> {
+    if shutdown_requested {
+        None
+    } else {
+        Some((
+            *delays.get(index).or_else(|| delays.last())?,
+            index.saturating_add(1),
+        ))
+    }
+}
 
-
-
-
-
-
-
-
-
-
-
-
+pub const fn reset_recovery_backoff() -> usize {
+    0
+}
 
 #[cfg(test)]
 mod tests {
-    use super :: * ;
+    use super::*;
 
     fn frame(version: &str, operation: &str, stream: &str) -> Vec<u8> {
         format!("{{\"protocol_version\":{version},\"operation\":{operation},\"stream\":{stream}}}")
@@ -389,7 +514,95 @@ mod tests {
         );
     }
 
-    
+    #[test]
+    fn subscription_decisions_and_error_precedence() {
+        use SubscribeDecision::{Already, Join, Reject, Start};
+        use SubscriptionError::{ConnectionClosing, ServiceFailed, ServiceUnavailable};
+        assert_eq!(
+            subscribe_decision(DaemonState::Starting, true, true, 1, true),
+            Reject(ServiceUnavailable)
+        );
+        for state in DaemonState::ALL {
+            if state != DaemonState::Starting {
+                assert_eq!(subscribe_decision(state, true, true, 1, false), Already);
+                assert_eq!(
+                    subscribe_decision(state, false, true, 0, false),
+                    Reject(ConnectionClosing)
+                );
+            }
+        }
+        assert_eq!(
+            subscribe_decision(DaemonState::Failed, false, false, 0, true),
+            Reject(ServiceFailed)
+        );
+        assert_eq!(
+            subscribe_decision(DaemonState::Stopped, false, false, 0, true),
+            Reject(ServiceUnavailable)
+        );
+        assert_eq!(
+            subscribe_decision(DaemonState::Ready, false, false, 0, false),
+            Reject(ServiceUnavailable)
+        );
+        assert_eq!(
+            subscribe_decision(DaemonState::Ready, false, false, 0, true),
+            Start
+        );
+        assert_eq!(
+            subscribe_decision(DaemonState::Streaming, false, false, 2, false),
+            Join
+        );
+        assert_eq!(
+            unsubscribe_decision(false, 0, DaemonState::Streaming, true),
+            UnsubscribeDecision::Already
+        );
+        assert_eq!(
+            unsubscribe_decision(true, 1, DaemonState::Streaming, true),
+            UnsubscribeDecision::Remove
+        );
+        assert_eq!(
+            unsubscribe_decision(true, 0, DaemonState::Starting, true),
+            UnsubscribeDecision::Remove
+        );
+        assert_eq!(
+            unsubscribe_decision(true, 0, DaemonState::Streaming, false),
+            UnsubscribeDecision::Remove
+        );
+        assert_eq!(
+            unsubscribe_decision(true, 0, DaemonState::Streaming, true),
+            UnsubscribeDecision::Stop
+        );
+    }
 
-    
+    #[test]
+    fn recovery_sequence_reset_shutdown_and_cleanup_proof() {
+        let delays = [1.0, 2.0, 5.0, 10.0];
+        let mut index = 0;
+        for delay in [1.0, 2.0, 5.0, 10.0, 10.0, 10.0] {
+            let (actual, next) = recovery_step(index, &delays, false).unwrap();
+            assert_eq!(actual, delay);
+            index = next;
+        }
+        index = reset_recovery_backoff();
+        assert_eq!(recovery_step(index, &delays, false), Some((1.0, 1)));
+        assert_eq!(recovery_step(index, &delays, true), None);
+        assert_eq!(restore_decision(0, false), RestoreDecision::Ready);
+        assert_eq!(restore_decision(1, false), RestoreDecision::StartHeartRate);
+        assert_eq!(restore_decision(1, true), RestoreDecision::Shutdown);
+        for cleanup in [false, true] {
+            for recoverable in [false, true] {
+                assert_eq!(
+                    recovery_disposition(cleanup, recoverable, true),
+                    RecoveryDisposition::Shutdown
+                );
+                assert_eq!(
+                    recovery_disposition(cleanup, recoverable, false),
+                    if cleanup && recoverable {
+                        RecoveryDisposition::Retry
+                    } else {
+                        RecoveryDisposition::Terminal
+                    }
+                );
+            }
+        }
+    }
 }
