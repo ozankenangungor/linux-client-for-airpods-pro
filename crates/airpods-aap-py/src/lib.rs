@@ -2,7 +2,7 @@
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
 use airpods_aap_core :: { AapFrameSummary , AapType2bFrameSummary , ActivationCommand , ActivationEvent , ActivationState , ControlFrameSummary , DescriptorEvidence , HeartRateParseError , HeartRateReport , ProductionError , ProductionEvent , ProductionOperation , ProductionState , RecoveryCauseKind , RecoveryError , SentCommands , SourceSide , TransitionError , advance , classify_coexistence_recovery as classify_core_coexistence_recovery , parse_heart_rate_packet as parse_core , plan_activation_send , plan_cleanup_send , production_operation as check_production_operation , production_transition as advance_production } ;
-use airpods_hub_core :: { self as hub , DaemonState , Operation , RequestField } ;
+use airpods_hub_core :: { self as hub , DaemonState , Operation , RecoveryDisposition , RequestField , RestoreDecision , SubscribeDecision , UnsubscribeDecision } ;
 use pyo3 :: create_exception ;
 use pyo3 :: exceptions :: { PyUnicodeDecodeError , PyValueError } ;
 use pyo3 :: prelude :: * ;
@@ -559,21 +559,78 @@ fn hub_source_side(raw: i64) -> (&'static str, Option<i64>) {
     hub::source_side(raw)
 }
 
+fn hub_state(value: &str) -> PyResult<DaemonState> {
+    DaemonState::parse(value).ok_or_else(|| PyValueError::new_err("invalid daemon state"))
+}
 
+#[pyfunction]
+fn hub_subscribe_decision(
+    state: &str,
+    subscribed: bool,
+    closing: bool,
+    count: usize,
+    has_session: bool,
+) -> PyResult<(&'static str, Option<&'static str>, Option<&'static str>)> {
+    Ok(
+        match hub::subscribe_decision(hub_state(state)?, subscribed, closing, count, has_session) {
+            SubscribeDecision::Already => ("already", None, None),
+            SubscribeDecision::Join => ("join", None, None),
+            SubscribeDecision::Start => ("start", None, None),
+            SubscribeDecision::Reject(error) => {
+                ("reject", Some(error.code()), Some(error.message()))
+            }
+        },
+    )
+}
 
+#[pyfunction]
+fn hub_unsubscribe_decision(
+    subscribed: bool,
+    remaining: usize,
+    state: &str,
+    has_session: bool,
+) -> PyResult<&'static str> {
+    Ok(
+        match hub::unsubscribe_decision(subscribed, remaining, hub_state(state)?, has_session) {
+            UnsubscribeDecision::Already => "already",
+            UnsubscribeDecision::Remove => "remove",
+            UnsubscribeDecision::Stop => "stop",
+        },
+    )
+}
 
+#[pyfunction]
+fn hub_recovery_step(index: usize, delays: Vec<f64>, shutdown: bool) -> Option<(f64, usize)> {
+    hub::recovery_step(index, &delays, shutdown)
+}
 
+#[pyfunction]
+fn hub_reset_recovery_backoff() -> usize {
+    hub::reset_recovery_backoff()
+}
 
+#[pyfunction]
+fn hub_default_recovery_delays() -> Vec<f64> {
+    hub::DEFAULT_RECOVERY_DELAYS.to_vec()
+}
 
+#[pyfunction]
+fn hub_restore_decision(count: usize, shutdown: bool) -> &'static str {
+    match hub::restore_decision(count, shutdown) {
+        RestoreDecision::Shutdown => "shutdown",
+        RestoreDecision::Ready => "ready",
+        RestoreDecision::StartHeartRate => "start_heart_rate",
+    }
+}
 
-
-
-
-
-
-
-
-
+#[pyfunction]
+fn hub_recovery_disposition(cleanup: bool, recoverable: bool, shutdown: bool) -> &'static str {
+    match hub::recovery_disposition(cleanup, recoverable, shutdown) {
+        RecoveryDisposition::Shutdown => "shutdown",
+        RecoveryDisposition::Terminal => "terminal",
+        RecoveryDisposition::Retry => "retry",
+    }
+}
 
 #[pyfunction]
 fn hub_constants() -> (
@@ -635,6 +692,13 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(hub_validate_request, module)?)?;
     module.add_function(wrap_pyfunction!(hub_decode_request, module)?)?;
     module.add_function(wrap_pyfunction!(hub_source_side, module)?)?;
-                                module.add_function(wrap_pyfunction!(hub_constants, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_subscribe_decision, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_unsubscribe_decision, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_recovery_step, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_reset_recovery_backoff, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_default_recovery_delays, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_restore_decision, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_recovery_disposition, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_constants, module)?)?;
             Ok(())
 }

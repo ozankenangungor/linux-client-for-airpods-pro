@@ -151,4 +151,45 @@ class HubBindingsTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(OverflowError):
                 self.native.hub_source_side(raw)
 
+    def test_subscription_decisions_and_invalid_state(self):
+        decide = self.native.hub_subscribe_decision
+        self.assertEqual(decide("ready", True, False, 1, True), ("already", None, None))
+        self.assertEqual(decide("ready", False, False, 0, True), ("start", None, None))
+        self.assertEqual(decide("streaming", False, False, 1, True), ("join", None, None))
+        self.assertEqual(
+            decide("ready", False, True, 0, True),
+            ("reject", "connection_closing", "connection is closing"),
+        )
+        self.assertEqual(
+            decide("failed", False, False, 0, True),
+            ("reject", "service_failed", "sensor service is unavailable"),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid daemon state"):
+            decide("unknown", False, False, 0, True)
+
+    def test_unsubscription_decisions(self):
+        decide = self.native.hub_unsubscribe_decision
+        self.assertEqual(decide(False, 0, "streaming", True), "already")
+        self.assertEqual(decide(True, 1, "streaming", True), "remove")
+        self.assertEqual(decide(True, 0, "streaming", True), "stop")
+        with self.assertRaisesRegex(ValueError, "invalid daemon state"):
+            decide(True, 0, "unknown", True)
+
+
+    def test_recovery_decisions(self):
+        step = self.native.hub_recovery_step
+        self.assertEqual(step(0, [1.0, 2.0], False), (1.0, 1))
+        self.assertEqual(step(1, [1.0, 2.0], False), (2.0, 2))
+        self.assertEqual(step(2, [1.0, 2.0], False), (2.0, 3))
+        self.assertIsNone(step(0, [], False))
+        self.assertIsNone(step(0, [1.0], True))
+        self.assertEqual(self.native.hub_restore_decision(0, False), "ready")
+        self.assertEqual(self.native.hub_restore_decision(1, False), "start_heart_rate")
+        self.assertEqual(self.native.hub_restore_decision(1, True), "shutdown")
+        disposition = self.native.hub_recovery_disposition
+        self.assertEqual(disposition(True, True, False), "retry")
+        self.assertEqual(disposition(False, True, False), "terminal")
+        self.assertEqual(disposition(True, False, False), "terminal")
+        self.assertEqual(disposition(True, True, True), "shutdown")
+
 
