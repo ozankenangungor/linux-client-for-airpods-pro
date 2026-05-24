@@ -175,6 +175,77 @@ class HubBindingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid daemon state"):
             decide(True, 0, "unknown", True)
 
+    def test_core_message_constructors(self):
+        message = self.native.hub_message
+        self.assertEqual(
+            message("hello"),
+            {
+                "protocol_version": 1, "ok": True, "operation": "hello",
+                "service": "airpods-hubd", "experimental": True,
+            },
+        )
+        self.assertEqual(
+            message("ping"),
+            {"protocol_version": 1, "ok": True, "operation": "ping", "pong": True},
+        )
+        self.assertEqual(
+            message("status", state="streaming", subscriber_count=2),
+            {
+                "protocol_version": 1, "ok": True, "operation": "status",
+                "state": "streaming", "subscriber_count": 2,
+            },
+        )
+        self.assertEqual(
+            message("subscribe", subscribed=True, already=False),
+            {
+                "protocol_version": 1, "ok": True, "operation": "subscribe",
+                "stream": "heart_rate", "subscribed": True, "already_subscribed": False,
+            },
+        )
+        self.assertEqual(
+            message("unsubscribe", subscribed=False, already=True),
+            {
+                "protocol_version": 1, "ok": True, "operation": "unsubscribe",
+                "stream": "heart_rate", "subscribed": False, "already_unsubscribed": True,
+            },
+        )
+        for operation, kwargs in (
+            ("unknown", {}),
+            ("status", {}),
+            ("status", {"state": "unknown", "subscriber_count": 0}),
+            ("subscribe", {}),
+            ("subscribe", {"subscribed": False, "already": False}),
+            ("unsubscribe", {"subscribed": True, "already": False}),
+        ):
+            with self.subTest(operation=operation, kwargs=kwargs), self.assertRaises(ValueError):
+                message(operation, **kwargs)
+
+    def test_heart_rate_event_preserves_python_values(self):
+        event = self.native.hub_heart_rate_event
+        for bpm in (0, -1, 100_000, 2**100, "80"):
+            for raw, side in (
+                (1, "left"), (2, "right"), (True, "left"),
+                (1.0, "left"), (2.0, "right"), (1.5, "unknown"),
+                (float("inf"), "unknown"),
+                (False, "unknown"), (0, "unknown"), (-1, "unknown"),
+                (2**100, "unknown"), (-(2**100), "unknown"),
+                (None, "unknown"), ("1", "unknown"),
+            ):
+                with self.subTest(bpm=bpm, raw=raw):
+                    result = event(bpm, raw)
+                    self.assertEqual(result["protocol_version"], 1)
+                    self.assertEqual(result["event"], "heart_rate")
+                    self.assertEqual(result["bpm"], bpm)
+                    self.assertEqual(result["source_side"], side)
+                    if side == "unknown":
+                        self.assertEqual(result["source_side_raw"], raw)
+                    else:
+                        self.assertNotIn("source_side_raw", result)
+        raw_list = [1]
+        bpm_list = [80]
+        result = event(bpm_list, raw_list)
+        self.assertIs(result["source_side_raw"], raw_list)
+        self.assertIs(result["bpm"], bpm_list)
 
     def test_recovery_decisions(self):
         step = self.native.hub_recovery_step
@@ -193,3 +264,5 @@ class HubBindingsTests(unittest.TestCase):
         self.assertEqual(disposition(True, True, True), "shutdown")
 
 
+if __name__ == "__main__":
+    unittest.main()

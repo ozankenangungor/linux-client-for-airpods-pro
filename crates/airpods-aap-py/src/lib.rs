@@ -1,12 +1,24 @@
 #![forbid(unsafe_code)]
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
-use airpods_aap_core :: { AapFrameSummary , AapType2bFrameSummary , ActivationCommand , ActivationEvent , ActivationState , ControlFrameSummary , DescriptorEvidence , HeartRateParseError , HeartRateReport , ProductionError , ProductionEvent , ProductionOperation , ProductionState , RecoveryCauseKind , RecoveryError , SentCommands , SourceSide , TransitionError , advance , classify_coexistence_recovery as classify_core_coexistence_recovery , parse_heart_rate_packet as parse_core , plan_activation_send , plan_cleanup_send , production_operation as check_production_operation , production_transition as advance_production } ;
-use airpods_hub_core :: { self as hub , DaemonState , Operation , RecoveryDisposition , RequestField , RestoreDecision , SubscribeDecision , UnsubscribeDecision } ;
-use pyo3 :: create_exception ;
-use pyo3 :: exceptions :: { PyUnicodeDecodeError , PyValueError } ;
-use pyo3 :: prelude :: * ;
-use pyo3 :: types :: { PyAny , PyBool , PyBytes , PyDict , PyInt , PyModule , PyString , PyTuple } ;
+use airpods_aap_core::{
+    AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
+    ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, ProductionError,
+    ProductionEvent, ProductionOperation, ProductionState, RecoveryCauseKind, RecoveryError,
+    SentCommands, SourceSide, TransitionError, advance,
+    classify_coexistence_recovery as classify_core_coexistence_recovery,
+    parse_heart_rate_packet as parse_core, plan_activation_send, plan_cleanup_send,
+    production_operation as check_production_operation,
+    production_transition as advance_production,
+};
+use airpods_hub_core::{
+    self as hub, DaemonState, Operation, RecoveryDisposition, RequestField, RestoreDecision,
+    SubscribeDecision, UnsubscribeDecision,
+};
+use pyo3::create_exception;
+use pyo3::exceptions::{PyUnicodeDecodeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyInt, PyModule, PyString, PyTuple};
 
 fn neutral_u8(value: &Bound<'_, PyAny>) -> PyResult<u8> {
     if value.is_instance_of::<PyBool>() {
@@ -653,11 +665,82 @@ fn hub_constants() -> (
     )
 }
 
+fn hub_value_to_dict<'py>(
+    py: Python<'py>,
+    value: serde_json::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    let json =
+        serde_json::to_string(&value).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(py
+        .import("json")?
+        .call_method1("loads", (json,))?
+        .extract::<Bound<'py, PyDict>>()?)
+}
 
+#[pyfunction(signature = (operation, state=None, subscriber_count=None, subscribed=None, already=None))]
+fn hub_message<'py>(
+    py: Python<'py>,
+    operation: &str,
+    state: Option<&str>,
+    subscriber_count: Option<usize>,
+    subscribed: Option<bool>,
+    already: Option<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let value = match Operation::parse(operation) {
+        Some(Operation::Hello) => hub::hello_response(),
+        Some(Operation::Ping) => hub::ping_response(),
+        Some(Operation::Status) => hub::status_response(
+            hub_state(state.ok_or_else(|| PyValueError::new_err("state is required"))?)?,
+            subscriber_count
+                .ok_or_else(|| PyValueError::new_err("subscriber_count is required"))?,
+        ),
+        Some(operation @ (Operation::Subscribe | Operation::Unsubscribe)) => {
+            let subscribed =
+                subscribed.ok_or_else(|| PyValueError::new_err("subscribed is required"))?;
+            if subscribed != matches!(operation, Operation::Subscribe) {
+                return Err(PyValueError::new_err("subscribed does not match operation"));
+            }
+            hub::subscription_response(
+                subscribed,
+                already.ok_or_else(|| PyValueError::new_err("already is required"))?,
+            )
+        }
+        None => return Err(PyValueError::new_err("invalid hub operation")),
+    };
+    hub_value_to_dict(py, value)
+}
 
-
-
-
+#[pyfunction]
+fn hub_heart_rate_event<'py>(
+    py: Python<'py>,
+    bpm: &Bound<'py, PyAny>,
+    raw: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let numeric = if raw.is_instance_of::<PyBool>() {
+        i64::from(raw.extract::<bool>()?)
+    } else if let Ok(value) = raw.extract::<i64>() {
+        value
+    } else if raw.is_instance_of::<PyFloat>() {
+        let value = raw.extract::<f64>()?;
+        if value.is_finite()
+            && value.fract() == 0.0
+            && value >= i64::MIN as f64
+            && value < i64::MAX as f64
+        {
+            value as i64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let event = hub_value_to_dict(py, hub::heart_rate_event(0, numeric))?;
+    event.set_item("bpm", bpm)?;
+    if event.contains("source_side_raw")? {
+        event.set_item("source_side_raw", raw)?;
+    }
+    Ok(event)
+}
 
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -700,5 +783,7 @@ fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(hub_restore_decision, module)?)?;
     module.add_function(wrap_pyfunction!(hub_recovery_disposition, module)?)?;
     module.add_function(wrap_pyfunction!(hub_constants, module)?)?;
-            Ok(())
+    module.add_function(wrap_pyfunction!(hub_message, module)?)?;
+    module.add_function(wrap_pyfunction!(hub_heart_rate_event, module)?)?;
+    Ok(())
 }
