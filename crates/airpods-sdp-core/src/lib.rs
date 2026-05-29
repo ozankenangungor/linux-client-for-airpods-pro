@@ -196,14 +196,66 @@ pub fn bluez_xml_records(identity: UsbIdentity) -> [XmlRecord; 4] {
     result.try_into().expect("four canonical records")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonStatus {
+    Match,
+    Mismatch,
+    NotObservable,
+}
+impl ComparisonStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::NotObservable => "unknown/not-observable",
+        }
+    }
+}
 
+pub fn expected_attributes(identity: Option<UsbIdentity>) -> [Vec<(&'static str, Option<u16>)>; 4] {
+    [
+        vec![
+            ("pnp_vendor_id", identity.map(|value| value.vendor_id)),
+            ("pnp_product_id", identity.map(|value| value.product_id)),
+            ("pnp_version", identity.map(|value| value.version)),
+            ("pnp_vendor_id_source", Some(PNP_VENDOR_ID_SOURCE_USB)),
+        ],
+        vec![("rfcomm_channel", Some(u16::from(HANDS_FREE_RFCOMM_CHANNEL)))],
+        vec![
+            ("l2cap_psm", Some(AVDTP_L2CAP_PSM)),
+            ("avdtp_version", Some(AVDTP_VERSION)),
+        ],
+        vec![("avrcp_profile_version", Some(AVRCP_VERSION))],
+    ]
+}
 
+/// `observed` is present only if the inspector marked the field observable.
+pub fn compare_attribute(expected: Option<u16>, observed: Option<Option<i64>>) -> ComparisonStatus {
+    match (expected, observed) {
+        (Some(expected), Some(Some(observed))) if i64::from(expected) == observed => {
+            ComparisonStatus::Match
+        }
+        (Some(_), Some(_)) => ComparisonStatus::Mismatch,
+        _ => ComparisonStatus::NotObservable,
+    }
+}
 
-
-
-
-
-
+pub fn full_record_equivalence(
+    statuses: &[ComparisonStatus],
+    uuids_present: &[bool],
+) -> ComparisonStatus {
+    if statuses.contains(&ComparisonStatus::Mismatch) || uuids_present.contains(&false) {
+        ComparisonStatus::Mismatch
+    } else if !statuses.is_empty()
+        && statuses
+            .iter()
+            .all(|status| *status == ComparisonStatus::Match)
+    {
+        ComparisonStatus::Match
+    } else {
+        ComparisonStatus::NotObservable
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceUuid {

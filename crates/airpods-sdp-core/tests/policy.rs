@@ -182,7 +182,74 @@ fn bluez_xml_matches_exact_parent_golden_records() {
     }
 }
 
-
+#[test]
+fn audit_attribute_matrix_and_overall_fail_closed() {
+    for expected in [None, Some(7)] {
+        for observed in [None, Some(None), Some(Some(7)), Some(Some(8))] {
+            let status = compare_attribute(expected, observed);
+            let expected_status = match (expected, observed) {
+                (Some(7), Some(Some(7))) => ComparisonStatus::Match,
+                (Some(_), Some(_)) => ComparisonStatus::Mismatch,
+                _ => ComparisonStatus::NotObservable,
+            };
+            assert_eq!(status, expected_status);
+        }
+    }
+    for attributes in expected_attributes(None) {
+        for (name, expected) in attributes {
+            if ["pnp_vendor_id", "pnp_product_id", "pnp_version"].contains(&name) {
+                assert_eq!(expected, None);
+            } else {
+                assert!(expected.is_some());
+            }
+        }
+    }
+    assert_eq!(
+        expected_attributes(Some(identity(1, 2, 3)))[0],
+        vec![
+            ("pnp_vendor_id", Some(1)),
+            ("pnp_product_id", Some(2)),
+            ("pnp_version", Some(3)),
+            ("pnp_vendor_id_source", Some(2)),
+        ]
+    );
+    let all_match = vec![ComparisonStatus::Match; 8];
+    assert_eq!(
+        full_record_equivalence(&all_match, &[true; 4]),
+        ComparisonStatus::Match
+    );
+    for missing in 0..4 {
+        let mut uuids = [true; 4];
+        uuids[missing] = false;
+        assert_eq!(
+            full_record_equivalence(&all_match, &uuids),
+            ComparisonStatus::Mismatch
+        );
+    }
+    for mismatch in 0..8 {
+        let mut statuses = all_match.clone();
+        statuses[mismatch] = ComparisonStatus::Mismatch;
+        assert_eq!(
+            full_record_equivalence(&statuses, &[true; 4]),
+            ComparisonStatus::Mismatch
+        );
+    }
+    assert_eq!(
+        full_record_equivalence(
+            &[ComparisonStatus::Match, ComparisonStatus::NotObservable],
+            &[true; 4]
+        ),
+        ComparisonStatus::NotObservable
+    );
+    assert_eq!(
+        full_record_equivalence(&[], &[]),
+        ComparisonStatus::NotObservable
+    );
+    assert_eq!(
+        full_record_equivalence(&[ComparisonStatus::NotObservable; 8], &[true; 4]),
+        ComparisonStatus::NotObservable
+    );
+}
 
 
 
