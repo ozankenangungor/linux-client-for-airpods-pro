@@ -4,5 +4,6 @@ members = [
     "crates/airpods-aap-py",
     "crates/airpods-client",
     "crates/airpods-hub-core",
+    "crates/airpods-sdp-core",
 ]
 resolver = "3"
