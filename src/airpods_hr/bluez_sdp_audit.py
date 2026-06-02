@@ -8,12 +8,8 @@ from types import MappingProxyType
 from typing import Mapping
 
 from airpods_hr.bluez_coexistence import BlueZCoexistenceState
+from airpods_hr import _airpods_aap_core as _sdp_core
 from airpods_hr.sdp import (
-    AVDTP_L2CAP_PSM,
-    AVDTP_VERSION,
-    AVRCP_VERSION,
-    HANDS_FREE_RFCOMM_CHANNEL,
-    PNP_VENDOR_ID_SOURCE_USB,
     AdapterIdentityError,
     USBAdapterIdentity,
     build_bluez_sdp_service_records,
@@ -72,54 +68,16 @@ class BlueZSDPAuditResult:
 
     @property
     def full_record_equivalence(self) -> SDPComparisonStatus:
-        statuses = tuple(
-            attribute.status
-            for record in self.records
-            for attribute in record.attributes
+        return SDPComparisonStatus(
+            _sdp_core.sdp_full_record_equivalence(
+                [
+                    attribute.status.value
+                    for record in self.records
+                    for attribute in record.attributes
+                ],
+                [record.service_class_uuid_present for record in self.records],
+            )
         )
-        if any(status is SDPComparisonStatus.MISMATCH for status in statuses):
-            return SDPComparisonStatus.MISMATCH
-        if not all(record.service_class_uuid_present for record in self.records):
-            return SDPComparisonStatus.MISMATCH
-        if statuses and all(
-            status is SDPComparisonStatus.MATCH for status in statuses
-        ):
-            return SDPComparisonStatus.MATCH
-        return SDPComparisonStatus.NOT_OBSERVABLE
-
-
-def _expected_attributes(
-    identity: USBAdapterIdentity | None,
-) -> Mapping[str, tuple[tuple[str, int | None], ...]]:
-    return {
-        "PnPInformation": (
-            ("pnp_vendor_id", None if identity is None else identity.vendor_id),
-            ("pnp_product_id", None if identity is None else identity.product_id),
-            ("pnp_version", None if identity is None else identity.version),
-            ("pnp_vendor_id_source", PNP_VENDOR_ID_SOURCE_USB),
-        ),
-        "HandsfreeAudioGateway": (
-            ("rfcomm_channel", HANDS_FREE_RFCOMM_CHANNEL),
-        ),
-        "AudioSource": (
-            ("l2cap_psm", AVDTP_L2CAP_PSM),
-            ("avdtp_version", AVDTP_VERSION),
-        ),
-        "A/V RemoteControlTarget": (
-            ("avrcp_profile_version", AVRCP_VERSION),
-        ),
-    }
-
-
-def _compare_attribute(
-    observed: ObservedSDPAttribute | None,
-    expected: int | None,
-) -> SDPComparisonStatus:
-    if expected is None or observed is None or not observed.observable:
-        return SDPComparisonStatus.NOT_OBSERVABLE
-    if observed.value == expected:
-        return SDPComparisonStatus.MATCH
-    return SDPComparisonStatus.MISMATCH
 
 
 def audit_bluez_sdp_identity(
@@ -134,12 +92,15 @@ def audit_bluez_sdp_identity(
         )
     except AdapterIdentityError:
         identity = None
-    expected_attributes = _expected_attributes(identity)
+    expected_rows = _sdp_core.sdp_expected_attributes(
+        None if identity is None else
+        (identity.vendor_id, identity.product_id, identity.version)
+    )
     records = build_bluez_sdp_service_records(
         identity or USBAdapterIdentity(0, 0, 0)
     )
     comparisons: list[SDPAuditRecord] = []
-    for expected_record in records:
+    for expected_record, expected_attributes in zip(records, expected_rows):
         observed_record = (
             inspection.records_by_uuid.get(expected_record.uuid)
             if inspection is not None
@@ -156,16 +117,22 @@ def audit_bluez_sdp_identity(
                     and observed_record.attributes[name].observable
                     else None
                 ),
-                _compare_attribute(
-                    (
-                        observed_record.attributes.get(name)
-                        if observed_record is not None
-                        else None
-                    ),
-                    expected,
+                SDPComparisonStatus(
+                    _sdp_core.sdp_compare_attribute(
+                        expected,
+                        observed_record is not None
+                        and name in observed_record.attributes
+                        and observed_record.attributes[name].observable,
+                        (
+                            observed_record.attributes[name].value
+                            if observed_record is not None
+                            and name in observed_record.attributes
+                            else None
+                        ),
+                    )
                 ),
             )
-            for name, expected in expected_attributes[expected_record.name]
+            for name, expected in expected_attributes
         )
         comparisons.append(
             SDPAuditRecord(

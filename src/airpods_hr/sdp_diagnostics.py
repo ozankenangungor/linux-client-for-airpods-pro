@@ -11,19 +11,7 @@ from time import monotonic
 from typing import Callable, Iterator
 
 from bumble import l2cap, sdp
-from bumble.core import (
-    BT_AUDIO_SOURCE_SERVICE,
-    BT_AV_REMOTE_CONTROL_TARGET_SERVICE,
-    BT_HANDSFREE_AUDIO_GATEWAY_SERVICE,
-    BT_PNP_INFORMATION_SERVICE,
-)
-
-from airpods_hr.sdp import (
-    AUDIO_SOURCE_HANDLE,
-    AVRCP_TARGET_HANDLE,
-    HANDS_FREE_AUDIO_GATEWAY_HANDLE,
-    PNP_INFORMATION_HANDLE,
-)
+from airpods_hr import _airpods_aap_core as _sdp_core
 
 
 SUPPORTED_BUMBLE_VERSION = "0.0.234"
@@ -80,26 +68,25 @@ class SafeProtocolTimeline:
     ) -> None:
         if limit <= 0:
             raise ValueError("protocol timeline limit must be positive")
-        self._limit = limit
         self._clock = clock
         self._origin = clock()
-        self._events: list[ProtocolTimelineEvent] = []
-        self._total_events = 0
+        self._state = _sdp_core.SDPTimelineState(limit)
 
     def record(self, kind: ProtocolTimelineKind) -> None:
         kind = ProtocolTimelineKind(kind)
-        self._total_events += 1
-        if len(self._events) < self._limit:
-            self._events.append(
-                ProtocolTimelineEvent(
-                    kind=kind,
-                    elapsed_seconds=max(0.0, self._clock() - self._origin),
-                )
-            )
+        elapsed = (
+            self._clock() - self._origin if not self._state.full() else 0.0
+        )
+        self._state.record(kind.value, elapsed)
 
     def snapshot(self) -> ProtocolTimelineSnapshot:
+        events, total = self._state.snapshot()
         return ProtocolTimelineSnapshot(
-            events=tuple(self._events), total_events=self._total_events
+            events=tuple(
+                ProtocolTimelineEvent(ProtocolTimelineKind(kind), elapsed)
+                for kind, elapsed in events
+            ),
+            total_events=total,
         )
 
 
@@ -128,16 +115,7 @@ class SDPDiagnosticsSnapshot:
     )
 
 
-_KNOWN_SERVICES = (
-    ("pnp", BT_PNP_INFORMATION_SERVICE, PNP_INFORMATION_HANDLE),
-    (
-        "handsfree",
-        BT_HANDSFREE_AUDIO_GATEWAY_SERVICE,
-        HANDS_FREE_AUDIO_GATEWAY_HANDLE,
-    ),
-    ("audio_source", BT_AUDIO_SOURCE_SERVICE, AUDIO_SOURCE_HANDLE),
-    ("avrcp_target", BT_AV_REMOTE_CONTROL_TARGET_SERVICE, AVRCP_TARGET_HANDLE),
-)
+_KNOWN_SERVICES = _sdp_core.sdp_known_services()
 
 
 def _parameters(function: object) -> tuple[str, ...]:
@@ -197,43 +175,27 @@ class BumbleSDPDiagnostics:
         self._reset()
 
     def _reset(self) -> None:
-        self._sdp_connection_observed = False
-        self._sdp_requests_observed = 0
-        self._query_counts = {
-            "pnp": 0,
-            "handsfree": 0,
-            "audio_source": 0,
-            "avrcp_target": 0,
-            "other": 0,
-        }
-        self._matches_served = {
-            "pnp": False,
-            "handsfree": False,
-            "audio_source": False,
-            "avrcp_target": False,
-        }
-        self._psm_counts = {1: 0, 3: 0, 23: 0, 25: 0, "other": 0}
+        self._state = _sdp_core.SDPDiagnosticState()
 
     def snapshot(self) -> SDPDiagnosticsSnapshot:
+        connected, requests, queries, matches, psm = self._state.snapshot()
         return SDPDiagnosticsSnapshot(
-            sdp_connection_observed=self._sdp_connection_observed,
-            sdp_requests_observed=self._sdp_requests_observed,
-            pnp_information_queries=self._query_counts["pnp"],
-            handsfree_audio_gateway_queries=self._query_counts["handsfree"],
-            audio_source_queries=self._query_counts["audio_source"],
-            avrcp_target_queries=self._query_counts["avrcp_target"],
-            other_queries=self._query_counts["other"],
-            pnp_information_match_served=self._matches_served["pnp"],
-            handsfree_audio_gateway_match_served=self._matches_served[
-                "handsfree"
-            ],
-            audio_source_match_served=self._matches_served["audio_source"],
-            avrcp_target_match_served=self._matches_served["avrcp_target"],
-            psm_1_requests=self._psm_counts[1],
-            psm_3_requests=self._psm_counts[3],
-            psm_23_requests=self._psm_counts[23],
-            psm_25_requests=self._psm_counts[25],
-            other_psm_requests=self._psm_counts["other"],
+            sdp_connection_observed=connected,
+            sdp_requests_observed=requests,
+            pnp_information_queries=queries[0],
+            handsfree_audio_gateway_queries=queries[1],
+            audio_source_queries=queries[2],
+            avrcp_target_queries=queries[3],
+            other_queries=queries[4],
+            pnp_information_match_served=matches[0],
+            handsfree_audio_gateway_match_served=matches[1],
+            audio_source_match_served=matches[2],
+            avrcp_target_match_served=matches[3],
+            psm_1_requests=psm[0],
+            psm_3_requests=psm[1],
+            psm_23_requests=psm[2],
+            psm_25_requests=psm[3],
+            other_psm_requests=psm[4],
             timeline=self._timeline.snapshot(),
         )
 
@@ -244,15 +206,16 @@ class BumbleSDPDiagnostics:
         except (AttributeError, TypeError):
             return ()
         return tuple(
-            name
-            for name, service_uuid, _handle in _KNOWN_SERVICES
-            if any(value == service_uuid for value in values)
+            _sdp_core.sdp_classify_service_uuid_bytes(
+                [getattr(value, "uuid_bytes", b"") for value in values]
+            )
         )
+
 
     def _classify_request(
         self, request: sdp.SDP_PDU, server: sdp.Server
     ) -> tuple[str, ...]:
-        self._sdp_requests_observed += 1
+        self._state.observe_request()
         matched: tuple[str, ...] = ()
         if isinstance(request, sdp.SDP_ServiceSearchRequest):
             names = self._classify_pattern(request.service_search_pattern)
@@ -280,9 +243,7 @@ class BumbleSDPDiagnostics:
             )
         elif isinstance(request, sdp.SDP_ServiceAttributeRequest):
             names = tuple(
-                name
-                for name, _service_uuid, handle in _KNOWN_SERVICES
-                if handle == request.service_record_handle
+                _sdp_core.sdp_classify_handle(request.service_record_handle)
             )
             matched = tuple(
                 name
@@ -296,25 +257,12 @@ class BumbleSDPDiagnostics:
         else:
             names = ()
 
-        if not names:
-            self._query_counts["other"] += 1
-        else:
-            for name in names:
-                self._query_counts[name] += 1
+        self._state.account_query(list(names))
         return matched
 
     def _record_psm(self, psm: int) -> None:
-        if psm in (1, 3, 23, 25):
-            self._psm_counts[psm] += 1
-        else:
-            self._psm_counts["other"] += 1
-        timeline_kind = {
-            1: ProtocolTimelineKind.PSM_1_REQUEST,
-            3: ProtocolTimelineKind.PSM_3_REQUEST,
-            23: ProtocolTimelineKind.PSM_23_REQUEST,
-            25: ProtocolTimelineKind.PSM_25_REQUEST,
-        }.get(psm, ProtocolTimelineKind.OTHER_PSM_REQUEST)
-        self._timeline.record(timeline_kind)
+        timeline_kind = self._state.observe_psm(psm)
+        self._timeline.record(ProtocolTimelineKind(timeline_kind))
 
     @contextmanager
     def observe(self, device: object) -> Iterator[None]:
@@ -355,13 +303,13 @@ class BumbleSDPDiagnostics:
             try:
                 request = sdp.SDP_PDU.from_bytes(pdu)
             except Exception:
-                self._sdp_requests_observed += 1
-                self._query_counts["other"] += 1
+                self._state.observe_request()
+                self._state.account_query([])
             else:
                 matched = self._classify_request(request, server)
             original_server_on_pdu(pdu)
             for name in matched:
-                self._matches_served[name] = True
+                self._state.mark_served(name)
 
         def observe_connection_request(
             connection: object,
@@ -372,7 +320,7 @@ class BumbleSDPDiagnostics:
             original_manager_handler(connection, cid, request)
 
         def observe_sdp_connection(_channel: object) -> None:
-            self._sdp_connection_observed = True
+            self._state.observe_connection()
 
         server.on_pdu = observe_pdu  # type: ignore[method-assign]
         manager.on_l2cap_connection_request = (  # type: ignore[method-assign]
