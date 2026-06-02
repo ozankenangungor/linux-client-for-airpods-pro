@@ -2,47 +2,34 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
 from bumble import sdp
-from bumble.core import (
-    BT_AUDIO_SOURCE_SERVICE,
-    BT_AV_REMOTE_CONTROL_SERVICE,
-    BT_AV_REMOTE_CONTROL_TARGET_SERVICE,
-    BT_AVDTP_PROTOCOL_ID,
-    BT_HANDSFREE_AUDIO_GATEWAY_SERVICE,
-    BT_L2CAP_PROTOCOL_ID,
-    BT_PNP_INFORMATION_SERVICE,
-    BT_RFCOMM_PROTOCOL_ID,
-)
+from bumble.core import UUID
+from airpods_hr import _airpods_aap_core as _sdp_core
 
 from airpods_hr.discovery import AirPodsCandidate
 
-REQUIRED_SDP_COMPATIBILITY_RECORDS: tuple[str, ...] = (
-    "PnPInformation",
-    "HandsfreeAudioGateway",
-    "AudioSource",
-    "A/V RemoteControlTarget",
+_CONSTANTS = dict(_sdp_core.sdp_constants())
+REQUIRED_SDP_COMPATIBILITY_RECORDS: tuple[str, ...] = tuple(
+    spec["name"] for spec in _sdp_core.sdp_canonical_records(0, 0, 0)
 )
-
-PNP_INFORMATION_HANDLE = 0x00010001
-HANDS_FREE_AUDIO_GATEWAY_HANDLE = 0x00010002
-AUDIO_SOURCE_HANDLE = 0x00010003
-AVRCP_TARGET_HANDLE = 0x00010004
-HANDS_FREE_RFCOMM_CHANNEL = 13
-AVDTP_L2CAP_PSM = 0x0019
-AVDTP_VERSION = 0x0103
-AVRCP_VERSION = 0x0106
-PNP_VENDOR_ID_SOURCE_USB = 0x0002
-
-PNP_VENDOR_ID_ATTRIBUTE_ID = 0x0201
-PNP_PRODUCT_ID_ATTRIBUTE_ID = 0x0202
-PNP_VERSION_ATTRIBUTE_ID = 0x0203
-PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID = 0x0205
+PNP_INFORMATION_HANDLE = _CONSTANTS["PNP_INFORMATION_HANDLE"]
+HANDS_FREE_AUDIO_GATEWAY_HANDLE = _CONSTANTS["HANDS_FREE_AUDIO_GATEWAY_HANDLE"]
+AUDIO_SOURCE_HANDLE = _CONSTANTS["AUDIO_SOURCE_HANDLE"]
+AVRCP_TARGET_HANDLE = _CONSTANTS["AVRCP_TARGET_HANDLE"]
+HANDS_FREE_RFCOMM_CHANNEL = _CONSTANTS["HANDS_FREE_RFCOMM_CHANNEL"]
+AVDTP_L2CAP_PSM = _CONSTANTS["AVDTP_L2CAP_PSM"]
+AVDTP_VERSION = _CONSTANTS["AVDTP_VERSION"]
+AVRCP_VERSION = _CONSTANTS["AVRCP_VERSION"]
+PNP_VENDOR_ID_SOURCE_USB = _CONSTANTS["PNP_VENDOR_ID_SOURCE_USB"]
+PNP_VENDOR_ID_ATTRIBUTE_ID = _CONSTANTS["PNP_VENDOR_ID_ATTRIBUTE_ID"]
+PNP_PRODUCT_ID_ATTRIBUTE_ID = _CONSTANTS["PNP_PRODUCT_ID_ATTRIBUTE_ID"]
+PNP_VERSION_ATTRIBUTE_ID = _CONSTANTS["PNP_VERSION_ATTRIBUTE_ID"]
+PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID = _CONSTANTS["PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,13 +39,6 @@ class BlueZSDPServiceRecord:
     name: str
     uuid: str
     service_record: str
-
-
-_USB_MODALIAS = re.compile(
-    r"usb:v(?P<vendor>[0-9A-Fa-f]{4})"
-    r"p(?P<product>[0-9A-Fa-f]{4})"
-    r"d(?P<version>[0-9A-Fa-f]{4})"
-)
 
 
 class SDPCompatibilityError(RuntimeError):
@@ -89,239 +69,60 @@ class USBAdapterIdentity:
 
     @classmethod
     def from_bluez_modalias(cls, modalias: str | None) -> USBAdapterIdentity:
-        if modalias is None:
-            raise AdapterIdentityError("BlueZ adapter has no Modalias")
-        match = _USB_MODALIAS.fullmatch(modalias)
-        if match is None:
-            raise AdapterIdentityError(
-                "BlueZ adapter Modalias is not a supported USB identity"
-            )
-        return cls(
-            vendor_id=int(match.group("vendor"), 16),
-            product_id=int(match.group("product"), 16),
-            version=int(match.group("version"), 16),
-        )
+        try:
+            vendor_id, product_id, version = _sdp_core.sdp_parse_bluez_modalias(modalias)
+        except ValueError as error:
+            raise AdapterIdentityError(str(error)) from error
+        return cls(vendor_id, product_id, version)
 
 
-def _attribute(attribute_id: int, value: sdp.DataElement) -> sdp.ServiceAttribute:
-    return sdp.ServiceAttribute(attribute_id, value)
-
-
-def _handle(value: int) -> sdp.ServiceAttribute:
-    return _attribute(
-        sdp.SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
-        sdp.DataElement.unsigned_integer_32(value),
-    )
-
-
-def _service_class(value: object) -> sdp.ServiceAttribute:
-    return _attribute(
-        sdp.SDP_SERVICE_CLASS_ID_LIST_ATTRIBUTE_ID,
-        sdp.DataElement.sequence([sdp.DataElement.uuid(value)]),
-    )
+def _bumble_element(spec: dict[str, object]) -> sdp.DataElement:
+    kind = spec["kind"]
+    value = spec["value"]
+    if kind == "sequence":
+        return sdp.DataElement.sequence([_bumble_element(item) for item in value])
+    if kind == "uuid16":
+        return sdp.DataElement.uuid(UUID.from_16_bits(value))
+    if kind == "u8":
+        return sdp.DataElement.unsigned_integer_8(value)
+    if kind == "u16":
+        return sdp.DataElement.unsigned_integer_16(value)
+    return sdp.DataElement.unsigned_integer_32(value)
 
 
 def build_sdp_compatibility_records(
     identity: USBAdapterIdentity,
 ) -> dict[int, sdp.Server.Service]:
-    """Build exactly the four records proven by earlier experiments."""
+    """Build the four native-specified records as Bumble runtime objects."""
 
-    pnp = sdp.Server.Service(
-        [
-            _handle(PNP_INFORMATION_HANDLE),
-            _service_class(BT_PNP_INFORMATION_SERVICE),
-            _attribute(
-                PNP_VENDOR_ID_ATTRIBUTE_ID,
-                sdp.DataElement.unsigned_integer_16(identity.vendor_id),
-            ),
-            _attribute(
-                PNP_PRODUCT_ID_ATTRIBUTE_ID,
-                sdp.DataElement.unsigned_integer_16(identity.product_id),
-            ),
-            _attribute(
-                PNP_VERSION_ATTRIBUTE_ID,
-                sdp.DataElement.unsigned_integer_16(identity.version),
-            ),
-            _attribute(
-                PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID,
-                sdp.DataElement.unsigned_integer_16(PNP_VENDOR_ID_SOURCE_USB),
-            ),
-        ]
-    )
-    hands_free = sdp.Server.Service(
-        [
-            _handle(HANDS_FREE_AUDIO_GATEWAY_HANDLE),
-            _service_class(BT_HANDSFREE_AUDIO_GATEWAY_SERVICE),
-            _attribute(
-                sdp.SDP_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
-                sdp.DataElement.sequence(
-                    [
-                        sdp.DataElement.sequence(
-                            [sdp.DataElement.uuid(BT_L2CAP_PROTOCOL_ID)]
-                        ),
-                        sdp.DataElement.sequence(
-                            [
-                                sdp.DataElement.uuid(BT_RFCOMM_PROTOCOL_ID),
-                                sdp.DataElement.unsigned_integer_8(
-                                    HANDS_FREE_RFCOMM_CHANNEL
-                                ),
-                            ]
-                        ),
-                    ]
-                ),
-            ),
-        ]
-    )
-    audio_source = sdp.Server.Service(
-        [
-            _handle(AUDIO_SOURCE_HANDLE),
-            _service_class(BT_AUDIO_SOURCE_SERVICE),
-            _attribute(
-                sdp.SDP_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
-                sdp.DataElement.sequence(
-                    [
-                        sdp.DataElement.sequence(
-                            [
-                                sdp.DataElement.uuid(BT_L2CAP_PROTOCOL_ID),
-                                sdp.DataElement.unsigned_integer_16(
-                                    AVDTP_L2CAP_PSM
-                                ),
-                            ]
-                        ),
-                        sdp.DataElement.sequence(
-                            [
-                                sdp.DataElement.uuid(BT_AVDTP_PROTOCOL_ID),
-                                sdp.DataElement.unsigned_integer_16(AVDTP_VERSION),
-                            ]
-                        ),
-                    ]
-                ),
-            ),
-        ]
-    )
-    avrcp_target = sdp.Server.Service(
-        [
-            _handle(AVRCP_TARGET_HANDLE),
-            _service_class(BT_AV_REMOTE_CONTROL_TARGET_SERVICE),
-            _attribute(
-                sdp.SDP_BLUETOOTH_PROFILE_DESCRIPTOR_LIST_ATTRIBUTE_ID,
-                sdp.DataElement.sequence(
-                    [
-                        sdp.DataElement.sequence(
-                            [
-                                sdp.DataElement.uuid(
-                                    BT_AV_REMOTE_CONTROL_SERVICE
-                                ),
-                                sdp.DataElement.unsigned_integer_16(AVRCP_VERSION),
-                            ]
-                        )
-                    ]
-                ),
-            ),
-        ]
-    )
     return {
-        PNP_INFORMATION_HANDLE: pnp,
-        HANDS_FREE_AUDIO_GATEWAY_HANDLE: hands_free,
-        AUDIO_SOURCE_HANDLE: audio_source,
-        AVRCP_TARGET_HANDLE: avrcp_target,
+        spec["handle"]: sdp.Server.Service(
+            [
+                sdp.ServiceAttribute(attribute_id, _bumble_element(element))
+                for attribute_id, element in spec["attributes"]
+            ]
+        )
+        for spec in _sdp_core.sdp_canonical_records(
+            identity.vendor_id, identity.product_id, identity.version
+        )
     }
 
 
-def _uuid16(value: int) -> str:
-    return f"0000{value:04x}-0000-1000-8000-00805f9b34fb"
-
-
 REQUIRED_BLUEZ_SDP_COMPATIBILITY_UUIDS = frozenset(
-    _uuid16(value) for value in (0x1200, 0x111F, 0x110A, 0x110C)
+    uuid for _, uuid, _ in _sdp_core.sdp_bluez_xml_records(0, 0, 0)
 )
-
-
-def _xml_record(*attributes: str) -> str:
-    body = "\n".join(f"  {attribute}" for attribute in attributes)
-    return f"<record>\n{body}\n</record>"
-
-
-def _xml_service_class(uuid16: int) -> str:
-    return (
-        '<attribute id="0x0001">'
-        f'<sequence><uuid value="0x{uuid16:04x}"/></sequence>'
-        "</attribute>"
-    )
 
 
 def build_bluez_sdp_service_records(
     identity: USBAdapterIdentity,
 ) -> tuple[BlueZSDPServiceRecord, ...]:
-    """Render the accepted four-record identity for BlueZ ProfileManager1.
+    """Adapt native ProfileManager XML to the existing Python model."""
 
-    BlueZ assigns service-record handles, so the fixed Bumble-local handles are
-    deliberately omitted. Every interoperability attribute otherwise mirrors
-    :func:`build_sdp_compatibility_records` and uses the same constants.
-    """
-
-    pnp = _xml_record(
-        _xml_service_class(0x1200),
-        (
-            '<attribute id="0x0201">'
-            f'<uint16 value="0x{identity.vendor_id:04x}"/>'
-            "</attribute>"
-        ),
-        (
-            '<attribute id="0x0202">'
-            f'<uint16 value="0x{identity.product_id:04x}"/>'
-            "</attribute>"
-        ),
-        (
-            '<attribute id="0x0203">'
-            f'<uint16 value="0x{identity.version:04x}"/>'
-            "</attribute>"
-        ),
-        (
-            '<attribute id="0x0205">'
-            f'<uint16 value="0x{PNP_VENDOR_ID_SOURCE_USB:04x}"/>'
-            "</attribute>"
-        ),
-    )
-    hands_free = _xml_record(
-        _xml_service_class(0x111F),
-        (
-            '<attribute id="0x0004"><sequence>'
-            '<sequence><uuid value="0x0100"/></sequence>'
-            '<sequence><uuid value="0x0003"/>'
-            f'<uint8 value="0x{HANDS_FREE_RFCOMM_CHANNEL:02x}"/></sequence>'
-            "</sequence></attribute>"
-        ),
-    )
-    audio_source = _xml_record(
-        _xml_service_class(0x110A),
-        (
-            '<attribute id="0x0004"><sequence>'
-            '<sequence><uuid value="0x0100"/>'
-            f'<uint16 value="0x{AVDTP_L2CAP_PSM:04x}"/></sequence>'
-            '<sequence><uuid value="0x0019"/>'
-            f'<uint16 value="0x{AVDTP_VERSION:04x}"/></sequence>'
-            "</sequence></attribute>"
-        ),
-    )
-    avrcp_target = _xml_record(
-        _xml_service_class(0x110C),
-        (
-            '<attribute id="0x0009"><sequence><sequence>'
-            '<uuid value="0x110e"/>'
-            f'<uint16 value="0x{AVRCP_VERSION:04x}"/>'
-            "</sequence></sequence></attribute>"
-        ),
-    )
-    return (
-        BlueZSDPServiceRecord("PnPInformation", _uuid16(0x1200), pnp),
-        BlueZSDPServiceRecord(
-            "HandsfreeAudioGateway", _uuid16(0x111F), hands_free
-        ),
-        BlueZSDPServiceRecord("AudioSource", _uuid16(0x110A), audio_source),
-        BlueZSDPServiceRecord(
-            "A/V RemoteControlTarget", _uuid16(0x110C), avrcp_target
-        ),
+    return tuple(
+        BlueZSDPServiceRecord(*record)
+        for record in _sdp_core.sdp_bluez_xml_records(
+            identity.vendor_id, identity.product_id, identity.version
+        )
     )
 
 
