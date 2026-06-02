@@ -1,5 +1,5 @@
-use airpods_sdp_core :: * ;
-use std :: collections :: HashSet ;
+use airpods_sdp_core::*;
+use std::collections::HashSet;
 
 fn identity(vendor_id: u16, product_id: u16, version: u16) -> UsbIdentity {
     UsbIdentity {
@@ -506,10 +506,145 @@ fn query_policy_boundary_matrix_and_retention() {
     assert_eq!(first_l2cap_summary_index(&[vec![0x110a]]), None);
 }
 
+#[test]
+fn services_psms_and_timeline_are_closed_deterministic_vocabulary() {
+    assert_eq!(
+        classify_services(&[0x110c, 0x1200, 0x110c]),
+        vec!["pnp", "avrcp_target"]
+    );
+    assert_eq!(classify_handle(0x10003), vec!["audio_source"]);
+    assert!(classify_handle(0).is_empty());
+    assert_eq!(normalize_bluetooth_uuid(&[0, 0x12]), Some(0x1200));
+    assert_eq!(
+        normalize_bluetooth_uuid(&[
+            0xfb, 0x34, 0x9b, 0x5f, 0x80, 0, 0, 0x80, 0, 0x10, 0, 0, 0, 0x12, 0, 0
+        ]),
+        Some(0x1200)
+    );
+    assert_eq!(normalize_bluetooth_uuid(&[1, 2, 3]), None);
+    for psm in [0, 1, 2, 3, 22, 23, 24, 25, 26, 0xffff] {
+        let expected = match psm {
+            1 => ("1", "psm_1_request"),
+            3 => ("3", "psm_3_request"),
+            23 => ("23", "psm_23_request"),
+            25 => ("25", "psm_25_request"),
+            _ => ("other", "other_psm_request"),
+        };
+        assert_eq!(psm_category(psm), expected);
+    }
+    for psm in 0..=u16::MAX {
+        let (category, event) = psm_category(psm);
+        if [1, 3, 23, 25].contains(&psm) {
+            assert_eq!(category, psm.to_string());
+            assert_eq!(event, format!("psm_{psm}_request"));
+        } else {
+            assert_eq!((category, event), ("other", "other_psm_request"));
+        }
+    }
+}
 
+#[test]
+fn bounded_timeline_preserves_first_duplicate_order_and_total() {
+    assert!(Timeline::new(0).is_err());
+    for limit in [1, 64] {
+        let mut timeline = Timeline::new(limit).unwrap();
+        assert!(timeline.first("ack_observed").is_none());
+        assert!(timeline.record("unlisted", 1.0).is_err());
+        for index in 0..limit + 7 {
+            timeline
+                .record(
+                    if index % 2 == 0 {
+                        "ack_observed"
+                    } else {
+                        "handshake_sent"
+                    },
+                    if index == 0 { -1.0 } else { index as f64 },
+                )
+                .unwrap();
+        }
+        let (events, total) = timeline.snapshot();
+        assert_eq!(events.len(), limit);
+        assert_eq!(total, (limit + 7) as u64);
+        assert_eq!(events[0], ("ack_observed", 0.0));
+        assert_eq!(timeline.first("ack_observed"), Some(("ack_observed", 0.0)));
+        assert_eq!(timeline.first("handshake_sent").is_some(), limit > 1);
+    }
+    let mut timeline = Timeline::new(3).unwrap();
+    timeline.record("handshake_sent", 0.0).unwrap();
+    timeline.record("ack_observed", f64::NAN).unwrap();
+    timeline
+        .record("first_post_ack_frame", f64::INFINITY)
+        .unwrap();
+    assert_eq!(timeline.snapshot().0[1].1, 0.0);
+    assert!(timeline.snapshot().0[2].1.is_infinite());
+}
 
+#[test]
+fn diagnostic_accounting_is_ordered_and_monotonic() {
+    let mut state = DiagnosticState::default();
+    assert_eq!(state.snapshot().queries, [0; 5]);
+    state.observe_connection();
+    state.observe_request();
+    state.account_query(&[]);
+    state.observe_request();
+    state.account_query(&["avrcp_target", "pnp"]);
+    state.mark_served("pnp");
+    state.mark_served("pnp");
+    for psm in [1, 3, 23, 25, 0, 0xffff] {
+        state.observe_psm(psm);
+    }
+    let snapshot = state.snapshot();
+    assert!(snapshot.connection_observed);
+    assert_eq!(snapshot.requests, 2);
+    assert_eq!(snapshot.queries, [1, 0, 0, 1, 1]);
+    assert_eq!(snapshot.matches_served, [true, false, false, false]);
+    assert_eq!(snapshot.psm, [1, 1, 1, 1, 2]);
+}
 
-
-
-
-
+#[test]
+fn seeded_audit_query_and_psm_invariants_hold_across_many_facts() {
+    let mut seed = 0xd1af_6e52_u64;
+    for _ in 0..5000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let expected = (seed & 1 != 0).then_some((seed >> 8) as u16);
+        let observed = match (seed >> 1) & 3 {
+            0 => None,
+            1 => Some(None),
+            2 => Some(Some(i64::from(expected.unwrap_or(0)))),
+            _ => Some(Some(((seed >> 16) & 0xffff) as i64)),
+        };
+        let status = compare_attribute(expected, observed);
+        assert_eq!(
+            status == ComparisonStatus::Match,
+            expected.is_some() && observed == Some(expected.map(i64::from))
+        );
+        assert_eq!(
+            status == ComparisonStatus::NotObservable,
+            expected.is_none() || observed.is_none()
+        );
+        let stored = ((seed >> 24) % 15) as usize;
+        let state_len = ((seed >> 28) % 4) as usize;
+        let decision = query_decision(
+            &[],
+            &[],
+            100,
+            Some(40),
+            ((seed >> 32) % 100) as i64,
+            state_len,
+            stored,
+            false,
+        );
+        assert_eq!(
+            decision.retain_summary,
+            stored < REFERENCE_SDP_QUERY_SUMMARY_LIMIT && state_len <= 1
+        );
+        assert!(!decision.target && !decision.mark_prior_target);
+        let psm = (seed >> 40) as u16;
+        let (category, event) = psm_category(psm);
+        assert!(matches!(category, "1" | "3" | "23" | "25" | "other"));
+        assert!(TIMELINE_KINDS.contains(&event));
+        assert_eq!(category == "other", ![1, 3, 23, 25].contains(&psm));
+    }
+}

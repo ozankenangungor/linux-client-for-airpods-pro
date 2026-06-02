@@ -498,18 +498,171 @@ pub fn query_attribute_ranges(values: &[(u32, u8)]) -> Vec<(u16, u16)> {
         .collect()
 }
 
+pub const SERVICE_IDENTITIES: [(&str, u16, u32); 4] = [
+    ("pnp", 0x1200, PNP_INFORMATION_HANDLE),
+    ("handsfree", 0x111f, HANDS_FREE_AUDIO_GATEWAY_HANDLE),
+    ("audio_source", 0x110a, AUDIO_SOURCE_HANDLE),
+    ("avrcp_target", 0x110c, AVRCP_TARGET_HANDLE),
+];
+pub fn classify_services(uuids: &[u16]) -> Vec<&'static str> {
+    SERVICE_IDENTITIES
+        .iter()
+        .filter_map(|(name, uuid, _)| uuids.contains(uuid).then_some(*name))
+        .collect()
+}
+/// Bumble's UUID bytes are little endian. Its short and equivalent base UUIDs
+/// compare equal, so diagnostic classification accepts both representations.
+pub fn normalize_bluetooth_uuid(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() == 2 {
+        return Some(u16::from_le_bytes([bytes[0], bytes[1]]));
+    }
+    const BASE_PREFIX: [u8; 12] = [
+        0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00,
+    ];
+    if bytes.len() == 16 && bytes[..12] == BASE_PREFIX && bytes[14..] == [0, 0] {
+        return Some(u16::from_le_bytes([bytes[12], bytes[13]]));
+    }
+    None
+}
+pub fn classify_service_uuid_bytes(values: &[Vec<u8>]) -> Vec<&'static str> {
+    let uuids: Vec<_> = values
+        .iter()
+        .filter_map(|value| normalize_bluetooth_uuid(value))
+        .collect();
+    classify_services(&uuids)
+}
+pub fn classify_handle(handle: u32) -> Vec<&'static str> {
+    SERVICE_IDENTITIES
+        .iter()
+        .filter_map(|(name, _, known)| (*known == handle).then_some(*name))
+        .collect()
+}
+pub fn psm_category(psm: u16) -> (&'static str, &'static str) {
+    match psm {
+        1 => ("1", "psm_1_request"),
+        3 => ("3", "psm_3_request"),
+        23 => ("23", "psm_23_request"),
+        25 => ("25", "psm_25_request"),
+        _ => ("other", "other_psm_request"),
+    }
+}
 
+pub const TIMELINE_KINDS: [&str; 9] = [
+    "handshake_sent",
+    "ack_observed",
+    "first_post_ack_frame",
+    "first_357_byte_frame",
+    "psm_1_request",
+    "psm_3_request",
+    "psm_23_request",
+    "psm_25_request",
+    "other_psm_request",
+];
+#[derive(Debug, Clone)]
+pub struct Timeline {
+    limit: usize,
+    events: Vec<(&'static str, f64)>,
+    total: u64,
+}
+impl Timeline {
+    pub fn new(limit: usize) -> Result<Self, &'static str> {
+        if limit == 0 {
+            return Err("protocol timeline limit must be positive");
+        }
+        Ok(Self {
+            limit,
+            events: Vec::new(),
+            total: 0,
+        })
+    }
+    pub fn full(&self) -> bool {
+        self.events.len() >= self.limit
+    }
+    pub fn record(&mut self, kind: &str, elapsed: f64) -> Result<(), &'static str> {
+        let kind = TIMELINE_KINDS
+            .iter()
+            .find(|candidate| **candidate == kind)
+            .ok_or("invalid protocol timeline kind")?;
+        self.total += 1;
+        if !self.full() {
+            self.events
+                .push((kind, if elapsed > 0.0 { elapsed } else { 0.0 }));
+        }
+        Ok(())
+    }
+    pub fn snapshot(&self) -> (&[(&'static str, f64)], u64) {
+        (&self.events, self.total)
+    }
+    pub fn first(&self, kind: &str) -> Option<(&'static str, f64)> {
+        self.events.iter().copied().find(|(seen, _)| *seen == kind)
+    }
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+/// Instance-scoped, secret-free SDP diagnostic accounting. Bumble match and
+/// response decisions are supplied by the caller after runtime inspection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiagnosticState {
+    connection_observed: bool,
+    requests: u64,
+    queries: [u64; 5],
+    matches_served: [bool; 4],
+    psm: [u64; 5],
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticSnapshot {
+    pub connection_observed: bool,
+    pub requests: u64,
+    pub queries: [u64; 5],
+    pub matches_served: [bool; 4],
+    pub psm: [u64; 5],
+}
+fn service_index(name: &str) -> Option<usize> {
+    SERVICE_IDENTITIES
+        .iter()
+        .position(|(known, _, _)| *known == name)
+}
+impl DiagnosticState {
+    pub fn observe_connection(&mut self) {
+        self.connection_observed = true;
+    }
+    pub fn observe_request(&mut self) {
+        self.requests += 1;
+    }
+    pub fn account_query(&mut self, names: &[&str]) {
+        if names.is_empty() {
+            self.queries[4] += 1;
+        } else {
+            for name in names {
+                if let Some(index) = service_index(name) {
+                    self.queries[index] += 1;
+                }
+            }
+        }
+    }
+    pub fn mark_served(&mut self, name: &str) {
+        if let Some(index) = service_index(name) {
+            self.matches_served[index] = true;
+        }
+    }
+    pub fn observe_psm(&mut self, psm: u16) -> &'static str {
+        let (category, kind) = psm_category(psm);
+        let index = match category {
+            "1" => 0,
+            "3" => 1,
+            "23" => 2,
+            "25" => 3,
+            _ => 4,
+        };
+        self.psm[index] += 1;
+        kind
+    }
+    pub fn snapshot(&self) -> DiagnosticSnapshot {
+        DiagnosticSnapshot {
+            connection_observed: self.connection_observed,
+            requests: self.requests,
+            queries: self.queries,
+            matches_served: self.matches_served,
+            psm: self.psm,
+        }
+    }
+}
