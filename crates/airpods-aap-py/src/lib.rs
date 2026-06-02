@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
+mod sdp_bridge;
+
 use airpods_aap_core::{
     AapFrameSummary, AapType2bFrameSummary, ActivationCommand, ActivationEvent, ActivationState,
     ControlFrameSummary, DescriptorEvidence, HeartRateParseError, HeartRateReport, ProductionError,
@@ -744,6 +746,7 @@ fn hub_heart_rate_event<'py>(
 
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    sdp_bridge::register(module)?;
     module.add_function(wrap_pyfunction!(plan_activation_transition, module)?)?;
     module.add_function(wrap_pyfunction!(plan_cleanup_transition, module)?)?;
     module.add_function(wrap_pyfunction!(advance_activation_transition, module)?)?;
