@@ -1,5 +1,5 @@
 use airpods_sdp_core :: * ;
-
+use std :: collections :: HashSet ;
 
 fn identity(vendor_id: u16, product_id: u16, version: u16) -> UsbIdentity {
     UsbIdentity {
@@ -251,13 +251,260 @@ fn audit_attribute_matrix_and_overall_fail_closed() {
     );
 }
 
+#[test]
+fn all_reference_extra_specs_match_parent_order_and_values() {
+    use ServiceUuid::{Full, Short};
+    let expected = [
+        ("Generic Access", Short(0x1800), "att", None, None, None),
+        ("Generic Attribute", Short(0x1801), "att", None, None, None),
+        ("Device Information", Short(0x180a), "att", None, None, None),
+        (
+            "Audio Input Control",
+            Short(0x1843),
+            "att",
+            None,
+            None,
+            None,
+        ),
+        ("Volume Control", Short(0x1844), "att", None, None, None),
+        (
+            "Volume Offset Control",
+            Short(0x1845),
+            "att",
+            None,
+            None,
+            None,
+        ),
+        (
+            "Generic Media Control",
+            Short(0x1849),
+            "att",
+            None,
+            None,
+            None,
+        ),
+        ("Microphone Control", Short(0x184d), "att", None, None, None),
+        (
+            "Broadcast Audio Scan",
+            Short(0x184f),
+            "att",
+            None,
+            None,
+            None,
+        ),
+        ("Ranging Service", Short(0x185b), "att", None, None, None),
+        (
+            "A/V RemoteControlController",
+            Short(0x110f),
+            "avrcp-controller",
+            None,
+            None,
+            None,
+        ),
+        ("Audio Sink", Short(0x110b), "audio-sink", None, None, None),
+        ("Handsfree", Short(0x111e), "handsfree", None, None, None),
+        (
+            "Message Notification Server",
+            Short(0x1133),
+            "obex",
+            Some(17),
+            Some(Short(0x1134)),
+            Some(0x0104),
+        ),
+        (
+            "Message Access Server",
+            Short(0x1132),
+            "obex",
+            Some(16),
+            Some(Short(0x1134)),
+            Some(0x0100),
+        ),
+        (
+            "Phone Book Access Server",
+            Short(0x112f),
+            "obex",
+            Some(15),
+            Some(Short(0x1130)),
+            Some(0x0101),
+        ),
+        (
+            "Synchronization",
+            Short(0x1104),
+            "obex",
+            Some(14),
+            Some(Short(0x1104)),
+            Some(0x0100),
+        ),
+        (
+            "OBEX File Transfer",
+            Short(0x1106),
+            "obex",
+            Some(10),
+            Some(Short(0x1106)),
+            Some(0x0103),
+        ),
+        (
+            "OBEX Object Push",
+            Short(0x1105),
+            "obex",
+            Some(9),
+            Some(Short(0x1105)),
+            Some(0x0102),
+        ),
+        (
+            "Nokia OBEX PC Suite Services",
+            Full("00005005-0000-1000-8000-0002ee000001"),
+            "obex",
+            Some(24),
+            Some(Full("00005005-0000-1000-8000-0002ee000001")),
+            Some(0x0100),
+        ),
+    ];
+    let actual = BLUEZ_LIKE_EXTRA_SERVICE_SPECS.map(|spec| {
+        (
+            spec.name,
+            spec.uuid,
+            spec.protocol,
+            spec.rfcomm_channel,
+            spec.profile_uuid,
+            spec.profile_version,
+        )
+    });
+    assert_eq!(actual, expected);
+    assert_eq!(
+        (ATT_L2CAP_PSM, AVCTP_L2CAP_PSM, AVDTP_L2CAP_PSM),
+        (31, 23, 25)
+    );
+    assert_eq!(
+        (
+            AVCTP_VERSION,
+            AVRCP_VERSION,
+            AVDTP_VERSION,
+            ADVANCED_AUDIO_VERSION,
+            HANDS_FREE_VERSION
+        ),
+        (0x104, 0x106, 0x103, 0x104, 0x109)
+    );
+    assert_eq!(HANDS_FREE_UNIT_RFCOMM_CHANNEL, 7);
+}
 
+#[test]
+fn handle_plan_preserves_max_plus_one_and_never_collides() {
+    for input in [
+        vec![],
+        vec!["1"],
+        vec!["65537", "65538", "65539", "65540"],
+        vec!["1", "4", "99"],
+        vec!["0", "1", "2", "3", "4", "5", "6"],
+        vec!["4294967295"],
+        vec!["99999999999999999999999999999999999999"],
+    ] {
+        let existing: Vec<String> = input.into_iter().map(str::to_owned).collect();
+        let output = allocate_handles(&existing, 20).unwrap();
+        assert_eq!(output.len(), 20);
+        assert_eq!(output.iter().collect::<HashSet<_>>().len(), 20);
+        assert!(output.iter().all(|handle| !existing.contains(handle)));
+        assert!(
+            output
+                .windows(2)
+                .all(|pair| pair[1].len() > pair[0].len() || pair[1] > pair[0])
+        );
+    }
+    assert_eq!(allocate_handles(&[], 3).unwrap(), ["1", "2", "3"]);
+    assert_eq!(
+        allocate_handles(&["65537".into(), "65540".into()], 2).unwrap(),
+        ["65541", "65542"]
+    );
+    assert_eq!(
+        allocate_handles(&["99".into()], 0).unwrap(),
+        Vec::<String>::new()
+    );
+    let many_occupied: Vec<_> = (0..10_000).map(|value| value.to_string()).collect();
+    assert_eq!(
+        allocate_handles(&many_occupied, 2).unwrap(),
+        ["10000", "10001"]
+    );
+}
 
+#[test]
+fn random_handle_sets_keep_plan_unique_and_above_every_input() {
+    let mut seed = 0x5a17_c0de_u64;
+    for _ in 0..1000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let existing: Vec<String> = (0..(seed % 30))
+            .map(|offset| ((seed.rotate_left(offset as u32) % 10_000) as u32).to_string())
+            .collect();
+        let plan = allocate_handles(&existing, 20).unwrap();
+        let maximum = existing
+            .iter()
+            .map(|value| value.parse::<u32>().unwrap())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(plan[0].parse::<u32>().unwrap(), maximum + 1);
+        assert!(plan.iter().all(|value| !existing.contains(value)));
+    }
+}
 
-
-
-
-
+#[test]
+fn query_policy_boundary_matrix_and_retention() {
+    assert_eq!(
+        query_uuid16s(&[vec![0, 1], vec![0, 0x12], vec![], vec![1, 2, 3]]),
+        [0x0100, 0x1200]
+    );
+    assert_eq!(
+        query_attribute_ranges(&[(4, 2), (0x0000ffff, 4), (0x12345678, 4), (7, 1)]),
+        [(4, 4), (0, 0xffff), (0x1234, 0x5678)]
+    );
+    for has_uuid in [false, true] {
+        for has_range in [false, true] {
+            let uuids = if has_uuid { vec![0x0100] } else { vec![0x110a] };
+            let ranges = if has_range {
+                vec![(0, 0xffff)]
+            } else {
+                vec![(4, 4)]
+            };
+            let decision = query_decision(&uuids, &ranges, 100, None, 100, 0, 0, false);
+            assert_eq!(decision.target, has_uuid && has_range);
+            assert!(!decision.continuation_used);
+            assert_eq!(decision.retain_summary, !(has_uuid && has_range));
+        }
+    }
+    for (maximum, mtu, bytes, state_len, expected) in [
+        (100, None, 99, 0, false),
+        (100, None, 100, 0, false),
+        (100, None, 101, 0, true),
+        (100, Some(109), 100, 0, false),
+        (100, Some(109), 101, 0, true),
+        (100, Some(50), 40, 0, false),
+        (100, Some(50), 42, 0, true),
+        (100, Some(8), 0, 0, false),
+        (100, Some(8), 1, 0, true),
+        (100, Some(200), 101, 0, true),
+        (100, None, 0, 1, false),
+        (100, None, 0, 2, true),
+    ] {
+        assert_eq!(
+            query_decision(&[], &[], maximum, mtu, bytes, state_len, 0, false).continuation_used,
+            expected
+        );
+    }
+    for stored in 0..11 {
+        let decision = query_decision(&[], &[], 100, None, 0, 0, stored, false);
+        assert_eq!(decision.retain_summary, stored < 8);
+    }
+    assert!(query_decision(&[0x0100], &[(0, 0xffff)], 100, None, 0, 2, 8, true).mark_prior_target);
+    assert!(!query_decision(&[0x0100], &[(0, 0xffff)], 100, None, 0, 1, 8, true).mark_prior_target);
+    assert!(
+        !query_decision(&[0x0100], &[(0, 0xffff)], 100, None, 0, 2, 8, false).mark_prior_target
+    );
+    assert_eq!(
+        first_l2cap_summary_index(&[vec![0x110a], vec![0x0100], vec![0x0100]]),
+        Some(1)
+    );
+    assert_eq!(first_l2cap_summary_index(&[vec![0x110a]]), None);
+}
 
 
 

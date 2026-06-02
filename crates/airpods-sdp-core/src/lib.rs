@@ -15,13 +15,13 @@ pub const PNP_VENDOR_ID_ATTRIBUTE_ID: u16 = 0x0201;
 pub const PNP_PRODUCT_ID_ATTRIBUTE_ID: u16 = 0x0202;
 pub const PNP_VERSION_ATTRIBUTE_ID: u16 = 0x0203;
 pub const PNP_VENDOR_ID_SOURCE_ATTRIBUTE_ID: u16 = 0x0205;
-
-
-
-
-
-
-
+pub const ATT_L2CAP_PSM: u16 = 0x001f;
+pub const AVCTP_L2CAP_PSM: u16 = 0x0017;
+pub const AVCTP_VERSION: u16 = 0x0104;
+pub const ADVANCED_AUDIO_VERSION: u16 = 0x0104;
+pub const HANDS_FREE_VERSION: u16 = 0x0109;
+pub const HANDS_FREE_UNIT_RFCOMM_CHANNEL: u8 = 7;
+pub const REFERENCE_SDP_QUERY_SUMMARY_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbIdentity {
@@ -271,7 +271,7 @@ pub struct ExtraServiceSpec {
     pub profile_uuid: Option<ServiceUuid>,
     pub profile_version: Option<u16>,
 }
-
+const NOKIA_UUID: ServiceUuid = ServiceUuid::Full("00005005-0000-1000-8000-0002ee000001");
 const fn extra(
     name: &'static str,
     uuid: ServiceUuid,
@@ -289,19 +289,214 @@ const fn extra(
         profile_version,
     }
 }
+const fn short(uuid: u16) -> ServiceUuid {
+    ServiceUuid::Short(uuid)
+}
+pub const BLUEZ_LIKE_EXTRA_SERVICE_SPECS: [ExtraServiceSpec; 20] = [
+    extra("Generic Access", short(0x1800), "att", None, None, None),
+    extra("Generic Attribute", short(0x1801), "att", None, None, None),
+    extra("Device Information", short(0x180a), "att", None, None, None),
+    extra(
+        "Audio Input Control",
+        short(0x1843),
+        "att",
+        None,
+        None,
+        None,
+    ),
+    extra("Volume Control", short(0x1844), "att", None, None, None),
+    extra(
+        "Volume Offset Control",
+        short(0x1845),
+        "att",
+        None,
+        None,
+        None,
+    ),
+    extra(
+        "Generic Media Control",
+        short(0x1849),
+        "att",
+        None,
+        None,
+        None,
+    ),
+    extra("Microphone Control", short(0x184d), "att", None, None, None),
+    extra(
+        "Broadcast Audio Scan",
+        short(0x184f),
+        "att",
+        None,
+        None,
+        None,
+    ),
+    extra("Ranging Service", short(0x185b), "att", None, None, None),
+    extra(
+        "A/V RemoteControlController",
+        short(0x110f),
+        "avrcp-controller",
+        None,
+        None,
+        None,
+    ),
+    extra("Audio Sink", short(0x110b), "audio-sink", None, None, None),
+    extra("Handsfree", short(0x111e), "handsfree", None, None, None),
+    extra(
+        "Message Notification Server",
+        short(0x1133),
+        "obex",
+        Some(17),
+        Some(short(0x1134)),
+        Some(0x0104),
+    ),
+    extra(
+        "Message Access Server",
+        short(0x1132),
+        "obex",
+        Some(16),
+        Some(short(0x1134)),
+        Some(0x0100),
+    ),
+    extra(
+        "Phone Book Access Server",
+        short(0x112f),
+        "obex",
+        Some(15),
+        Some(short(0x1130)),
+        Some(0x0101),
+    ),
+    extra(
+        "Synchronization",
+        short(0x1104),
+        "obex",
+        Some(14),
+        Some(short(0x1104)),
+        Some(0x0100),
+    ),
+    extra(
+        "OBEX File Transfer",
+        short(0x1106),
+        "obex",
+        Some(10),
+        Some(short(0x1106)),
+        Some(0x0103),
+    ),
+    extra(
+        "OBEX Object Push",
+        short(0x1105),
+        "obex",
+        Some(9),
+        Some(short(0x1105)),
+        Some(0x0102),
+    ),
+    extra(
+        "Nokia OBEX PC Suite Services",
+        NOKIA_UUID,
+        "obex",
+        Some(24),
+        Some(NOKIA_UUID),
+        Some(0x0100),
+    ),
+];
 
+/// Decimal arithmetic keeps Python's unbounded integer handle behavior.
+/// Every new candidate exceeds every existing handle, so occupied skipping is implicit.
+pub fn allocate_handles(existing: &[String], count: usize) -> Result<Vec<String>, &'static str> {
+    fn normalized(value: &str) -> Result<&str, &'static str> {
+        let positive = value.strip_prefix('+').unwrap_or(value);
+        if positive.starts_with('-') {
+            return Ok("0");
+        }
+        if positive.is_empty() || !positive.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid handle");
+        }
+        Ok(positive.trim_start_matches('0'))
+    }
+    let mut maximum = String::from("0");
+    for value in existing {
+        let value = normalized(value)?;
+        if value.len() > maximum.len() || (value.len() == maximum.len() && value > maximum.as_str())
+        {
+            maximum = value.to_owned();
+        }
+    }
+    fn increment(value: &mut String) {
+        let mut bytes = value.as_bytes().to_vec();
+        for byte in bytes.iter_mut().rev() {
+            if *byte < b'9' {
+                *byte += 1;
+                *value = String::from_utf8(bytes).expect("decimal digits");
+                return;
+            }
+            *byte = b'0';
+        }
+        bytes.insert(0, b'1');
+        *value = String::from_utf8(bytes).expect("decimal digits");
+    }
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        increment(&mut maximum);
+        result.push(maximum.clone());
+    }
+    Ok(result)
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryDecision {
+    pub target: bool,
+    pub continuation_used: bool,
+    pub retain_summary: bool,
+    pub mark_prior_target: bool,
+}
+/// The caller extracts SDP facts and keeps the first target summary. This function
+/// decides whether later requests enter the bounded general list or mark it.
+#[allow(clippy::too_many_arguments)] // Each argument is one neutral fact extracted at the Bumble boundary.
+pub fn query_decision(
+    uuids: &[u16],
+    ranges: &[(u16, u16)],
+    maximum: i64,
+    peer_mtu: Option<i64>,
+    response_bytes: i64,
+    continuation_state_len: usize,
+    stored: usize,
+    target_already_seen: bool,
+) -> QueryDecision {
+    let target = uuids.contains(&0x0100) && ranges.contains(&(0, 0xffff));
+    let continuation = continuation_state_len > 1;
+    let effective = peer_mtu.map_or(maximum, |mtu| maximum.min(mtu - 9)).max(0);
+    QueryDecision {
+        target,
+        continuation_used: continuation || response_bytes > effective,
+        retain_summary: !target && !continuation && stored < REFERENCE_SDP_QUERY_SUMMARY_LIMIT,
+        mark_prior_target: target && target_already_seen && continuation,
+    }
+}
 
+pub fn first_l2cap_summary_index(summaries: &[Vec<u16>]) -> Option<usize> {
+    summaries.iter().position(|uuids| uuids.contains(&0x0100))
+}
 
+/// Reference summaries retain only UUIDs encoded by Bumble as short UUIDs.
+/// Unlike diagnostic service classification, equivalent 128-bit UUIDs are
+/// deliberately excluded to preserve the parent observer's output.
+pub fn query_uuid16s(values: &[Vec<u8>]) -> Vec<u16> {
+    values
+        .iter()
+        .filter(|value| value.len() == 2)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        .collect()
+}
 
-
-
-
-
-
-
-
-
+pub fn query_attribute_ranges(values: &[(u32, u8)]) -> Vec<(u16, u16)> {
+    values
+        .iter()
+        .filter_map(|(value, size)| match size {
+            2 => Some((*value as u16, *value as u16)),
+            4 => Some(((value >> 16) as u16, *value as u16)),
+            _ => None,
+        })
+        .collect()
+}
 
 
 
