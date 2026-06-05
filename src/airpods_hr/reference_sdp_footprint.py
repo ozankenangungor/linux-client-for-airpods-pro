@@ -32,18 +32,20 @@ from bumble.core import (
 )
 
 from airpods_hr.sdp import PreparedSDPCompatibilityProfile
+from airpods_hr import _airpods_aap_core as _sdp_core
 
 
-REFERENCE_SDP_QUERY_SUMMARY_LIMIT = 8
-ATT_L2CAP_PSM = 0x001F
-AVCTP_L2CAP_PSM = 0x0017
-AVDTP_L2CAP_PSM = 0x0019
-HANDS_FREE_UNIT_RFCOMM_CHANNEL = 7
-AVCTP_VERSION = 0x0104
-AVRCP_VERSION = 0x0106
-AVDTP_VERSION = 0x0103
-ADVANCED_AUDIO_VERSION = 0x0104
-HANDS_FREE_VERSION = 0x0109
+_CONSTANTS = dict(_sdp_core.sdp_constants())
+REFERENCE_SDP_QUERY_SUMMARY_LIMIT = _CONSTANTS["REFERENCE_SDP_QUERY_SUMMARY_LIMIT"]
+ATT_L2CAP_PSM = _CONSTANTS["ATT_L2CAP_PSM"]
+AVCTP_L2CAP_PSM = _CONSTANTS["AVCTP_L2CAP_PSM"]
+AVDTP_L2CAP_PSM = _CONSTANTS["AVDTP_L2CAP_PSM"]
+HANDS_FREE_UNIT_RFCOMM_CHANNEL = _CONSTANTS["HANDS_FREE_UNIT_RFCOMM_CHANNEL"]
+AVCTP_VERSION = _CONSTANTS["AVCTP_VERSION"]
+AVRCP_VERSION = _CONSTANTS["AVRCP_VERSION"]
+AVDTP_VERSION = _CONSTANTS["AVDTP_VERSION"]
+ADVANCED_AUDIO_VERSION = _CONSTANTS["ADVANCED_AUDIO_VERSION"]
+HANDS_FREE_VERSION = _CONSTANTS["HANDS_FREE_VERSION"]
 
 _MISSING = object()
 
@@ -73,80 +75,26 @@ NOKIA_OBEX_PC_SUITE_SERVICE = UUID(
 )
 
 
-BLUEZ_LIKE_EXTRA_SERVICE_SPECS: tuple[BlueZLikeServiceSpec, ...] = (
-    BlueZLikeServiceSpec("Generic Access", UUID.from_16_bits(0x1800), "att"),
-    BlueZLikeServiceSpec("Generic Attribute", UUID.from_16_bits(0x1801), "att"),
-    BlueZLikeServiceSpec("Device Information", UUID.from_16_bits(0x180A), "att"),
-    BlueZLikeServiceSpec("Audio Input Control", UUID.from_16_bits(0x1843), "att"),
-    BlueZLikeServiceSpec("Volume Control", UUID.from_16_bits(0x1844), "att"),
-    BlueZLikeServiceSpec("Volume Offset Control", UUID.from_16_bits(0x1845), "att"),
-    BlueZLikeServiceSpec("Generic Media Control", UUID.from_16_bits(0x1849), "att"),
-    BlueZLikeServiceSpec("Microphone Control", UUID.from_16_bits(0x184D), "att"),
-    BlueZLikeServiceSpec("Broadcast Audio Scan", UUID.from_16_bits(0x184F), "att"),
-    BlueZLikeServiceSpec("Ranging Service", UUID.from_16_bits(0x185B), "att"),
+def _spec_uuid(value: tuple[int | None, str | None]) -> UUID:
+    short, full = value
+    if short is not None:
+        return UUID.from_16_bits(short)
+    if full == "00005005-0000-1000-8000-0002ee000001":
+        return NOKIA_OBEX_PC_SUITE_SERVICE
+    return UUID(full)
+
+
+BLUEZ_LIKE_EXTRA_SERVICE_SPECS: tuple[BlueZLikeServiceSpec, ...] = tuple(
     BlueZLikeServiceSpec(
-        "A/V RemoteControlController",
-        BT_AV_REMOTE_CONTROL_CONTROLLER_SERVICE,
-        "avrcp-controller",
-    ),
-    BlueZLikeServiceSpec("Audio Sink", BT_AUDIO_SINK_SERVICE, "audio-sink"),
-    BlueZLikeServiceSpec("Handsfree", BT_HANDSFREE_SERVICE, "handsfree"),
-    BlueZLikeServiceSpec(
-        "Message Notification Server",
-        BT_MESSAGE_NOTIFICATION_SERVER_SERVICE,
-        "obex",
-        rfcomm_channel=17,
-        profile_uuid=BT_MESSAGE_ACCESS_PROFILE_SERVICE,
-        profile_version=0x0104,
-    ),
-    BlueZLikeServiceSpec(
-        "Message Access Server",
-        BT_MESSAGE_ACCESS_SERVER_SERVICE,
-        "obex",
-        rfcomm_channel=16,
-        profile_uuid=BT_MESSAGE_ACCESS_PROFILE_SERVICE,
-        profile_version=0x0100,
-    ),
-    BlueZLikeServiceSpec(
-        "Phone Book Access Server",
-        BT_PHONEBOOK_ACCESS_PSE_SERVICE,
-        "obex",
-        rfcomm_channel=15,
-        profile_uuid=BT_PHONEBOOK_ACCESS_SERVICE,
-        profile_version=0x0101,
-    ),
-    BlueZLikeServiceSpec(
-        "Synchronization",
-        BT_IR_MCSYNC_SERVICE,
-        "obex",
-        rfcomm_channel=14,
-        profile_uuid=BT_IR_MCSYNC_SERVICE,
-        profile_version=0x0100,
-    ),
-    BlueZLikeServiceSpec(
-        "OBEX File Transfer",
-        BT_OBEX_FILE_TRANSFER_SERVICE,
-        "obex",
-        rfcomm_channel=10,
-        profile_uuid=BT_OBEX_FILE_TRANSFER_SERVICE,
-        profile_version=0x0103,
-    ),
-    BlueZLikeServiceSpec(
-        "OBEX Object Push",
-        BT_OBEX_OBJECT_PUSH_SERVICE,
-        "obex",
-        rfcomm_channel=9,
-        profile_uuid=BT_OBEX_OBJECT_PUSH_SERVICE,
-        profile_version=0x0102,
-    ),
-    BlueZLikeServiceSpec(
-        "Nokia OBEX PC Suite Services",
-        NOKIA_OBEX_PC_SUITE_SERVICE,
-        "obex",
-        rfcomm_channel=24,
-        profile_uuid=NOKIA_OBEX_PC_SUITE_SERVICE,
-        profile_version=0x0100,
-    ),
+        name=name,
+        service_uuid=_spec_uuid(service_uuid),
+        protocol=protocol,
+        rfcomm_channel=rfcomm_channel,
+        profile_uuid=_spec_uuid(profile_uuid) if profile_uuid is not None else None,
+        profile_version=profile_version,
+    )
+    for name, service_uuid, protocol, rfcomm_channel, profile_uuid, profile_version
+    in _sdp_core.sdp_extra_service_specs()
 )
 
 
@@ -290,12 +238,12 @@ def augment_reference_sdp_records(
     if footprint is ReferenceSDPFootprint.PROVEN:
         return proven_records
     records = dict(proven_records)
-    handle = max(records, default=0) + 1
-    for spec in BLUEZ_LIKE_EXTRA_SERVICE_SPECS:
-        while handle in records:
-            handle += 1
+    handles = _sdp_core.sdp_allocate_handles(
+        [str(handle) for handle in records], len(BLUEZ_LIKE_EXTRA_SERVICE_SPECS)
+    )
+    for spec, handle_text in zip(BLUEZ_LIKE_EXTRA_SERVICE_SPECS, handles):
+        handle = int(handle_text)
         records[handle] = _build_extra_record(spec, handle)
-        handle += 1
     return records
 
 
@@ -319,43 +267,42 @@ class ReferenceSDPQuerySnapshot:
     target_l2cap_full_attribute_query: ReferenceSDPQuerySummary | None = None
 
     def l2cap_query(self) -> ReferenceSDPQuerySummary | None:
-        general = next(
-            (
-                summary
-                for summary in self.summaries
-                if 0x0100 in summary.search_uuids
-            ),
-            None,
+        index = _sdp_core.sdp_first_l2cap_summary_index(
+            [list(summary.search_uuids) for summary in self.summaries]
         )
-        return general or self.target_l2cap_full_attribute_query
+        return (
+            self.summaries[index]
+            if index is not None
+            else self.target_l2cap_full_attribute_query
+        )
 
     def l2cap_full_attribute_query(self) -> ReferenceSDPQuerySummary | None:
         return self.target_l2cap_full_attribute_query
 
 
 def _uuid16s(pattern: sdp.DataElement) -> tuple[int, ...]:
-    values: list[int] = []
-    for element in getattr(pattern, "value", ()):
-        value = getattr(element, "value", None)
-        uuid_bytes = getattr(value, "uuid_bytes", b"")
-        if len(uuid_bytes) == 2:
-            values.append(int(value.to_hex_str(), 16))
-    return tuple(values)
+    return tuple(
+        _sdp_core.sdp_query_uuid16s(
+            [
+                getattr(getattr(element, "value", None), "uuid_bytes", b"")
+                for element in getattr(pattern, "value", ())
+            ]
+        )
+    )
 
 
 def _attribute_ranges(
     attribute_id_list: sdp.DataElement,
 ) -> tuple[tuple[int, int], ...]:
-    ranges: list[tuple[int, int]] = []
-    for element in getattr(attribute_id_list, "value", ()):
-        value = getattr(element, "value", None)
-        if not isinstance(value, int):
-            continue
-        if element.value_size == 2:
-            ranges.append((value, value))
-        elif element.value_size == 4:
-            ranges.append(((value >> 16) & 0xFFFF, value & 0xFFFF))
-    return tuple(ranges)
+    return tuple(
+        _sdp_core.sdp_query_attribute_ranges(
+            [
+                (value, element.value_size)
+                for element in getattr(attribute_id_list, "value", ())
+                if isinstance((value := getattr(element, "value", None)), int)
+            ]
+        )
+    )
 
 
 def _response_metadata(
@@ -372,10 +319,6 @@ def _response_metadata(
     return len(matching_services), len(bytes(attribute_lists))
 
 
-def _continuation_present(state: bytes) -> bool:
-    """Match Bumble's parsed SDP continuation-state representation."""
-
-    return len(state) > 1
 
 
 class ReferenceSDPQueryDiagnostics:
@@ -401,10 +344,21 @@ class ReferenceSDPQueryDiagnostics:
         )
 
     @staticmethod
-    def _is_target(summary: ReferenceSDPQuerySummary) -> bool:
-        return (
-            0x0100 in summary.search_uuids
-            and (0x0000, 0xFFFF) in summary.attribute_ranges
+    def _decision(
+        summary: ReferenceSDPQuerySummary,
+        continuation_state_len: int,
+        stored: int,
+        target_already_seen: bool,
+    ) -> tuple[bool, bool, bool, bool]:
+        return _sdp_core.sdp_query_decision(
+            list(summary.search_uuids),
+            list(summary.attribute_ranges),
+            summary.maximum_attribute_byte_count,
+            None,
+            summary.total_response_bytes,
+            continuation_state_len,
+            stored,
+            target_already_seen,
         )
 
     @staticmethod
@@ -413,19 +367,27 @@ class ReferenceSDPQueryDiagnostics:
         request: sdp.SDP_ServiceSearchAttributeRequest,
     ) -> ReferenceSDPQuerySummary:
         matches, response_bytes = _response_metadata(server, request)
-        effective_maximum = request.maximum_attribute_byte_count
         channel = getattr(server, "channel", None)
         peer_mtu = getattr(channel, "peer_mtu", None)
-        if isinstance(peer_mtu, int):
-            effective_maximum = min(effective_maximum, peer_mtu - 9)
+        if not isinstance(peer_mtu, int):
+            peer_mtu = None
+        search_uuids = _uuid16s(request.service_search_pattern)
+        attribute_ranges = _attribute_ranges(request.attribute_id_list)
+        _, continuation_used, _, _ = _sdp_core.sdp_query_decision(
+            list(search_uuids),
+            list(attribute_ranges),
+            request.maximum_attribute_byte_count,
+            peer_mtu,
+            response_bytes,
+            len(request.continuation_state),
+            0,
+            False,
+        )
         return ReferenceSDPQuerySummary(
-            search_uuids=_uuid16s(request.service_search_pattern),
-            attribute_ranges=_attribute_ranges(request.attribute_id_list),
+            search_uuids=search_uuids,
+            attribute_ranges=attribute_ranges,
             maximum_attribute_byte_count=request.maximum_attribute_byte_count,
-            continuation_used=(
-                _continuation_present(request.continuation_state)
-                or response_bytes > max(0, effective_maximum)
-            ),
+            continuation_used=continuation_used,
             matching_record_count=matches,
             total_response_bytes=response_bytes,
         )
@@ -452,19 +414,21 @@ class ReferenceSDPQueryDiagnostics:
             if isinstance(request, sdp.SDP_ServiceSearchAttributeRequest):
                 self._requests_observed += 1
                 summary = self._summarize(server, request)
-                if self._is_target(summary):
+                target, _, retain, mark_prior = self._decision(
+                    summary,
+                    len(request.continuation_state),
+                    len(self._summaries),
+                    self._target_l2cap_full_attribute_query is not None,
+                )
+                if target:
                     if self._target_l2cap_full_attribute_query is None:
                         self._target_l2cap_full_attribute_query = summary
-                    elif _continuation_present(request.continuation_state):
+                    elif mark_prior:
                         self._target_l2cap_full_attribute_query = replace(
                             self._target_l2cap_full_attribute_query,
                             continuation_used=True,
                         )
-                elif (
-                    not _continuation_present(request.continuation_state)
-                    and len(self._summaries)
-                    < REFERENCE_SDP_QUERY_SUMMARY_LIMIT
-                ):
+                elif retain:
                     self._summaries.append(summary)
             original(pdu)
 

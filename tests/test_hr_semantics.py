@@ -679,7 +679,7 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
                 "c0331641dad21cd9ace2e0708e8586c50863b4cc9c5a5b2bf1792661e6ec0d4c"
             ),
             "src/airpods_hr/reference_sdp_footprint.py": (
-                "3dab4655a72d2e97877691cb3a0d1b73d2d16ba35c02d2f98b4218cd68447325"
+                "273e9b7c7044e45a21e4a92af13a134f29224c682d614764d79d66a97fbd4891"
             ),
             "tools/probe_reference_handshake.py": (
                 "3928019cb5bd8948935d80aa6bd37e7ec6f109811160464d8f214004f717cb66"
