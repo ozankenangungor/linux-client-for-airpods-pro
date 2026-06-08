@@ -11,6 +11,7 @@ mod control;
 mod heart_rate;
 mod production;
 mod recovery;
+pub mod semantics;
 
 pub use activation::{
     ActivationCommand, ActivationEvent, ActivationState, SentCommands, TransitionError, advance,
