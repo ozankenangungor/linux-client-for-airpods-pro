@@ -1942,9 +1942,6 @@ class ProductionStaticSafetyTests(unittest.TestCase):
             "src/airpods_hr/monitor_cli.py": (
                 "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
             ),
-            "src/airpods_hr/hr_semantics.py": (
-                "f6004987032f02c5b2a7c59590a4e3e2edb5ef85788f8259f2e0b9499f5bc4ba"
-            ),
             "tools/probe_hr_semantics.py": (
                 "4e0fa4c54f3b29d376284e882225a0194f07fa79b8be5c2dec44d7bf73057e21"
             ),

@@ -1409,6 +1409,7 @@ class SocketPathSafetyTests(unittest.TestCase):
             native_importers,
             {
                 "airpods_hr/heartrate.py",
+                "airpods_hr/hr_semantics.py",
                 "airpods_hr/aap.py",
                 "airpods_hr/heart_rate_session.py",
                 "airpods_hr/production_session.py",

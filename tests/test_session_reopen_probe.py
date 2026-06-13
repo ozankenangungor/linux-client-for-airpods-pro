@@ -49,9 +49,6 @@ FROZEN_SHA256 = {
     "src/airpods_hr/monitor_cli.py": (
         "41332f411af2e89374b42047a2e009aef035ca2e8bce74440d0d9d891d7aded4"
     ),
-    "src/airpods_hr/hr_semantics.py": (
-        "f6004987032f02c5b2a7c59590a4e3e2edb5ef85788f8259f2e0b9499f5bc4ba"
-    ),
 }
 
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import inspect
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import asynccontextmanager, redirect_stderr
@@ -14,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from airpods_hr import _airpods_aap_core as _rust_core
 from airpods_hr.aap import AAP_HANDSHAKE_ACK, AAPHandshakeSession
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluez_coexistence import (
@@ -244,6 +247,66 @@ def make_recorder(
         restart_delay_seconds=5,
         monotonic_clock_ns=clock or ClockNS([0] * 100),
     )
+
+
+class SemanticsNativeBoundaryTests(unittest.TestCase):
+    def test_native_entry_points_are_compiled_and_plan_errors_convert(self) -> None:
+        self.assertTrue(inspect.isbuiltin(_rust_core.semantics_parser_structure))
+        self.assertTrue(inspect.isbuiltin(_rust_core.semantics_cycle_plan))
+        self.assertTrue(inspect.isbuiltin(_rust_core.semantics_schema_version))
+        self.assertEqual(_rust_core.HRSemanticsState.__module__, "airpods_hr._airpods_aap_core")
+        self.assertEqual(_rust_core.semantics_cycle_plan("baseline", 3, None), [3])
+        self.assertEqual(_rust_core.semantics_cycle_plan("activation-restart", None, 2), [2, 2])
+        with self.assertRaisesRegex(ValueError, "baseline requires requested_samples only"):
+            _rust_core.semantics_cycle_plan("baseline", None, 2)
+        state = _rust_core.HRSemanticsState("baseline", 1, None, 5.0)
+        for index in (0, 2, -1, "1"):
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, "cycle index is outside this scenario"):
+                state.mark_cycle_attempted(index)
+
+    def test_native_raw_validation_precedes_clock_and_preserves_error(self) -> None:
+        clock = ClockNS([0])
+        recorder = make_recorder(MemorySink(), scenario=HRSemanticsScenario.BASELINE, clock=clock)
+        recorder.write_header(descriptor_complete=True, local_rx_imtu=2048)
+        recorder.mark_cycle_attempted(1)
+        recorder.begin_cycle(1)
+        self.assertEqual(clock.values, [])
+        bad = HeartRateReport(169, 2, 0, 3, 100, 0, b"short")
+        with self.assertRaisesRegex(RuntimeError, "canonical report does not retain 18 raw bytes"):
+            recorder.record_sample(bad)
+        self.assertEqual(recorder.records, ())
+
+    def test_sink_failure_does_not_commit_native_record(self) -> None:
+        class FailingSink(MemorySink):
+            fail = True
+
+            def write_event(self, event) -> None:
+                if self.fail:
+                    raise OSError("sink failed")
+                super().write_event(event)
+
+        sink = FailingSink()
+        recorder = make_recorder(sink, scenario=HRSemanticsScenario.BASELINE, clock=ClockNS([0, 1, 2]))
+        with self.assertRaises(OSError):
+            recorder.write_header(descriptor_complete=True, local_rx_imtu=2048)
+        self.assertFalse(recorder.header_written)
+        sink.fail = False
+        recorder.write_header(descriptor_complete=True, local_rx_imtu=2048)
+        recorder.mark_cycle_attempted(1)
+        recorder.begin_cycle(1)
+        sink.fail = True
+        with self.assertRaises(OSError):
+            recorder.record_sample(parsed_report(169, 0))
+        self.assertEqual(recorder.records, ())
+        sink.fail = False
+        record = recorder.record_sample(parsed_report(169, 0))
+        self.assertEqual(record.sample_index_global, 1)
+        recorder.complete_cycle(1)
+        sink.fail = True
+        with self.assertRaises(OSError):
+            recorder.write_summary(status="complete", failure_category=None)
+        sink.fail = False
+        self.assertEqual(recorder.write_summary(status="complete", failure_category=None)["canonical_reports_received"], 1)
 
 
 class SemanticsRecorderTests(unittest.TestCase):
@@ -701,6 +764,31 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
             hashlib.sha256(tail.encode()).hexdigest(),
             "28ed4077035611f980ec62030d92aefc584fa7d3528fe2dab79ff1b32d6d11fd",
         )
+
+    def test_effect_orchestration_and_relative_transport_match_exact_parent(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        parent = subprocess.run(
+            ["git", "show", "c7cfd63e669c456fff9ec1f196e3360ace5f37c4:src/airpods_hr/hr_semantics.py"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout
+        current = (root / "src/airpods_hr/hr_semantics.py").read_text()
+
+        def declarations(source: str) -> dict[str, ast.AST]:
+            tree = ast.parse(source)
+            return {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+
+        before, after = declarations(parent), declarations(current)
+        self.assertEqual(
+            ast.dump(before["_CycleRelativeTransport"], include_attributes=False),
+            ast.dump(after["_CycleRelativeTransport"], include_attributes=False),
+        )
+        def methods(node: ast.ClassDef) -> dict[str, ast.AST]:
+            return {child.name: child for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        old, new = methods(before["HRSemanticsSession"]), methods(after["HRSemanticsSession"])
+        for name in ("run", "_run_cycle", "_checkpoint", "_assert_connected", "_failure_category", "_make_monitor"):
+            with self.subTest(name=name):
+                self.assertEqual(ast.dump(old[name], include_attributes=False), ast.dump(new[name], include_attributes=False))
 
     def test_semantics_path_has_no_bumble_handoff_or_pairing_dependency(
         self,
