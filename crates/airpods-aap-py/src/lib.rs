@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Private PyO3 bridge to authoritative `airpods-aap-core` analysis.
 
+mod reference_diagnostics_bridge;
 mod sdp_bridge;
 mod semantics_bridge;
 
@@ -748,6 +749,7 @@ fn hub_heart_rate_event<'py>(
 #[pymodule]
 fn _airpods_aap_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     sdp_bridge::register(module)?;
+    reference_diagnostics_bridge::register(module)?;
     semantics_bridge::register(module)?;
     module.add_function(wrap_pyfunction!(plan_activation_transition, module)?)?;
     module.add_function(wrap_pyfunction!(plan_cleanup_transition, module)?)?;
