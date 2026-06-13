@@ -9,6 +9,7 @@ mod activation;
 mod analysis;
 mod control;
 mod heart_rate;
+pub mod pre_auth_diagnostics;
 mod production;
 mod recovery;
 pub mod semantics;
