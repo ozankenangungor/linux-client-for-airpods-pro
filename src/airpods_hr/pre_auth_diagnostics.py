@@ -15,6 +15,8 @@ from bumble import hci, utils
 from bumble.device import Device
 from bumble.host import Host
 
+from . import _airpods_aap_core as _native
+
 
 PRE_AUTH_DELAY_SECONDS = 0.085
 DEFAULT_REMOTE_DISCOVERY_TIMEOUT = 2.0
@@ -146,7 +148,7 @@ async def _send_accepted_command(device: object, command: object) -> None:
     response = await device.send_command(command)
     if (
         not isinstance(response, hci.HCI_Command_Status_Event)
-        or response.status != hci.HCI_COMMAND_STATUS_PENDING
+        or not _native.pre_auth_command_accepted(response.status)
     ):
         raise PreAuthSequenceError("pre-authentication HCI command was rejected")
 
@@ -203,62 +205,21 @@ class PreAuthSequenceStrategy:
         remote_discovery: _RemoteDiscovery | None = None,
     ) -> None:
         self.mode = PreAuthSequenceMode(mode)
+        self._native = _native._PreAuthDiagnosticState(self.mode.value)
         self._sleep = sleep
         self._remote_discovery = remote_discovery or BumbleRemoteDiscovery()
-        self._supported_request_sent = False
-        self._supported_command_accepted = False
-        self._supported_response_observed = False
-        self._supported_result = RemoteDiscoveryResult.NOT_APPLICABLE
-        self._supported_mask: int | None = None
-        self._extended_request_sent = False
-        self._extended_command_accepted = False
-        self._extended_response_observed = False
-        self._extended_result = RemoteDiscoveryResult.NOT_APPLICABLE
-        self._extended_max_page: int | None = None
-        self._extended_mask: int | None = None
-        self._name_request_sent = False
-        self._name_command_accepted = False
-        self._name_response_observed = False
-        self._name_result = RemoteDiscoveryResult.NOT_APPLICABLE
-        self._authentication_attempted = False
 
     @property
     def observation(self) -> PreAuthSequenceObservation:
-        return PreAuthSequenceObservation(
-            mode=self.mode,
-            delay_ms=(
-                round(PRE_AUTH_DELAY_SECONDS * 1000)
-                if self.mode is PreAuthSequenceMode.DELAY_ONLY
-                else 0
-            ),
-            remote_supported_features_request_sent=self._supported_request_sent,
-            remote_supported_features_command_accepted=(
-                self._supported_command_accepted
-            ),
-            remote_supported_features_response_observed=(
-                self._supported_response_observed
-            ),
-            remote_supported_features_result=self._supported_result,
-            remote_supported_features_mask=self._supported_mask,
-            remote_extended_features_request_sent=self._extended_request_sent,
-            remote_extended_features_command_accepted=(
-                self._extended_command_accepted
-            ),
-            remote_extended_features_page=(
-                1 if self._extended_request_sent else None
-            ),
-            remote_extended_features_response_observed=(
-                self._extended_response_observed
-            ),
-            remote_extended_features_result=self._extended_result,
-            remote_extended_features_max_page=self._extended_max_page,
-            remote_extended_features_mask=self._extended_mask,
-            remote_name_request_sent=self._name_request_sent,
-            remote_name_command_accepted=self._name_command_accepted,
-            remote_name_response_observed=self._name_response_observed,
-            remote_name_result=self._name_result,
-            authentication_attempted=self._authentication_attempted,
-        )
+        values = self._native.snapshot()
+        values["mode"] = PreAuthSequenceMode(values["mode"])
+        for key in (
+            "remote_supported_features_result",
+            "remote_extended_features_result",
+            "remote_name_result",
+        ):
+            values[key] = RemoteDiscoveryResult(values[key])
+        return PreAuthSequenceObservation(**values)
 
     async def run(self, connection: object) -> None:
         if self.mode is PreAuthSequenceMode.PROVEN:
@@ -275,32 +236,24 @@ class PreAuthSequenceStrategy:
         self.mark_authentication_attempted()
 
     def mark_authentication_attempted(self) -> None:
-        self._authentication_attempted = True
+        self._native.mark_authentication_attempted()
 
     def _supported_request(self) -> None:
-        self._supported_request_sent = True
-        self._supported_result = RemoteDiscoveryResult.OTHER
+        self._native.supported_request()
 
     def _supported_accepted(self) -> None:
-        self._supported_command_accepted = True
+        self._native.supported_accepted()
 
     def _supported_response(
-        self,
-        *,
-        observed: bool,
-        result: RemoteDiscoveryResult,
-        mask: int | None,
+        self, *, observed: bool, result: RemoteDiscoveryResult, mask: int | None
     ) -> None:
-        self._supported_response_observed = observed
-        self._supported_result = result
-        self._supported_mask = mask
+        self._native.supported_response(observed, result.value, mask)
 
     def _extended_request(self) -> None:
-        self._extended_request_sent = True
-        self._extended_result = RemoteDiscoveryResult.OTHER
+        self._native.extended_request()
 
     def _extended_accepted(self) -> None:
-        self._extended_command_accepted = True
+        self._native.extended_accepted()
 
     def _extended_response(
         self,
@@ -310,23 +263,18 @@ class PreAuthSequenceStrategy:
         maximum_page: int | None,
         mask: int | None,
     ) -> None:
-        self._extended_response_observed = observed
-        self._extended_result = result
-        self._extended_max_page = maximum_page
-        self._extended_mask = mask
+        self._native.extended_response(observed, result.value, maximum_page, mask)
 
     def _name_request(self) -> None:
-        self._name_request_sent = True
-        self._name_result = RemoteDiscoveryResult.OTHER
+        self._native.name_request()
 
     def _name_accepted(self) -> None:
-        self._name_command_accepted = True
+        self._native.name_accepted()
 
     def _name_response(
         self, *, observed: bool, result: RemoteDiscoveryResult
     ) -> None:
-        self._name_response_observed = observed
-        self._name_result = result
+        self._native.name_response(observed, result.value)
 
 
 class BumbleRemoteDiscovery:
@@ -378,18 +326,11 @@ class BumbleRemoteDiscovery:
                     del maximum_page
                     if handle != raw_connection.handle or future.done():
                         return
-                    valid = (
-                        status == hci.HCI_SUCCESS
-                        and page == 0
-                        and 0 <= features < 1 << 64
+                    result, mask = _native.pre_auth_supported_completion(
+                        status, page, features
                     )
                     future.set_result(
-                        _FeatureResponse(
-                            RemoteDiscoveryResult.SUCCESS
-                            if valid
-                            else RemoteDiscoveryResult.OTHER,
-                            features if valid else None,
-                        )
+                        _FeatureResponse(RemoteDiscoveryResult(result), mask)
                     )
 
                 await _send_accepted_command(
@@ -456,20 +397,11 @@ class BumbleRemoteDiscovery:
                 ) -> None:
                     if handle != raw_connection.handle or future.done():
                         return
-                    valid = (
-                        status == hci.HCI_SUCCESS
-                        and page == 1
-                        and 1 <= maximum_page <= 0xFF
-                        and 0 <= features < 1 << 64
+                    result, mask, max_page = _native.pre_auth_extended_completion(
+                        status, page, maximum_page, features
                     )
                     future.set_result(
-                        _FeatureResponse(
-                            RemoteDiscoveryResult.SUCCESS
-                            if valid
-                            else RemoteDiscoveryResult.OTHER,
-                            features if valid else None,
-                            maximum_page if valid else None,
-                        )
+                        _FeatureResponse(RemoteDiscoveryResult(result), mask, max_page)
                     )
 
                 await _send_accepted_command(
