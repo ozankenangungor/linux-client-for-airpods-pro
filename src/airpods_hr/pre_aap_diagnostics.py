@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 from bumble import l2cap
 
+from . import _airpods_aap_core as _native
+
 
 PRE_AAP_DELAY_SECONDS = 0.020
 DEFAULT_INFORMATION_RESPONSE_TIMEOUT = 2.0
@@ -83,39 +85,19 @@ class PreAAPSequenceStrategy:
         information_exchange: _InformationExchange | None = None,
     ) -> None:
         self.mode = PreAAPSequenceMode(mode)
+        self._native = _native._PreAAPDiagnosticState(self.mode.value)
         self._sleep = sleep
         self._information_exchange = (
             information_exchange or BumbleInformationExchange()
         )
-        self._extended_request_sent = False
-        self._extended_response_observed = False
-        self._extended_result = InformationResponseResult.NOT_APPLICABLE
-        self._extended_mask: int | None = None
-        self._fixed_request_sent = False
-        self._fixed_response_observed = False
-        self._fixed_result = InformationResponseResult.NOT_APPLICABLE
-        self._fixed_mask: int | None = None
-        self._aap_open_attempted = False
 
     @property
     def observation(self) -> PreAAPSequenceObservation:
-        return PreAAPSequenceObservation(
-            mode=self.mode,
-            delay_ms=(
-                round(PRE_AAP_DELAY_SECONDS * 1000)
-                if self.mode is PreAAPSequenceMode.DELAY_ONLY
-                else 0
-            ),
-            extended_features_request_sent=self._extended_request_sent,
-            extended_features_response_observed=self._extended_response_observed,
-            extended_features_result=self._extended_result,
-            extended_features_mask=self._extended_mask,
-            fixed_channels_request_sent=self._fixed_request_sent,
-            fixed_channels_response_observed=self._fixed_response_observed,
-            fixed_channels_result=self._fixed_result,
-            fixed_channels_mask=self._fixed_mask,
-            aap_open_attempted=self._aap_open_attempted,
-        )
+        values = self._native.snapshot()
+        values["mode"] = PreAAPSequenceMode(values["mode"])
+        for key in ("extended_features_result", "fixed_channels_result"):
+            values[key] = InformationResponseResult(values[key])
+        return PreAAPSequenceObservation(**values)
 
     async def run(self, connection: object) -> None:
         if self.mode is PreAAPSequenceMode.PROVEN:
@@ -126,17 +108,10 @@ class PreAAPSequenceStrategy:
         await self._information_exchange.run(connection, self)
 
     def mark_aap_open_attempted(self) -> None:
-        self._aap_open_attempted = True
+        self._native.mark_aap_open_attempted()
 
     def _request_sent(self, info_type: int) -> None:
-        if info_type == 0x0002:
-            self._extended_request_sent = True
-            self._extended_result = InformationResponseResult.OTHER
-        elif info_type == 0x0003:
-            self._fixed_request_sent = True
-            self._fixed_result = InformationResponseResult.OTHER
-        else:
-            raise ValueError("unsupported diagnostic Information Type")
+        self._native.request_sent(info_type)
 
     def _response(
         self,
@@ -146,16 +121,7 @@ class PreAAPSequenceStrategy:
         result: InformationResponseResult,
         mask: int | None,
     ) -> None:
-        if info_type == 0x0002:
-            self._extended_response_observed = observed
-            self._extended_result = result
-            self._extended_mask = mask
-        elif info_type == 0x0003:
-            self._fixed_response_observed = observed
-            self._fixed_result = result
-            self._fixed_mask = mask
-        else:
-            raise ValueError("unsupported diagnostic Information Type")
+        self._native.response(info_type, observed, result.value, mask)
 
 
 class BumbleInformationExchange:
@@ -309,27 +275,10 @@ class BumbleInformationExchange:
     def _decode_response(
         response: l2cap.L2CAP_Information_Response,
     ) -> _DecodedInformationResponse:
-        if int(response.result) == int(
-            l2cap.L2CAP_Information_Response.Result.NOT_SUPPORTED
-        ):
-            return _DecodedInformationResponse(
-                InformationResponseResult.NOT_SUPPORTED, None
-            )
-        if int(response.result) != int(
-            l2cap.L2CAP_Information_Response.Result.SUCCESS
-        ):
-            return _DecodedInformationResponse(
-                InformationResponseResult.OTHER, None
-            )
-        expected_length = 4 if int(response.info_type) == 0x0002 else 8
-        if len(response.data) != expected_length:
-            return _DecodedInformationResponse(
-                InformationResponseResult.OTHER, None
-            )
-        return _DecodedInformationResponse(
-            InformationResponseResult.SUCCESS,
-            int.from_bytes(response.data, "little"),
+        result, mask = _native.pre_aap_decode_response(
+            int(response.info_type), int(response.result), bytes(response.data)
         )
+        return _DecodedInformationResponse(InformationResponseResult(result), mask)
 
     @staticmethod
     def _require_bumble_signaling(connection: object) -> tuple[Any, Any]:

@@ -3,10 +3,34 @@
 import unittest
 
 from airpods_hr import _airpods_aap_core as native
+from airpods_hr.pre_aap_diagnostics import (
+    InformationResponseResult,
+    PreAAPSequenceMode,
+    PreAAPSequenceStrategy,
+)
+from airpods_hr.pre_auth_diagnostics import (
+    PreAuthSequenceMode,
+    PreAuthSequenceStrategy,
+    RemoteDiscoveryResult,
+)
 
 
 class ReferenceDiagnosticBridgeTests(unittest.TestCase):
-
+    def test_compiled_state_and_compatibility_enums(self):
+        self.assertEqual(native._PreAuthDiagnosticState.__module__, native.__name__)
+        self.assertEqual(native._PreAAPDiagnosticState.__module__, native.__name__)
+        auth = PreAuthSequenceStrategy(PreAuthSequenceMode.DELAY_ONLY)
+        aap = PreAAPSequenceStrategy(PreAAPSequenceMode.DELAY_ONLY)
+        self.assertIsInstance(auth._native, native._PreAuthDiagnosticState)
+        self.assertIsInstance(aap._native, native._PreAAPDiagnosticState)
+        self.assertEqual(auth.observation.delay_ms, 85)
+        self.assertEqual(aap.observation.delay_ms, 20)
+        self.assertIs(auth.observation.remote_name_result, RemoteDiscoveryResult.NOT_APPLICABLE)
+        self.assertIs(aap.observation.fixed_channels_result, InformationResponseResult.NOT_APPLICABLE)
+        auth._supported_request()
+        aap._request_sent(2)
+        self.assertIs(auth.observation.remote_supported_features_result, RemoteDiscoveryResult.OTHER)
+        self.assertIs(aap.observation.extended_features_result, InformationResponseResult.OTHER)
 
     def test_unknown_identities_fail_without_mutation(self):
         with self.assertRaises(ValueError):
@@ -45,3 +69,5 @@ class ReferenceDiagnosticBridgeTests(unittest.TestCase):
             native.pre_aap_decode_response(4, 0, b"\0" * 8)
 
 
+if __name__ == "__main__":
+    unittest.main()

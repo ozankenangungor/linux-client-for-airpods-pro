@@ -736,10 +736,10 @@ class SemanticsStaticSafetyTests(unittest.TestCase):
                 "40b5f39c3737eec4cd132804b2dfbfe57c7c2180265b15d7987139a876830d1e"
             ),
             "src/airpods_hr/pre_aap_diagnostics.py": (
-                "0b37874aa7136a4ef754974d873d064ad92027c01a4f263efc4dd214c9479782"
+                "e877bcb4584c54f9505656e275ee26df29cc852d8698675e291e7532a9b27d5a"
             ),
             "src/airpods_hr/pre_auth_diagnostics.py": (
-                "c0331641dad21cd9ace2e0708e8586c50863b4cc9c5a5b2bf1792661e6ec0d4c"
+                "1b592f576f096c400c4d01c6954a0df4b9b46332ffdb20a917e5698351e1ca41"
             ),
             "src/airpods_hr/reference_sdp_footprint.py": (
                 "273e9b7c7044e45a21e4a92af13a134f29224c682d614764d79d66a97fbd4891"
