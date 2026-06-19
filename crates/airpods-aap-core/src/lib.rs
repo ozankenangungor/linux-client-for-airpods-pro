@@ -9,6 +9,7 @@ pub mod aap_config_diagnostics;
 pub mod aap_local_rx_diagnostics;
 mod activation;
 mod analysis;
+pub mod classic_diagnostics;
 mod control;
 mod heart_rate;
 pub mod pre_aap_diagnostics;
