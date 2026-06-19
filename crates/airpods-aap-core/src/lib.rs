@@ -6,6 +6,7 @@
 //! errors, and Linux integration.
 
 pub mod aap_config_diagnostics;
+pub mod aap_local_rx_diagnostics;
 mod activation;
 mod analysis;
 mod control;
