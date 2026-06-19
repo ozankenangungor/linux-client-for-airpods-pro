@@ -5,6 +5,7 @@
 //! It performs no operating-system I/O. Python retains the public models,
 //! errors, and Linux integration.
 
+pub mod aap_config_diagnostics;
 mod activation;
 mod analysis;
 mod control;
