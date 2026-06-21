@@ -1,9 +1,9 @@
 //! Conversion of neutral diagnostic facts to and from the pure core.
 
-use airpods_aap_core :: { aap_config_diagnostics as config , aap_local_rx_diagnostics as rx } ;
+use airpods_aap_core :: { aap_config_diagnostics as config , aap_local_rx_diagnostics as rx , classic_diagnostics as classic } ;
 use pyo3 :: exceptions :: PyValueError ;
 use pyo3 :: prelude :: * ;
-use pyo3 :: types :: { PyDict , PyModule } ;
+use pyo3 :: types :: { PyAny , PyBytes , PyDict , PyModule , PyString } ;
 
 fn rx_error(error: rx::OptionError) -> PyErr {
     PyValueError::new_err(match error {
@@ -173,17 +173,146 @@ fn diagnostic_post_ack_type_17_limit() -> usize {
 
 
 
+fn profile(value: &str) -> PyResult<classic::Profile> {
+    classic::Profile::try_from(value)
+        .map_err(|_| PyValueError::new_err("unsupported Classic runtime-name profile"))
+}
 
+#[pyfunction]
+fn diagnostic_runtime_name(value: &str) -> PyResult<&'static str> {
+    Ok(profile(value)?.name())
+}
 
+#[pyfunction]
+fn diagnostic_local_name_matches(
+    value: &Bound<'_, PyAny>,
+    profile_id: &str,
+) -> PyResult<Option<bool>> {
+    let profile = profile(profile_id)?;
+    if value.is_instance_of::<PyBytes>() {
+        let bytes = value.cast::<PyBytes>()?;
+        Ok(classic::local_name_matches(
+            classic::LocalName::Bytes(bytes.as_bytes()),
+            profile,
+        ))
+    } else if value.is_instance_of::<PyString>() {
+        let string = value.cast::<PyString>()?;
+        let text = string.to_string_lossy();
+        Ok(classic::local_name_matches(
+            classic::LocalName::Text(&text),
+            profile,
+        ))
+    } else {
+        Ok(classic::local_name_matches(
+            classic::LocalName::Unavailable,
+            profile,
+        ))
+    }
+}
 
+#[pyfunction]
+fn diagnostic_power_on_facts() -> (Vec<&'static str>, Vec<&'static str>) {
+    (
+        classic::POWER_ON_CLASSIC_WRITES.to_vec(),
+        classic::POWER_ON_NOT_EXPLICITLY_WRITTEN.to_vec(),
+    )
+}
 
+#[pyfunction]
+fn diagnostic_classic_audit<'py>(
+    py: Python<'py>,
+    profile_id: &str,
+    flags: [bool; 15],
+    class_of_device: i64,
+    io_capability: i64,
+    features: Vec<i64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let audit = classic::audit(
+        profile(profile_id)?,
+        flags,
+        class_of_device,
+        io_capability,
+        &features,
+    );
+    let d = PyDict::new(py);
+    d.set_item("runtime_name_profile", profile_id)?;
+    let names = [
+        "classic_enabled",
+        "le_enabled",
+        "configured_address_is_default",
+        "classic_sc_enabled",
+        "classic_ssp_enabled",
+        "classic_smp_enabled",
+        "classic_accept_any",
+        "classic_interlaced_scan_enabled",
+        "connectable",
+        "discoverable",
+        "gap_service_enabled",
+        "gatt_service_enabled",
+        "enhanced_retransmission_supported",
+        "config_keystore_present",
+        "keystore_available_before_power_on",
+    ];
+    for (name, value) in names.iter().zip(audit.flags) {
+        d.set_item(name, value)?;
+    }
+    d.set_item("class_of_device", audit.class_of_device)?;
+    d.set_item("io_capability", audit.io_capability)?;
+    d.set_item("l2cap_extended_features", audit.l2cap_extended_features)?;
+    Ok(d)
+}
 
-
-
-
-
-
-
+#[pyfunction]
+fn diagnostic_classic_host_snapshot<'py>(
+    py: Python<'py>,
+    profile_id: &str,
+    flags: [bool; 6],
+    io_capability: i64,
+    name_match: Option<bool>,
+    observations: [Option<i64>; 10],
+    unavailable: Vec<String>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let s = classic::host_snapshot(
+        profile(profile_id)?,
+        flags,
+        io_capability,
+        name_match,
+        observations,
+        &unavailable,
+    );
+    let d = PyDict::new(py);
+    d.set_item("runtime_name_profile", profile_id)?;
+    let flag_names = [
+        "classic_enabled",
+        "le_enabled",
+        "connectable",
+        "discoverable",
+        "configured_ssp_enabled",
+        "configured_sc_enabled",
+    ];
+    for (name, value) in flag_names.iter().zip(s.configured_flags) {
+        d.set_item(name, value)?;
+    }
+    d.set_item("configured_io_capability", s.io_capability)?;
+    d.set_item("observed_local_name_matches_profile", s.local_name_match)?;
+    let observation_names = [
+        "observed_class_of_device",
+        "observed_authentication_enable",
+        "observed_simple_pairing_mode",
+        "observed_secure_connections_host_support",
+        "observed_scan_enable",
+        "observed_page_timeout",
+        "observed_page_scan_type",
+        "observed_page_scan_interval",
+        "observed_page_scan_window",
+        "observed_default_link_policy",
+    ];
+    for (name, value) in observation_names.iter().zip(s.observations) {
+        d.set_item(name, value)?;
+    }
+    d.set_item("unavailable_fields", s.unavailable)?;
+    Ok(d)
+}
 
 
 
@@ -214,5 +343,10 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(diagnostic_local_rx_parse, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_post_ack_shape, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_post_ack_type_17_limit, module)?)?;
-                                                Ok(())
+        module.add_function(wrap_pyfunction!(diagnostic_runtime_name, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_local_name_matches, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_power_on_facts, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_classic_audit, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_classic_host_snapshot, module)?)?;
+                        Ok(())
 }

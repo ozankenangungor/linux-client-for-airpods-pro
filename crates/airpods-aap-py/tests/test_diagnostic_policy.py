@@ -46,4 +46,17 @@ class DiagnosticPolicyBridgeTests(unittest.TestCase):
         self.assertEqual(native.diagnostic_post_ack_shape([(0x2b, 5), (0x17, 7), (0x2b, 8)]),
                          (5, [7], 8, 3))
 
+    def test_classic_closed_profiles_and_name_input(self):
+        self.assertEqual(native.diagnostic_runtime_name("legacy-poc"), "AirPods-RE")
+        with self.assertRaisesRegex(ValueError, "unsupported Classic runtime-name profile"):
+            native.diagnostic_runtime_name("custom")
+        self.assertTrue(native.diagnostic_local_name_matches(b"AirPods-RE\0hidden", "legacy-poc"))
+        self.assertIsNone(native.diagnostic_local_name_matches(b"\xff", "legacy-poc"))
+        self.assertFalse(native.diagnostic_local_name_matches("\ud800", "legacy-poc"))
+        self.assertTrue(native.diagnostic_local_name_matches("AirPods-RE\0\ud800", "legacy-poc"))
+        self.assertIsNone(native.diagnostic_local_name_matches(object(), "legacy-poc"))
+        written, unwritten = native.diagnostic_power_on_facts()
+        self.assertEqual(written[0], "local_name")
+        self.assertEqual(unwritten[-1], "voice_setting")
+
 
