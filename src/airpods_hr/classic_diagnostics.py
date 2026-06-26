@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from airpods_hr import _airpods_aap_core as _native
+
 
 class RuntimeNameProfile(StrEnum):
     """Reviewed local-name choices for a controlled single-variable A/B test."""
@@ -19,18 +21,12 @@ class RuntimeNameProfile(StrEnum):
     LEGACY_POC = "legacy-poc"
 
 
-_RUNTIME_NAMES = {
-    RuntimeNameProfile.PROJECT_DEFAULT: "airpods-hr authentication probe",
-    RuntimeNameProfile.LEGACY_POC: "AirPods-RE",
-}
-
-
 def runtime_name_for_profile(profile: RuntimeNameProfile) -> str:
     """Return a project-owned name without accepting arbitrary live input."""
 
     try:
-        return _RUNTIME_NAMES[RuntimeNameProfile(profile)]
-    except (KeyError, ValueError) as error:
+        return _native.diagnostic_runtime_name(profile)
+    except ValueError as error:
         raise ValueError("unsupported Classic runtime-name profile") from error
 
 
@@ -46,18 +42,9 @@ def local_name_matches_profile(
     as unavailable rather than rendered or retained.
     """
 
-    normalized: str
-    if isinstance(value, bytes):
-        try:
-            normalized = value.split(b"\x00", 1)[0].decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    elif isinstance(value, str):
-        normalized = value.split("\x00", 1)[0]
-    else:
+    if not isinstance(value, (bytes, str)):
         return None
-
-    return normalized == runtime_name_for_profile(profile)
+    return _native.diagnostic_local_name_matches(value, profile)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,58 +83,38 @@ def audit_device_configuration(
     from bumble.device import DEVICE_DEFAULT_ADDRESS
     from bumble.hci import Address
 
-    return DeviceConfigurationAudit(
-        runtime_name_profile=RuntimeNameProfile(runtime_name_profile),
-        classic_enabled=bool(config.classic_enabled),
-        le_enabled=bool(config.le_enabled),
-        configured_address_is_default=(
-            config.address == Address(DEVICE_DEFAULT_ADDRESS)
-        ),
-        class_of_device=int(config.class_of_device),
-        classic_sc_enabled=bool(config.classic_sc_enabled),
-        classic_ssp_enabled=bool(config.classic_ssp_enabled),
-        classic_smp_enabled=bool(config.classic_smp_enabled),
-        classic_accept_any=bool(config.classic_accept_any),
-        classic_interlaced_scan_enabled=bool(
-            config.classic_interlaced_scan_enabled
-        ),
-        connectable=bool(config.connectable),
-        discoverable=bool(config.discoverable),
-        io_capability=int(config.io_capability),
-        gap_service_enabled=bool(config.gap_service_enabled),
-        gatt_service_enabled=bool(config.gatt_service_enabled),
-        enhanced_retransmission_supported=bool(
-            config.enhanced_retransmission_supported
-        ),
-        l2cap_extended_features=tuple(
-            int(value) for value in config.l2cap_extended_features
-        ),
-        config_keystore_present=config.keystore is not None,
-        keystore_available_before_power_on=keystore_available_before_power_on,
+    facts = _native.diagnostic_classic_audit(
+        runtime_name_profile,
+        [
+            bool(config.classic_enabled),
+            bool(config.le_enabled),
+            config.address == Address(DEVICE_DEFAULT_ADDRESS),
+            bool(config.classic_sc_enabled),
+            bool(config.classic_ssp_enabled),
+            bool(config.classic_smp_enabled),
+            bool(config.classic_accept_any),
+            bool(config.classic_interlaced_scan_enabled),
+            bool(config.connectable),
+            bool(config.discoverable),
+            bool(config.gap_service_enabled),
+            bool(config.gatt_service_enabled),
+            bool(config.enhanced_retransmission_supported),
+            config.keystore is not None,
+            keystore_available_before_power_on,
+        ],
+        int(config.class_of_device),
+        int(config.io_capability),
+        [int(value) for value in config.l2cap_extended_features],
     )
+    facts["runtime_name_profile"] = RuntimeNameProfile(facts["runtime_name_profile"])
+    facts["l2cap_extended_features"] = tuple(facts["l2cap_extended_features"])
+    return DeviceConfigurationAudit(**facts)
 
 
 # Source-audit facts for Bumble 0.0.234. These are names only; they contain no
 # controller identity or packet data.
-POWER_ON_CLASSIC_WRITES: tuple[str, ...] = (
-    "local_name",
-    "class_of_device",
-    "simple_pairing_mode",
-    "secure_connections_host_support",
-    "scan_enable",
-    "extended_inquiry_response",
-    "page_scan_type_if_supported",
-    "inquiry_scan_type_if_supported",
-)
-
-POWER_ON_NOT_EXPLICITLY_WRITTEN: tuple[str, ...] = (
-    "authentication_enable",
-    "connection_accept_timeout",
-    "default_link_policy",
-    "page_timeout",
-    "page_scan_activity",
-    "inquiry_scan_activity",
-    "voice_setting",
+POWER_ON_CLASSIC_WRITES, POWER_ON_NOT_EXPLICITLY_WRITTEN = (
+    tuple(group) for group in _native.diagnostic_power_on_facts()
 )
 
 
@@ -254,29 +221,21 @@ class ClassicHostStateObserver:
             else:
                 values[field_name] = int(getattr(response, field_name))
 
-        return ClassicHostStateSnapshot(
-            runtime_name_profile=RuntimeNameProfile(runtime_name_profile),
-            classic_enabled=bool(device.classic_enabled),
-            le_enabled=bool(device.le_enabled),
-            connectable=bool(device.connectable),
-            discoverable=bool(device.discoverable),
-            configured_ssp_enabled=bool(device.classic_ssp_enabled),
-            configured_sc_enabled=bool(device.classic_sc_enabled),
-            configured_io_capability=int(device.config.io_capability),
-            observed_local_name_matches_profile=values.get(
-                "local_name_matches_profile"
-            ),
-            observed_class_of_device=values.get("class_of_device"),
-            observed_authentication_enable=values.get("authentication_enable"),
-            observed_simple_pairing_mode=values.get("simple_pairing_mode"),
-            observed_secure_connections_host_support=values.get(
-                "secure_connections_host_support"
-            ),
-            observed_scan_enable=values.get("scan_enable"),
-            observed_page_timeout=values.get("page_timeout"),
-            observed_page_scan_type=values.get("page_scan_type"),
-            observed_page_scan_interval=values.get("page_scan_interval"),
-            observed_page_scan_window=values.get("page_scan_window"),
-            observed_default_link_policy=values.get("default_link_policy"),
-            unavailable_fields=tuple(unavailable),
+        facts = _native.diagnostic_classic_host_snapshot(
+            runtime_name_profile,
+            [bool(device.classic_enabled), bool(device.le_enabled),
+             bool(device.connectable), bool(device.discoverable),
+             bool(device.classic_ssp_enabled), bool(device.classic_sc_enabled)],
+            int(device.config.io_capability),
+            values.get("local_name_matches_profile"),
+            [values.get(name) for name in (
+                "class_of_device", "authentication_enable", "simple_pairing_mode",
+                "secure_connections_host_support", "scan_enable", "page_timeout",
+                "page_scan_type", "page_scan_interval", "page_scan_window",
+                "default_link_policy",
+            )],
+            unavailable,
         )
+        facts["runtime_name_profile"] = RuntimeNameProfile(facts["runtime_name_profile"])
+        facts["unavailable_fields"] = tuple(facts["unavailable_fields"])
+        return ClassicHostStateSnapshot(**facts)
