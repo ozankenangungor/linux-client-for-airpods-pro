@@ -1,9 +1,12 @@
 //! Conversion of neutral diagnostic facts to and from the pure core.
 
-use airpods_aap_core :: { aap_config_diagnostics as config , aap_local_rx_diagnostics as rx , classic_diagnostics as classic } ;
-use pyo3 :: exceptions :: PyValueError ;
-use pyo3 :: prelude :: * ;
-use pyo3 :: types :: { PyAny , PyBytes , PyDict , PyModule , PyString } ;
+use airpods_aap_core::{
+    aap_config_diagnostics as config, aap_local_rx_diagnostics as rx,
+    classic_diagnostics as classic, heart_rate_diagnostics as hr,
+};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyDict, PyModule, PyString};
 
 fn rx_error(error: rx::OptionError) -> PyErr {
     PyValueError::new_err(match error {
@@ -171,7 +174,10 @@ fn diagnostic_post_ack_type_17_limit() -> usize {
     rx::POST_ACK_TYPE_17_LENGTH_LIMIT
 }
 
-
+#[pyfunction]
+fn diagnostic_schema_version() -> u8 {
+    hr::SCHEMA_VERSION
+}
 
 fn profile(value: &str) -> PyResult<classic::Profile> {
     classic::Profile::try_from(value)
@@ -314,39 +320,215 @@ fn diagnostic_classic_host_snapshot<'py>(
     Ok(d)
 }
 
+fn hr_error(error: hr::Error) -> PyErr {
+    PyValueError::new_err(match error {
+        hr::Error::AlreadyStarted => "diagnostic session is already started",
+        hr::Error::NotActive => "diagnostic session is not active",
+        hr::Error::InvalidPayload => "parsed report does not retain the validated 18-byte payload",
+        hr::Error::InvalidCommit => "invalid diagnostic event commit",
+    })
+}
 
+fn sample_dict<'py>(py: Python<'py>, sample: &hr::Sample) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("schema_version", hr::SCHEMA_VERSION)?;
+    d.set_item("event", "heart_rate_sample")?;
+    d.set_item("host_monotonic_ns", sample.host_monotonic_ns)?;
+    d.set_item("elapsed_ms", sample.elapsed_ms)?;
+    d.set_item("bpm", sample.bpm)?;
+    d.set_item("aux", sample.aux)?;
+    d.set_item("sequence", sample.sequence)?;
+    d.set_item("field_5", sample.field_5)?;
+    d.set_item("timestamp_ticks", sample.timestamp_ticks)?;
+    d.set_item("flags", sample.flags)?;
+    d.set_item("raw_report_hex", &sample.raw_report_hex)?;
+    Ok(d)
+}
 
+#[pyfunction]
+fn diagnostic_sample_event<'py>(
+    py: Python<'py>,
+    reference_ns: i128,
+    observed_ns: i128,
+    fields: [u64; 6],
+    raw: &[u8],
+) -> PyResult<Bound<'py, PyDict>> {
+    let sample = hr::sample(reference_ns, observed_ns, fields, raw).map_err(hr_error)?;
+    sample_dict(py, &sample)
+}
 
+#[pyfunction]
+fn diagnostic_sample_event_values<'py>(
+    py: Python<'py>,
+    observed_ns: i128,
+    elapsed_ms: i128,
+    fields: [u64; 6],
+    raw: &[u8],
+) -> PyResult<Bound<'py, PyDict>> {
+    sample_dict(
+        py,
+        &hr::sample_values(observed_ns, elapsed_ms, fields, raw).map_err(hr_error)?,
+    )
+}
 
+#[pyfunction]
+fn diagnostic_sample_human_values(
+    observed_ns: i128,
+    elapsed_ms: i128,
+    fields: [u64; 6],
+    raw: &[u8],
+) -> PyResult<String> {
+    Ok(hr::sample_values(observed_ns, elapsed_ms, fields, raw)
+        .map_err(hr_error)?
+        .human())
+}
 
+#[pyfunction]
+fn diagnostic_validate_raw(raw: &Bound<'_, PyAny>) -> PyResult<()> {
+    let bytes = raw
+        .cast::<PyBytes>()
+        .map_err(|_| hr_error(hr::Error::InvalidPayload))?;
+    hr::validate_raw(bytes.as_bytes()).map_err(hr_error)
+}
 
+#[pyfunction]
+fn diagnostic_sample_human(
+    reference_ns: i128,
+    observed_ns: i128,
+    fields: [u64; 6],
+    raw: &[u8],
+) -> PyResult<String> {
+    Ok(hr::sample(reference_ns, observed_ns, fields, raw)
+        .map_err(hr_error)?
+        .human())
+}
 
+#[pyclass(
+    frozen,
+    module = "airpods_hr._airpods_aap_core",
+    name = "_DiagnosticPlanToken"
+)]
+struct PyDiagnosticPlanToken {
+    inner: hr::PlanToken,
+}
 
+#[pyclass(
+    module = "airpods_hr._airpods_aap_core",
+    name = "_DiagnosticRecorderState"
+)]
+struct PyDiagnosticRecorderState {
+    inner: hr::State,
+}
 
-
-
-
-
-
-
-
-
-
-
+#[pymethods]
+impl PyDiagnosticRecorderState {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: hr::State::default(),
+        }
+    }
+    #[getter]
+    fn session_started(&self) -> bool {
+        self.inner.reference_ns.is_some()
+    }
+    #[getter]
+    fn session_stopped(&self) -> bool {
+        self.inner.stopped
+    }
+    #[getter]
+    fn sample_events_emitted(&self) -> u64 {
+        self.inner.sample_count
+    }
+    #[getter]
+    fn reference_ns(&self) -> Option<i128> {
+        self.inner.reference_ns
+    }
+    fn check_start(&self) -> PyResult<()> {
+        self.inner.check_start().map_err(hr_error)
+    }
+    fn check_active(&self) -> PyResult<i128> {
+        self.inner.check_active().map_err(hr_error)
+    }
+    fn plan_start<'py>(
+        &self,
+        py: Python<'py>,
+        reference_ns: i128,
+        wall_clock_utc: &str,
+    ) -> PyResult<(PyDiagnosticPlanToken, Bound<'py, PyDict>)> {
+        let token = self.inner.plan_start(reference_ns).map_err(hr_error)?;
+        let event = hr::start_event(reference_ns, wall_clock_utc);
+        let d = PyDict::new(py);
+        d.set_item("schema_version", hr::SCHEMA_VERSION)?;
+        d.set_item("event", "session_start")?;
+        d.set_item("host_monotonic_reference_ns", event.reference_ns)?;
+        d.set_item("wall_clock_utc", event.wall_clock_utc)?;
+        Ok((PyDiagnosticPlanToken { inner: token }, d))
+    }
+    fn commit_start(&mut self, token: PyRef<'_, PyDiagnosticPlanToken>) -> PyResult<()> {
+        self.inner.commit_start(token.inner).map_err(hr_error)
+    }
+    fn plan_sample<'py>(
+        &self,
+        py: Python<'py>,
+        observed_ns: i128,
+        fields: [u64; 6],
+        raw: &[u8],
+    ) -> PyResult<(PyDiagnosticPlanToken, Bound<'py, PyDict>)> {
+        let (token, sample) = self
+            .inner
+            .plan_sample(observed_ns, fields, raw)
+            .map_err(hr_error)?;
+        Ok((
+            PyDiagnosticPlanToken { inner: token },
+            sample_dict(py, &sample)?,
+        ))
+    }
+    fn commit_sample(&mut self, token: PyRef<'_, PyDiagnosticPlanToken>) -> PyResult<()> {
+        self.inner.commit_sample(token.inner).map_err(hr_error)
+    }
+    fn plan_stop<'py>(
+        &self,
+        py: Python<'py>,
+        observed_ns: i128,
+        termination_reason: &Bound<'_, PyAny>,
+    ) -> PyResult<(PyDiagnosticPlanToken, Bound<'py, PyDict>)> {
+        let (token, event) = self.inner.plan_stop(observed_ns).map_err(hr_error)?;
+        let d = PyDict::new(py);
+        d.set_item("schema_version", hr::SCHEMA_VERSION)?;
+        d.set_item("event", "session_stop")?;
+        d.set_item("host_monotonic_ns", event.observed_ns)?;
+        d.set_item("elapsed_ms", event.elapsed_ms)?;
+        d.set_item("heart_rate_samples_emitted", event.count)?;
+        d.set_item("termination_reason", termination_reason)?;
+        Ok((PyDiagnosticPlanToken { inner: token }, d))
+    }
+    fn commit_stop(&mut self, token: PyRef<'_, PyDiagnosticPlanToken>) -> PyResult<()> {
+        self.inner.commit_stop(token.inner).map_err(hr_error)
+    }
+}
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyLocalRXState>()?;
-            module.add_function(wrap_pyfunction!(diagnostic_config_plan, module)?)?;
+    module.add_class::<PyDiagnosticPlanToken>()?;
+    module.add_class::<PyDiagnosticRecorderState>()?;
+    module.add_function(wrap_pyfunction!(diagnostic_config_plan, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_config_rewrite, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_config_observation, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_local_rx_rewrite, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_local_rx_parse, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_post_ack_shape, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_post_ack_type_17_limit, module)?)?;
-        module.add_function(wrap_pyfunction!(diagnostic_runtime_name, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_schema_version, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_runtime_name, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_local_name_matches, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_power_on_facts, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_classic_audit, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostic_classic_host_snapshot, module)?)?;
-                        Ok(())
+    module.add_function(wrap_pyfunction!(diagnostic_sample_event, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_sample_human, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_sample_event_values, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_sample_human_values, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostic_validate_raw, module)?)?;
+    Ok(())
 }

@@ -15,6 +15,7 @@ FIELDS = [72, 165, 4660, 90, 0x0102030405060708, 0x89ABCDEF]
 class DiagnosticPolicyBridgeTests(unittest.TestCase):
     def test_compiled_entrypoints_and_config_policy(self):
         self.assertEqual(native._LocalRXState.__module__, native.__name__)
+        self.assertEqual(native._DiagnosticRecorderState.__module__, native.__name__)
         self.assertEqual(native.diagnostic_config_plan(True, HISTORICAL, 0),
                          (False, b"\x01\x02\x16\x0a"))
         self.assertEqual(native.diagnostic_config_plan(True, HISTORICAL, 1), (True, None))
@@ -59,4 +60,31 @@ class DiagnosticPolicyBridgeTests(unittest.TestCase):
         self.assertEqual(written[0], "local_name")
         self.assertEqual(unwritten[-1], "voice_setting")
 
+    def test_transactional_recorder_and_floor_timing(self):
+        state = native._DiagnosticRecorderState()
+        token, event = state.plan_start(100, "2026-01-02T03:04:05Z")
+        self.assertEqual(token.__class__.__module__, native.__name__)
+        self.assertFalse(state.session_started)
+        self.assertEqual(event, {"schema_version": 1, "event": "session_start",
+                                 "host_monotonic_reference_ns": 100,
+                                 "wall_clock_utc": "2026-01-02T03:04:05Z"})
+        state.commit_start(token)
+        with self.assertRaisesRegex(ValueError, "invalid diagnostic event commit"):
+            state.commit_sample(token)
+        sample_token, sample = state.plan_sample(99, FIELDS, RAW)
+        self.assertEqual(sample["elapsed_ms"], -1)
+        self.assertEqual(sample["raw_report_hex"], RAW.hex())
+        self.assertEqual(state.sample_events_emitted, 0)
+        state.commit_sample(sample_token)
+        stop_token, stop = state.plan_stop(1_000_100, {"arbitrary": [1, 2]})
+        self.assertEqual(stop["heart_rate_samples_emitted"], 1)
+        self.assertEqual(stop["termination_reason"], {"arbitrary": [1, 2]})
+        self.assertFalse(state.session_stopped)
+        state.commit_stop(stop_token)
+        self.assertTrue(state.session_stopped)
+        with self.assertRaisesRegex(ValueError, "diagnostic session is not active"):
+            state.plan_sample(2, FIELDS, RAW)
 
+
+if __name__ == "__main__":
+    unittest.main()
