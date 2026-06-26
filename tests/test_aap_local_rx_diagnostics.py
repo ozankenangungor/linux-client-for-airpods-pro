@@ -82,6 +82,26 @@ class ConfigureHarness:
 
 
 class AAPLocalRXWireTests(unittest.TestCase):
+    def test_native_option_errors_convert_and_restore_effect_hook(self) -> None:
+        for options, message in (
+            (b"\x01", "host Configure Request options are malformed"),
+            (b"\x01\x01\x02", "Configure MTU option is malformed"),
+            (b"\x01\x02\x00\x08\x01\x02\x00\x08", "Configure MTU option is malformed"),
+        ):
+            harness = ConfigureHarness()
+            strategy = AAPLocalRXDiagnosticStrategy(AAPLocalRXProfile.PROVEN)
+            request = l2cap.L2CAP_Configure_Request(
+                identifier=7, destination_cid=harness.channel.destination_cid,
+                flags=0, options=options,
+            )
+            with self.assertRaisesRegex(AAPLocalRXDiagnosticError, message):
+                with strategy(harness.manager):
+                    harness.manager.send_control_frame(
+                        harness.connection, l2cap.L2CAP_SIGNALING_CID, request
+                    )
+            self.assertIs(harness.manager.send_control_frame, harness.original_send)
+            self.assertFalse(strategy.observation.request_observed)
+
     def test_proven_request_is_byte_identical_and_reports_mtu_2048(self) -> None:
         harness = ConfigureHarness()
         strategy = AAPLocalRXDiagnosticStrategy(AAPLocalRXProfile.PROVEN)

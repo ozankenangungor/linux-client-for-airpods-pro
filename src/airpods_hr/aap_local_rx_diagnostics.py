@@ -5,10 +5,13 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from importlib import metadata
+
 from bumble import l2cap
+
+from airpods_hr import _airpods_aap_core as _native
 
 from airpods_hr.aap import HandshakeObservation
 from airpods_hr.bumble_compat import SUPPORTED_BUMBLE_VERSION
@@ -16,7 +19,7 @@ from airpods_hr.protocol import AAP_PSM
 
 
 L2CAP_CLASSIC_DEFAULT_MTU = 672
-AAP_POST_ACK_TYPE_17_LENGTH_LIMIT = 8
+AAP_POST_ACK_TYPE_17_LENGTH_LIMIT = _native.diagnostic_post_ack_type_17_limit()
 _MISSING = object()
 _STOCK_SEND_CONFIGURE_REQUEST = l2cap.ClassicChannel.send_configure_request
 _STOCK_SEND_CONTROL_FRAME = l2cap.ChannelManager.send_control_frame
@@ -34,13 +37,6 @@ class AAPLocalRXProfile(StrEnum):
 
 class AAPLocalRXDiagnosticError(RuntimeError):
     """Raised when the local-RX wire experiment cannot be applied safely."""
-
-
-@dataclass(frozen=True, slots=True)
-class _ConfigurationOption:
-    option_type: int
-    value: bytes
-    encoded: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,27 +70,17 @@ class AAPPostACKShapeObservation:
     def from_handshake(
         cls, observation: HandshakeObservation
     ) -> AAPPostACKShapeObservation:
-        first_type_2b: int | None = None
-        type_17_lengths: list[int] = []
-        maximum: int | None = None
-        for summary in observation.post_ack_frame_summaries:
-            maximum = (
-                summary.length
-                if maximum is None
-                else max(maximum, summary.length)
-            )
-            if first_type_2b is None and summary.header_u16_4_5 == 0x002B:
-                first_type_2b = summary.length
-            if (
-                summary.header_u16_4_5 == 0x0017
-                and len(type_17_lengths) < AAP_POST_ACK_TYPE_17_LENGTH_LIMIT
-            ):
-                type_17_lengths.append(summary.length)
+        first_type_2b, type_17_lengths, maximum, considered = _native.diagnostic_post_ack_shape(
+            [
+                (summary.header_u16_4_5, summary.length)
+                for summary in observation.post_ack_frame_summaries
+            ]
+        )
         return cls(
             first_type_0x002b_length=first_type_2b,
             type_0x0017_frame_lengths=tuple(type_17_lengths),
             max_post_ack_frame_length=maximum,
-            summaries_considered=len(observation.post_ack_frame_summaries),
+            summaries_considered=considered,
         )
 
 
@@ -143,56 +129,25 @@ def validate_bumble_local_rx_api(
         )
 
 
-def _decode_options(data: bytes) -> tuple[_ConfigurationOption, ...]:
-    options: list[_ConfigurationOption] = []
-    offset = 0
-    while offset < len(data):
-        if len(data) - offset < 2:
-            raise AAPLocalRXDiagnosticError(
-                "host Configure Request options are malformed"
-            )
-        length = data[offset + 1]
-        end = offset + 2 + length
-        if end > len(data):
-            raise AAPLocalRXDiagnosticError(
-                "host Configure Request options are malformed"
-            )
-        options.append(
-            _ConfigurationOption(
-                option_type=data[offset],
-                value=data[offset + 2 : end],
-                encoded=data[offset:end],
-            )
-        )
-        offset = end
-    return tuple(options)
-
-
-def _mtu(options: tuple[_ConfigurationOption, ...]) -> int | None:
-    matches = [
-        option
-        for option in options
-        if option.option_type == l2cap.L2CAP_Configure_Request.ParameterType.MTU
-    ]
-    if not matches:
-        return None
-    if len(matches) != 1 or len(matches[0].value) != 2:
-        raise AAPLocalRXDiagnosticError("Configure MTU option is malformed")
-    return int.from_bytes(matches[0].value, "little")
-
-
 class AAPLocalRXDiagnosticStrategy:
     """Observe or rewrite one initial host-originated AAP Configure Request."""
 
     def __init__(self, mode: AAPLocalRXProfile) -> None:
         validate_bumble_local_rx_api()
         self.mode = AAPLocalRXProfile(mode)
-        self._observation = AAPLocalRXConfigurationObservation(self.mode)
-        self._request_identifier: int | None = None
+        self._native_state = _native._LocalRXState(
+            self.mode is AAPLocalRXProfile.KERNEL_DEFAULT
+        )
 
     @property
     def observation(self) -> AAPLocalRXConfigurationObservation:
-        return self._observation
+        facts = self._native_state.snapshot()
+        facts["mode"] = AAPLocalRXProfile(facts["mode"])
+        facts["request_option_types"] = tuple(facts["request_option_types"])
+        facts["peer_response_option_types"] = tuple(
+            facts["peer_response_option_types"]
+        )
+        return AAPLocalRXConfigurationObservation(**facts)
 
     @contextmanager
     def __call__(self, manager: object) -> Iterator[None]:
@@ -212,42 +167,33 @@ class AAPLocalRXDiagnosticStrategy:
             channel = self._find_outgoing_aap_channel(
                 manager, connection, frame
             )
-            if channel is not None and not self._observation.request_observed:
+            if channel is not None and not self._native_state.request_observed:
                 assert isinstance(frame, l2cap.L2CAP_Configure_Request)
-                original_options = _decode_options(frame.options)
-                original_mtu = _mtu(original_options)
+                try:
+                    rewritten_bytes, _, _, original_mtu = _native.diagnostic_local_rx_rewrite(
+                        self.mode is AAPLocalRXProfile.KERNEL_DEFAULT,
+                        frame.options,
+                    )
+                except ValueError as error:
+                    raise AAPLocalRXDiagnosticError(str(error)) from error
                 if original_mtu is None:
                     raise AAPLocalRXDiagnosticError(
                         "reviewed Bumble AAP request did not contain MTU"
                     )
                 if self.mode is AAPLocalRXProfile.KERNEL_DEFAULT:
-                    rewritten_options = tuple(
-                        option
-                        for option in original_options
-                        if option.option_type
-                        != l2cap.L2CAP_Configure_Request.ParameterType.MTU
-                    )
                     outgoing = l2cap.L2CAP_Configure_Request(
                         identifier=frame.identifier,
                         destination_cid=frame.destination_cid,
                         flags=frame.flags,
-                        options=b"".join(
-                            option.encoded for option in rewritten_options
-                        ),
+                        options=rewritten_bytes,
                     )
-                emitted_options = _decode_options(outgoing.options)
-                self._request_identifier = outgoing.identifier
-                self._observation = AAPLocalRXConfigurationObservation(
-                    mode=self.mode,
-                    request_observed=True,
-                    request_option_types=tuple(
-                        option.option_type for option in emitted_options
-                    ),
-                    request_mtu=_mtu(emitted_options),
-                    request_flags=outgoing.flags,
-                    request_identifier=outgoing.identifier,
-                    request_destination_cid=outgoing.destination_cid,
-                    internal_receive_mtu=int(channel.mtu),
+                self._native_state.observe_request(
+                    self.mode is AAPLocalRXProfile.KERNEL_DEFAULT,
+                    frame.options,
+                    outgoing.flags,
+                    outgoing.identifier,
+                    outgoing.destination_cid,
+                    int(channel.mtu),
                 )
             installed_send(connection, cid, outgoing)
 
@@ -259,16 +205,12 @@ class AAPLocalRXDiagnosticStrategy:
             if self._is_matching_peer_response(
                 manager, connection, response
             ):
-                options = _decode_options(response.options)
-                self._observation = replace(
-                    self._observation,
-                    peer_response_observed=True,
-                    peer_response_result=int(response.result),
-                    peer_response_option_types=tuple(
-                        option.option_type for option in options
-                    ),
-                    peer_response_mtu=_mtu(options),
-                )
+                try:
+                    self._native_state.observe_response(
+                        int(response.result), response.options
+                    )
+                except ValueError as error:
+                    raise AAPLocalRXDiagnosticError(str(error)) from error
             installed_response(connection, cid, response)
 
         manager.send_control_frame = send_control_frame
@@ -308,10 +250,11 @@ class AAPLocalRXDiagnosticStrategy:
         connection: object,
         response: l2cap.L2CAP_Configure_Response,
     ) -> bool:
-        if (
-            not self._observation.request_observed
-            or response.identifier != self._request_identifier
-        ):
+        if not self._native_state.identifier_matches(response.identifier):
             return False
         channel = manager.find_channel(connection.handle, response.source_cid)
-        return channel is not None and channel.psm == AAP_PSM
+        return self._native_state.response_matches(
+            response.identifier,
+            channel.psm if channel is not None else None,
+            AAP_PSM,
+        )
