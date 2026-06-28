@@ -52,6 +52,37 @@ class MemorySink:
 
 
 class DiagnosticRecorderTests(unittest.TestCase):
+    def test_sink_failure_does_not_commit_native_lifecycle(self) -> None:
+        class FailOnceSink(MemorySink):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_next = True
+
+            def write_event(self, event: Mapping[str, Any]) -> None:
+                if self.fail_next:
+                    self.fail_next = False
+                    raise OSError("synthetic sink failure")
+                super().write_event(event)
+
+        sink = FailOnceSink()
+        recorder = self.make_recorder(sink, 0, 1, 2, 3, 4, 5)
+        with self.assertRaises(OSError):
+            recorder.start_session()
+        self.assertFalse(recorder.session_started)
+        recorder.start_session()
+        sink.fail_next = True
+        with self.assertRaises(OSError):
+            recorder.record_sample(parsed_report())
+        self.assertEqual(recorder.sample_events_emitted, 0)
+        recorder.record_sample(parsed_report())
+        sink.fail_next = True
+        with self.assertRaises(OSError):
+            recorder.stop_session("failed")
+        self.assertFalse(recorder.session_stopped)
+        recorder.stop_session("completed")
+        self.assertTrue(recorder.session_stopped)
+        self.assertEqual(recorder.sample_events_emitted, 1)
+
     def make_recorder(
         self,
         sink: MemorySink,

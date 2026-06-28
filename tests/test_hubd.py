@@ -1421,13 +1421,12 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/aap_config_diagnostics.py",
                 "airpods_hr/aap_local_rx_diagnostics.py",
                 "airpods_hr/classic_diagnostics.py",
+                "airpods_hr/heart_rate_diagnostics.py",
                 "airpods_hr/bluez_sdp_audit.py",
                 "airpods_hr/_hubd/protocol.py",
                 "airpods_hr/_hubd/server.py",
             },
         )
-
-
 
 
 class HubProbeTests(unittest.TestCase):

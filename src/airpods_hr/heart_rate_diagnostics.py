@@ -10,11 +10,20 @@ from pathlib import Path
 from time import monotonic_ns
 from typing import IO, Any, Protocol
 
+from airpods_hr import _airpods_aap_core as _native
 from airpods_hr.heartrate import HeartRateReport
-from airpods_hr.protocol import HEART_RATE_REPORT_SIZE
 
 
-DIAGNOSTIC_SCHEMA_VERSION = 1
+DIAGNOSTIC_SCHEMA_VERSION = _native.diagnostic_schema_version()
+
+
+def _report_fields(report: HeartRateReport) -> list[int]:
+    return [report.bpm, report.aux, report.sequence, report.field_5,
+            report.timestamp_ticks, report.flags]
+
+
+def _state_error(error: ValueError) -> DiagnosticStateError:
+    return DiagnosticStateError(str(error))
 
 
 class HeartRateDiagnosticError(RuntimeError):
@@ -98,34 +107,15 @@ class DiagnosticSample:
     report: HeartRateReport
 
     def as_event(self) -> dict[str, int | str]:
-        report = self.report
-        return {
-            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
-            "event": "heart_rate_sample",
-            "host_monotonic_ns": self.host_monotonic_ns,
-            "elapsed_ms": self.elapsed_ms,
-            "bpm": report.bpm,
-            "aux": report.aux,
-            "sequence": report.sequence,
-            "field_5": report.field_5,
-            "timestamp_ticks": report.timestamp_ticks,
-            "flags": report.flags,
-            "raw_report_hex": report.raw_report.hex(),
-        }
+        return _native.diagnostic_sample_event_values(
+            self.host_monotonic_ns, self.elapsed_ms,
+            _report_fields(self.report), self.report.raw_report,
+        )
 
     def format_human(self) -> str:
-        event = self.as_event()
-        return (
-            "Heart rate diagnostic: "
-            f"host_monotonic_ns={event['host_monotonic_ns']} "
-            f"elapsed_ms={event['elapsed_ms']} "
-            f"bpm={event['bpm']} "
-            f"aux={event['aux']} "
-            f"sequence={event['sequence']} "
-            f"field_5={event['field_5']} "
-            f"timestamp_ticks={event['timestamp_ticks']} "
-            f"flags={event['flags']} "
-            f"raw_report_hex={event['raw_report_hex']}"
+        return _native.diagnostic_sample_human_values(
+            self.host_monotonic_ns, self.elapsed_ms,
+            _report_fields(self.report), self.report.raw_report,
         )
 
 
@@ -142,68 +132,66 @@ class HeartRateDiagnosticRecorder:
         self._sink = sink
         self._monotonic_clock_ns = monotonic_clock_ns
         self._utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
-        self._session_reference_ns: int | None = None
-        self._sample_events_emitted = 0
-        self._stopped = False
+        self._native_state = _native._DiagnosticRecorderState()
         self._closed = False
 
     @property
     def sample_events_emitted(self) -> int:
-        return self._sample_events_emitted
+        return self._native_state.sample_events_emitted
 
     @property
     def session_started(self) -> bool:
-        return self._session_reference_ns is not None
+        return self._native_state.session_started
 
     @property
     def session_stopped(self) -> bool:
-        return self._stopped
+        return self._native_state.session_stopped
 
     def start_session(self) -> None:
-        if self._session_reference_ns is not None:
-            raise DiagnosticStateError("diagnostic session is already started")
+        try:
+            self._native_state.check_start()
+        except ValueError as error:
+            raise _state_error(error) from error
         reference_ns = self._monotonic_clock_ns()
         wall_clock = self._utc_clock().astimezone(timezone.utc)
-        event: dict[str, int | str] = {
-            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
-            "event": "session_start",
-            "host_monotonic_reference_ns": reference_ns,
-            "wall_clock_utc": wall_clock.isoformat().replace("+00:00", "Z"),
-        }
+        try:
+            token, event = self._native_state.plan_start(
+                reference_ns, wall_clock.isoformat().replace("+00:00", "Z")
+            )
+        except ValueError as error:
+            raise _state_error(error) from error
         self._write_event(event)
-        self._session_reference_ns = reference_ns
+        self._native_state.commit_start(token)
 
     def record_sample(self, report: HeartRateReport) -> DiagnosticSample:
-        reference_ns = self._require_active_session()
-        if not isinstance(report.raw_report, bytes) or len(report.raw_report) != (
-            HEART_RATE_REPORT_SIZE
-        ):
-            raise DiagnosticStateError(
-                "parsed report does not retain the validated 18-byte payload"
-            )
+        self._require_active_session()
+        try:
+            _native.diagnostic_validate_raw(report.raw_report)
+        except ValueError as error:
+            raise _state_error(error) from error
         observed_ns = self._monotonic_clock_ns()
-        sample = DiagnosticSample(
-            host_monotonic_ns=observed_ns,
-            elapsed_ms=(observed_ns - reference_ns) // 1_000_000,
-            report=report,
-        )
-        self._write_event(sample.as_event())
-        self._sample_events_emitted += 1
+        try:
+            token, event = self._native_state.plan_sample(
+                observed_ns, _report_fields(report), report.raw_report
+            )
+        except ValueError as error:
+            raise _state_error(error) from error
+        self._write_event(event)
+        self._native_state.commit_sample(token)
+        sample = DiagnosticSample(observed_ns, event["elapsed_ms"], report)
         return sample
 
     def stop_session(self, termination_reason: str) -> None:
-        reference_ns = self._require_active_session()
+        self._require_active_session()
         stopped_ns = self._monotonic_clock_ns()
-        event: dict[str, int | str] = {
-            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
-            "event": "session_stop",
-            "host_monotonic_ns": stopped_ns,
-            "elapsed_ms": (stopped_ns - reference_ns) // 1_000_000,
-            "heart_rate_samples_emitted": self._sample_events_emitted,
-            "termination_reason": termination_reason,
-        }
+        try:
+            token, event = self._native_state.plan_stop(
+                stopped_ns, termination_reason
+            )
+        except ValueError as error:
+            raise _state_error(error) from error
         self._write_event(event)
-        self._stopped = True
+        self._native_state.commit_stop(token)
 
     def close(self) -> None:
         if self._closed:
@@ -213,9 +201,10 @@ class HeartRateDiagnosticRecorder:
             self._sink.close()
 
     def _require_active_session(self) -> int:
-        if self._session_reference_ns is None or self._stopped:
-            raise DiagnosticStateError("diagnostic session is not active")
-        return self._session_reference_ns
+        try:
+            return self._native_state.check_active()
+        except ValueError as error:
+            raise _state_error(error) from error
 
     def _write_event(self, event: Mapping[str, Any]) -> None:
         if self._sink is not None:
