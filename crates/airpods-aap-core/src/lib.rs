@@ -18,6 +18,7 @@ pub mod pre_aap_diagnostics;
 pub mod pre_auth_diagnostics;
 mod production;
 mod recovery;
+pub mod runtime_policy;
 pub mod semantics;
 
 pub use activation::{
