@@ -165,21 +165,95 @@ impl TransportPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthenticationState {
+    Start,
+    Selected,
+    Connected,
+    Authenticated,
+    Encrypted,
+    Active,
+    DisconnectAttempted,
+    Disconnected,
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthenticationEvent {
+    Select,
+    Connect,
+    Authenticate,
+    Encrypt,
+    Yield,
+    AttemptDisconnect,
+    Disconnected,
+}
 
+#[must_use]
+pub fn authentication_transition(
+    state: AuthenticationState,
+    event: AuthenticationEvent,
+) -> Option<AuthenticationState> {
+    use AuthenticationEvent as E;
+    use AuthenticationState as S;
+    match (state, event) {
+        (S::Start, E::Select) => Some(S::Selected),
+        (S::Selected, E::Connect) => Some(S::Connected),
+        (S::Connected, E::Authenticate) => Some(S::Authenticated),
+        (S::Authenticated, E::Encrypt) => Some(S::Encrypted),
+        (S::Encrypted, E::Yield) => Some(S::Active),
+        (S::Connected | S::Authenticated | S::Encrypted | S::Active, E::AttemptDisconnect) => {
+            Some(S::DisconnectAttempted)
+        }
+        (S::DisconnectAttempted, E::Disconnected) => Some(S::Disconnected),
+        _ => None,
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Observation {
+    Success,
+    AuthenticationNotObserved,
+    EncryptionNotObserved,
+}
 
+#[must_use]
+pub fn authentication_observation(authenticated: bool) -> Observation {
+    if authenticated {
+        Observation::Success
+    } else {
+        Observation::AuthenticationNotObserved
+    }
+}
 
+#[must_use]
+pub fn encryption_observation(encrypted: bool) -> Observation {
+    if encrypted {
+        Observation::Success
+    } else {
+        Observation::EncryptionNotObserved
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cleanup {
+    EmitDisconnected,
+    NotePrimary,
+    PropagateCancellation,
+    RaiseDisconnectError,
+}
 
-
-
-
-
-
-
-
-
+#[must_use]
+pub fn disconnect_cleanup(primary_error: bool, cleanup_error: bool, cancelled: bool) -> Cleanup {
+    if !cleanup_error {
+        Cleanup::EmitDisconnected
+    } else if primary_error {
+        Cleanup::NotePrimary
+    } else if cancelled {
+        Cleanup::PropagateCancellation
+    } else {
+        Cleanup::RaiseDisconnectError
+    }
+}
 
 
 
@@ -283,7 +357,74 @@ mod tests {
         }
     }
 
-    
+    #[test]
+    fn lifecycle_matrix_and_cleanup() {
+        use AuthenticationEvent as E;
+        use AuthenticationState as S;
+        let path = [
+            (S::Start, E::Select, S::Selected),
+            (S::Selected, E::Connect, S::Connected),
+            (S::Connected, E::Authenticate, S::Authenticated),
+            (S::Authenticated, E::Encrypt, S::Encrypted),
+            (S::Encrypted, E::Yield, S::Active),
+            (S::Active, E::AttemptDisconnect, S::DisconnectAttempted),
+            (S::DisconnectAttempted, E::Disconnected, S::Disconnected),
+        ];
+        for (state, event, expected) in path {
+            assert_eq!(authentication_transition(state, event), Some(expected));
+        }
+        for state in [
+            S::Start,
+            S::Selected,
+            S::Connected,
+            S::Authenticated,
+            S::Encrypted,
+            S::Active,
+            S::DisconnectAttempted,
+            S::Disconnected,
+        ] {
+            for event in [
+                E::Select,
+                E::Connect,
+                E::Authenticate,
+                E::Encrypt,
+                E::Yield,
+                E::AttemptDisconnect,
+                E::Disconnected,
+            ] {
+                let legal = path.iter().any(|(s, e, _)| *s == state && *e == event)
+                    || matches!(
+                        (state, event),
+                        (
+                            S::Connected | S::Authenticated | S::Encrypted,
+                            E::AttemptDisconnect
+                        )
+                    );
+                assert_eq!(authentication_transition(state, event).is_some(), legal);
+            }
+        }
+        assert_eq!(
+            authentication_observation(false),
+            Observation::AuthenticationNotObserved
+        );
+        assert_eq!(
+            encryption_observation(false),
+            Observation::EncryptionNotObserved
+        );
+        assert_eq!(
+            disconnect_cleanup(false, false, false),
+            Cleanup::EmitDisconnected
+        );
+        assert_eq!(disconnect_cleanup(true, true, true), Cleanup::NotePrimary);
+        assert_eq!(
+            disconnect_cleanup(false, true, true),
+            Cleanup::PropagateCancellation
+        );
+        assert_eq!(
+            disconnect_cleanup(false, true, false),
+            Cleanup::RaiseDisconnectError
+        );
+    }
 
     
 
