@@ -11,6 +11,7 @@ mod activation;
 mod analysis;
 pub mod classic_diagnostics;
 mod control;
+pub mod handshake;
 mod heart_rate;
 pub mod heart_rate_diagnostics;
 pub mod pre_aap_diagnostics;

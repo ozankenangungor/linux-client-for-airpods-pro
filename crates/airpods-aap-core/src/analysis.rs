@@ -25,6 +25,11 @@ pub struct DescriptorEvidence {
 
 impl DescriptorEvidence {
     #[must_use]
+    pub fn required(self) -> bool {
+        self.sensor_framework && self.heart_rate_service
+    }
+
+    #[must_use]
     pub fn merged(self, frame: &[u8]) -> Self {
         Self {
             sensor_framework: self.sensor_framework
