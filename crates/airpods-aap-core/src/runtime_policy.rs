@@ -255,31 +255,140 @@ pub fn disconnect_cleanup(primary_error: bool, cleanup_error: bool, cancelled: b
     }
 }
 
+#[must_use]
+pub fn poll_delay(poll_interval: f64, deadline: f64, now: f64) -> f64 {
+    poll_interval.min((deadline - now).max(0.0))
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Restoration {
+    NeverObserved,
+    LastSetFailed,
+    Generic,
+}
 
+#[must_use]
+pub fn restoration(saw_adapter: bool, last_set_failed: bool) -> Restoration {
+    if !saw_adapter {
+        Restoration::NeverObserved
+    } else if last_set_failed {
+        Restoration::LastSetFailed
+    } else {
+        Restoration::Generic
+    }
+}
 
+#[must_use]
+pub fn reopen_checkpoint_holds(
+    bluez_reachable: bool,
+    adapter_powered: bool,
+    device_connected: bool,
+) -> bool {
+    bluez_reachable && adapter_powered && device_connected
+}
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReopenObservationCounters {
+    pub handshake_attempts: usize,
+    pub handshake_completed: usize,
+    pub transport_opens: usize,
+    pub transport_closes: usize,
+}
 
+impl ReopenObservationCounters {
+    pub fn handshake_attempt(&mut self) {
+        self.handshake_attempts += 1;
+    }
+    pub fn handshake_complete(&mut self) {
+        self.handshake_completed += 1;
+    }
+    pub fn transport_open(&mut self) {
+        self.transport_opens += 1;
+    }
+    pub fn transport_close(&mut self) {
+        self.transport_closes += 1;
+    }
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenCategory {
+    BothPass,
+    DescriptorTimeout,
+    AckFailure,
+    TransportFailure,
+    BluezChanged,
+    OtherFailure,
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Session1Mode {
+    HrCycle,
+    DescriptorOnly,
+}
 
+impl Session1Mode {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hr-cycle" => Some(Self::HrCycle),
+            "descriptor-only" => Some(Self::DescriptorOnly),
+            _ => None,
+        }
+    }
 
+    #[must_use]
+    pub fn activate_hr(self) -> bool {
+        matches!(self, Self::HrCycle)
+    }
+}
 
+#[must_use]
+pub fn reopen_failure_category(
+    descriptor_timeout: bool,
+    ack_timeout: bool,
+    ack_observed: Option<bool>,
+    preflight_failed: bool,
+    transport_failed: bool,
+) -> ReopenCategory {
+    if descriptor_timeout && ack_observed == Some(true) {
+        ReopenCategory::DescriptorTimeout
+    } else if ack_timeout && ack_observed != Some(true) {
+        ReopenCategory::AckFailure
+    } else if preflight_failed {
+        ReopenCategory::BluezChanged
+    } else if transport_failed {
+        ReopenCategory::TransportFailure
+    } else {
+        ReopenCategory::OtherFailure
+    }
+}
 
-
-
-
-
-
-
-
-
-
-
+/// Inputs are per-session neutral counts:
+/// transport opens/closes, handshake attempts/completions, ACKs,
+/// HR activations/stops, received reports.
+#[must_use]
+pub fn aggregate_reopen_counts(rows: &[[usize; 8]]) -> [usize; 12] {
+    let mut result = [0; 12];
+    result[0] = rows.len();
+    for row in rows {
+        for index in 0..7 {
+            result[index + 1] += row[index];
+        }
+    }
+    if let Some(first) = rows.first() {
+        result[8] = first[5];
+        result[9] = first[6];
+        result[10] = first[7];
+    }
+    if let Some(second) = rows.get(1) {
+        result[11] = second[7];
+    }
+    result
+}
 
 #[cfg(test)]
 mod tests {
-    use super :: * ;
+    use super::*;
 
     #[test]
     fn channel_precedence_and_boundaries() {
@@ -426,9 +535,73 @@ mod tests {
         );
     }
 
-    
+    #[test]
+    fn controller_and_reopen_policy() {
+        assert!(positive_timeouts(&[0.1, 1.0]));
+        assert!(!positive_timeouts(&[0.0]));
+        assert!(!positive_timeouts(&[-1.0]));
+        assert!(!positive_timeouts(&[f64::NAN]));
+        assert_eq!(poll_delay(0.1, 3.0, 2.95), 3.0 - 2.95);
+        assert_eq!(poll_delay(0.1, 3.0, 4.0), 0.0);
+        assert_eq!(restoration(false, true), Restoration::NeverObserved);
+        assert_eq!(restoration(true, true), Restoration::LastSetFailed);
+        assert_eq!(restoration(true, false), Restoration::Generic);
+        for bits in 0..8 {
+            assert_eq!(
+                reopen_checkpoint_holds(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0),
+                bits == 7
+            );
+        }
+    }
 
-    
+    #[test]
+    fn reopen_counts_and_failure_precedence() {
+        assert_eq!(Session1Mode::parse("hr-cycle"), Some(Session1Mode::HrCycle));
+        assert_eq!(
+            Session1Mode::parse("descriptor-only"),
+            Some(Session1Mode::DescriptorOnly)
+        );
+        assert_eq!(Session1Mode::parse("HR-CYCLE"), None);
+        assert_eq!(Session1Mode::parse(""), None);
+        assert!(Session1Mode::HrCycle.activate_hr());
+        assert!(!Session1Mode::DescriptorOnly.activate_hr());
+        let mut counters = ReopenObservationCounters::default();
+        counters.handshake_attempt();
+        counters.handshake_complete();
+        counters.transport_open();
+        counters.transport_close();
+        assert_eq!(counters.handshake_attempts, 1);
+        assert_eq!(counters.handshake_completed, 1);
+        assert_eq!(counters.transport_opens, 1);
+        assert_eq!(counters.transport_closes, 1);
+        let first = [1, 1, 1, 1, 1, 2, 2, 5];
+        let second = [1, 1, 1, 0, 1, 0, 0, 3];
+        assert_eq!(aggregate_reopen_counts(&[]), [0; 12]);
+        assert_eq!(
+            aggregate_reopen_counts(&[first, second]),
+            [2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 5, 3]
+        );
+        assert_eq!(
+            reopen_failure_category(true, true, Some(true), true, true),
+            ReopenCategory::DescriptorTimeout
+        );
+        assert_eq!(
+            reopen_failure_category(false, true, None, true, true),
+            ReopenCategory::AckFailure
+        );
+        assert_eq!(
+            reopen_failure_category(false, false, None, true, true),
+            ReopenCategory::BluezChanged
+        );
+        assert_eq!(
+            reopen_failure_category(false, false, None, false, true),
+            ReopenCategory::TransportFailure
+        );
+        assert_eq!(
+            reopen_failure_category(false, false, None, false, false),
+            ReopenCategory::OtherFailure
+        );
+    }
 
     #[test]
     fn transport_send_legality_is_closed_and_ordered() {
@@ -557,7 +730,63 @@ mod tests {
         assert_eq!(display_name(Some(""), Some("")), "AirPods");
     }
 
-    
+    #[test]
+    fn cleanup_truth_table_and_restore_precedence() {
+        for primary in [false, true] {
+            for failure in [false, true] {
+                for cancelled in [false, true] {
+                    let expected = if !failure {
+                        Cleanup::EmitDisconnected
+                    } else if primary {
+                        Cleanup::NotePrimary
+                    } else if cancelled {
+                        Cleanup::PropagateCancellation
+                    } else {
+                        Cleanup::RaiseDisconnectError
+                    };
+                    assert_eq!(disconnect_cleanup(primary, failure, cancelled), expected);
+                }
+            }
+        }
+        for seen in [false, true] {
+            for last_set_failed in [false, true] {
+                let expected = if !seen {
+                    Restoration::NeverObserved
+                } else if last_set_failed {
+                    Restoration::LastSetFailed
+                } else {
+                    Restoration::Generic
+                };
+                assert_eq!(restoration(seen, last_set_failed), expected);
+            }
+        }
+    }
 
-    
+    #[test]
+    fn seeded_aggregate_counts_match_independent_column_sums() {
+        let mut seed = 0x88f1_c2d3_u64;
+        for count in 0..100 {
+            let mut rows = Vec::new();
+            for _ in 0..count {
+                let mut row = [0; 8];
+                for cell in &mut row {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *cell = ((seed >> 32) % 1000) as usize;
+                }
+                rows.push(row);
+            }
+            let aggregate = aggregate_reopen_counts(&rows);
+            assert_eq!(aggregate[0], count);
+            for column in 0..7 {
+                assert_eq!(
+                    aggregate[column + 1],
+                    rows.iter().map(|row| row[column]).sum::<usize>()
+                );
+            }
+            assert_eq!(aggregate[8], rows.first().map_or(0, |row| row[5]));
+            assert_eq!(aggregate[9], rows.first().map_or(0, |row| row[6]));
+            assert_eq!(aggregate[10], rows.first().map_or(0, |row| row[7]));
+            assert_eq!(aggregate[11], rows.get(1).map_or(0, |row| row[7]));
+        }
+    }
 }
