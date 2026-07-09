@@ -1,7 +1,7 @@
 //! Neutral Python bindings for pure runtime decisions.
 
 use airpods_aap_core :: handshake :: { HandshakeAccumulator , expected_payload_count } ;
-use airpods_aap_core :: runtime_policy :: { CandidateCount , ChannelFacts , TransportLegality , TransportPolicy , TransportSend , adapter_index_digits , candidate_count , channel_facts , display_name , positive_timeouts , supported_airpods_name , transport_legality } ;
+use airpods_aap_core :: runtime_policy :: { AuthenticationEvent , AuthenticationState , CandidateCount , ChannelFacts , Cleanup , Observation , TransportLegality , TransportPolicy , TransportSend , adapter_index_digits , authentication_observation , authentication_transition , candidate_count , channel_facts , disconnect_cleanup , display_name , encryption_observation , positive_timeouts , supported_airpods_name , transport_legality } ;
 use airpods_aap_core :: { AapFrameSummary , AapType2bFrameSummary , DescriptorEvidence } ;
 use pyo3 :: exceptions :: PyValueError ;
 use pyo3 :: prelude :: * ;
@@ -266,23 +266,124 @@ impl PyTransportPolicy {
     }
 }
 
+fn auth_state(value: u8) -> PyResult<AuthenticationState> {
+    use AuthenticationState as S;
+    match value {
+        0 => Ok(S::Start),
+        1 => Ok(S::Selected),
+        2 => Ok(S::Connected),
+        3 => Ok(S::Authenticated),
+        4 => Ok(S::Encrypted),
+        5 => Ok(S::Active),
+        6 => Ok(S::DisconnectAttempted),
+        7 => Ok(S::Disconnected),
+        _ => Err(PyValueError::new_err("invalid authentication state")),
+    }
+}
 
+fn auth_event(value: u8) -> PyResult<AuthenticationEvent> {
+    use AuthenticationEvent as E;
+    match value {
+        0 => Ok(E::Select),
+        1 => Ok(E::Connect),
+        2 => Ok(E::Authenticate),
+        3 => Ok(E::Encrypt),
+        4 => Ok(E::Yield),
+        5 => Ok(E::AttemptDisconnect),
+        6 => Ok(E::Disconnected),
+        _ => Err(PyValueError::new_err("invalid authentication event")),
+    }
+}
 
+fn auth_state_id(value: AuthenticationState) -> u8 {
+    use AuthenticationState as S;
+    match value {
+        S::Start => 0,
+        S::Selected => 1,
+        S::Connected => 2,
+        S::Authenticated => 3,
+        S::Encrypted => 4,
+        S::Active => 5,
+        S::DisconnectAttempted => 6,
+        S::Disconnected => 7,
+    }
+}
 
+#[pyfunction]
+fn runtime_authentication_transition(state: u8, event: u8) -> PyResult<u8> {
+    authentication_transition(auth_state(state)?, auth_event(event)?)
+        .map(auth_state_id)
+        .ok_or_else(|| PyValueError::new_err("illegal authentication transition"))
+}
 
+#[pyclass(
+    name = "AuthenticationLifecycle",
+    module = "airpods_hr._airpods_aap_core"
+)]
+pub struct PyAuthenticationLifecycle {
+    state: AuthenticationState,
+    replacement_key_reported: bool,
+}
 
+#[pymethods]
+impl PyAuthenticationLifecycle {
+    #[new]
+    fn new() -> Self {
+        Self {
+            state: AuthenticationState::Start,
+            replacement_key_reported: false,
+        }
+    }
 
+    fn advance(&mut self, event: u8) -> PyResult<u8> {
+        let next = authentication_transition(self.state, auth_event(event)?)
+            .ok_or_else(|| PyValueError::new_err("illegal authentication transition"))?;
+        self.state = next;
+        Ok(auth_state_id(next))
+    }
 
+    fn report_replacement_key(&mut self) {
+        self.replacement_key_reported = true;
+    }
 
+    #[getter]
+    fn replacement_key_reported(&self) -> bool {
+        self.replacement_key_reported
+    }
 
+    #[getter]
+    fn state(&self) -> u8 {
+        auth_state_id(self.state)
+    }
+}
 
+#[pyfunction]
+fn runtime_authentication_observation(observed: bool) -> u8 {
+    match authentication_observation(observed) {
+        Observation::Success => 0,
+        Observation::AuthenticationNotObserved => 1,
+        Observation::EncryptionNotObserved => unreachable!(),
+    }
+}
 
+#[pyfunction]
+fn runtime_encryption_observation(observed: bool) -> u8 {
+    match encryption_observation(observed) {
+        Observation::Success => 0,
+        Observation::EncryptionNotObserved => 2,
+        Observation::AuthenticationNotObserved => unreachable!(),
+    }
+}
 
-
-
-
-
-
+#[pyfunction]
+fn runtime_disconnect_cleanup(primary: bool, failed: bool, cancelled: bool) -> u8 {
+    match disconnect_cleanup(primary, failed, cancelled) {
+        Cleanup::EmitDisconnected => 0,
+        Cleanup::NotePrimary => 1,
+        Cleanup::PropagateCancellation => 2,
+        Cleanup::RaiseDisconnectError => 3,
+    }
+}
 
 
 
@@ -302,7 +403,8 @@ impl PyTransportPolicy {
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyHandshakeAccumulator>()?;
-            module.add_class::<PyTransportPolicy>()?;
+    module.add_class::<PyAuthenticationLifecycle>()?;
+        module.add_class::<PyTransportPolicy>()?;
     module.add_function(wrap_pyfunction!(runtime_positive_timeouts, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_expected_payload_count, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_descriptors_required, module)?)?;
@@ -313,5 +415,12 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(runtime_optional_string, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_candidate_count, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_transport_legality, module)?)?;
-                                            Ok(())
+    module.add_function(wrap_pyfunction!(runtime_authentication_transition, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        runtime_authentication_observation,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(runtime_encryption_observation, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_disconnect_cleanup, module)?)?;
+                            Ok(())
 }

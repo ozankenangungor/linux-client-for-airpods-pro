@@ -81,4 +81,26 @@ class RuntimePolicyBindingsTests(unittest.TestCase):
             self.assertIsNone(self.native.runtime_adapter_digits(bad))
         self.assertEqual([self.native.runtime_candidate_count(n) for n in (0, 1, 2, 100)], [0, 1, 2, 2])
 
+    def test_authentication_lifecycle_and_cleanup(self):
+        state = self.native.AuthenticationLifecycle()
+        self.assertEqual(state.state, 0)
+        with self.assertRaises(ValueError):
+            state.advance(1)
+        for event, expected in enumerate((1, 2, 3, 4, 5)):
+            self.assertEqual(state.advance(event), expected)
+        self.assertFalse(state.replacement_key_reported)
+        state.report_replacement_key()
+        self.assertTrue(state.replacement_key_reported)
+        self.assertEqual(state.advance(5), 6)
+        self.assertEqual(state.advance(6), 7)
+        with self.assertRaises(ValueError):
+            state.advance(5)
+        self.assertEqual(self.native.runtime_authentication_observation(False), 1)
+        self.assertEqual(self.native.runtime_encryption_observation(False), 2)
+        self.assertEqual(
+            [self.native.runtime_disconnect_cleanup(*facts) for facts in
+             ((False, False, False), (True, True, True), (False, True, True), (False, True, False))],
+            [0, 1, 2, 3],
+        )
+
 
