@@ -103,4 +103,40 @@ class RuntimePolicyBindingsTests(unittest.TestCase):
             [0, 1, 2, 3],
         )
 
+    def test_controller_and_reopen_bindings(self):
+        self.assertEqual(self.native.runtime_poll_delay(0.1, 2.0, 3.0), 0.0)
+        self.assertEqual(self.native.runtime_restoration(False, True), 0)
+        self.assertEqual(self.native.runtime_restoration(True, True), 1)
+        self.assertEqual(self.native.runtime_restoration(True, False), 2)
+        for mask in range(8):
+            self.assertEqual(
+                self.native.runtime_reopen_checkpoint_holds(
+                    bool(mask & 1), bool(mask & 2), bool(mask & 4)
+                ), mask == 7
+            )
+        counts = self.native.ReopenObservationCounters()
+        counts.handshake_attempt()
+        counts.handshake_complete()
+        counts.transport_open()
+        counts.transport_close()
+        self.assertEqual(
+            (counts.attempts, counts.completed, counts.open_calls, counts.close_calls),
+            (1, 1, 1, 1),
+        )
+        self.assertEqual(
+            self.native.runtime_aggregate_reopen_counts([[1, 1, 1, 1, 1, 2, 2, 5]]),
+            [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 5, 0],
+        )
+        self.assertEqual(self.native.runtime_reopen_failure_category(True, True, True, True, True), 1)
+        self.assertEqual(self.native.runtime_reopen_failure_category(False, True, None, True, True), 2)
+        self.assertEqual(self.native.runtime_reopen_failure_category(False, False, None, True, True), 4)
+        self.assertEqual(self.native.runtime_reopen_failure_category(False, False, None, False, True), 3)
+        self.assertEqual(self.native.runtime_reopen_failure_category(False, False, None, False, False), 5)
+        self.assertTrue(self.native.runtime_session1_activate_hr("hr-cycle"))
+        self.assertFalse(self.native.runtime_session1_activate_hr("descriptor-only"))
+        with self.assertRaises(ValueError):
+            self.native.runtime_session1_activate_hr("HR-CYCLE")
 
+
+if __name__ == "__main__":
+    unittest.main()

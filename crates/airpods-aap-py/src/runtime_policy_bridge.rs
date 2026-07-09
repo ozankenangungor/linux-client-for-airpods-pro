@@ -1,11 +1,19 @@
 //! Neutral Python bindings for pure runtime decisions.
 
-use airpods_aap_core :: handshake :: { HandshakeAccumulator , expected_payload_count } ;
-use airpods_aap_core :: runtime_policy :: { AuthenticationEvent , AuthenticationState , CandidateCount , ChannelFacts , Cleanup , Observation , TransportLegality , TransportPolicy , TransportSend , adapter_index_digits , authentication_observation , authentication_transition , candidate_count , channel_facts , disconnect_cleanup , display_name , encryption_observation , positive_timeouts , supported_airpods_name , transport_legality } ;
-use airpods_aap_core :: { AapFrameSummary , AapType2bFrameSummary , DescriptorEvidence } ;
-use pyo3 :: exceptions :: PyValueError ;
-use pyo3 :: prelude :: * ;
-use pyo3 :: types :: { PyAny , PyBytes , PyModule , PyString } ;
+use airpods_aap_core::handshake::{HandshakeAccumulator, expected_payload_count};
+use airpods_aap_core::runtime_policy::{
+    AuthenticationEvent, AuthenticationState, CandidateCount, ChannelFacts, Cleanup, Observation,
+    ReopenCategory, ReopenObservationCounters, Restoration, Session1Mode, TransportLegality,
+    TransportPolicy, TransportSend, adapter_index_digits, aggregate_reopen_counts,
+    authentication_observation, authentication_transition, candidate_count, channel_facts,
+    disconnect_cleanup, display_name, encryption_observation, poll_delay, positive_timeouts,
+    reopen_checkpoint_holds, reopen_failure_category, restoration, supported_airpods_name,
+    transport_legality,
+};
+use airpods_aap_core::{AapFrameSummary, AapType2bFrameSummary, DescriptorEvidence};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyModule, PyString};
 
 type Type2bValues = (
     usize,
@@ -385,26 +393,112 @@ fn runtime_disconnect_cleanup(primary: bool, failed: bool, cancelled: bool) -> u
     }
 }
 
+#[pyfunction]
+fn runtime_poll_delay(interval: f64, deadline: f64, now: f64) -> f64 {
+    poll_delay(interval, deadline, now)
+}
 
+#[pyfunction]
+fn runtime_restoration(saw_adapter: bool, last_set_failed: bool) -> u8 {
+    match restoration(saw_adapter, last_set_failed) {
+        Restoration::NeverObserved => 0,
+        Restoration::LastSetFailed => 1,
+        Restoration::Generic => 2,
+    }
+}
 
+#[pyfunction]
+fn runtime_reopen_checkpoint_holds(reachable: bool, powered: bool, connected: bool) -> bool {
+    reopen_checkpoint_holds(reachable, powered, connected)
+}
 
+#[pyclass(
+    name = "ReopenObservationCounters",
+    module = "airpods_hr._airpods_aap_core"
+)]
+pub struct PyReopenObservationCounters {
+    inner: ReopenObservationCounters,
+}
 
+#[pymethods]
+impl PyReopenObservationCounters {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: ReopenObservationCounters::default(),
+        }
+    }
+    fn handshake_attempt(&mut self) {
+        self.inner.handshake_attempt();
+    }
+    fn handshake_complete(&mut self) {
+        self.inner.handshake_complete();
+    }
+    fn transport_open(&mut self) {
+        self.inner.transport_open();
+    }
+    fn transport_close(&mut self) {
+        self.inner.transport_close();
+    }
+    #[getter]
+    fn attempts(&self) -> usize {
+        self.inner.handshake_attempts
+    }
+    #[getter]
+    fn completed(&self) -> usize {
+        self.inner.handshake_completed
+    }
+    #[getter]
+    fn open_calls(&self) -> usize {
+        self.inner.transport_opens
+    }
+    #[getter]
+    fn close_calls(&self) -> usize {
+        self.inner.transport_closes
+    }
+}
 
+#[pyfunction]
+fn runtime_reopen_failure_category(
+    descriptor_timeout: bool,
+    ack_timeout: bool,
+    ack_observed: Option<bool>,
+    preflight_failed: bool,
+    transport_failed: bool,
+) -> u8 {
+    match reopen_failure_category(
+        descriptor_timeout,
+        ack_timeout,
+        ack_observed,
+        preflight_failed,
+        transport_failed,
+    ) {
+        ReopenCategory::BothPass => 0,
+        ReopenCategory::DescriptorTimeout => 1,
+        ReopenCategory::AckFailure => 2,
+        ReopenCategory::TransportFailure => 3,
+        ReopenCategory::BluezChanged => 4,
+        ReopenCategory::OtherFailure => 5,
+    }
+}
 
+#[pyfunction]
+fn runtime_session1_activate_hr(mode: &str) -> PyResult<bool> {
+    Session1Mode::parse(mode)
+        .map(Session1Mode::activate_hr)
+        .ok_or_else(|| PyValueError::new_err("invalid session 1 mode"))
+}
 
-
-
-
-
-
-
-
-
+#[pyfunction]
+fn runtime_aggregate_reopen_counts(rows: Vec<[usize; 8]>) -> Vec<usize> {
+    aggregate_reopen_counts(&rows).to_vec()
+}
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyHandshakeAccumulator>()?;
     module.add_class::<PyAuthenticationLifecycle>()?;
-        module.add_class::<PyTransportPolicy>()?;
+    module.add_class::<PyReopenObservationCounters>()?;
+    module.add_class::<PyTransportPolicy>()?;
     module.add_function(wrap_pyfunction!(runtime_positive_timeouts, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_expected_payload_count, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_descriptors_required, module)?)?;
@@ -422,5 +516,11 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(runtime_encryption_observation, module)?)?;
     module.add_function(wrap_pyfunction!(runtime_disconnect_cleanup, module)?)?;
-                            Ok(())
+    module.add_function(wrap_pyfunction!(runtime_poll_delay, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_restoration, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_reopen_checkpoint_holds, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_reopen_failure_category, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_session1_activate_hr, module)?)?;
+    module.add_function(wrap_pyfunction!(runtime_aggregate_reopen_counts, module)?)?;
+    Ok(())
 }
