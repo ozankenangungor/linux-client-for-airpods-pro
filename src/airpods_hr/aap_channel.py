@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import AsyncContextManager, Protocol, TypeVar
 
 from bumble import l2cap
+import airpods_hr._airpods_aap_core as _rust_core
 
 from airpods_hr.authentication import AuthenticatedClassicContext
 from airpods_hr.bumble_compat import aap_flush_timeout_compatibility
@@ -100,7 +101,7 @@ class AAPChannelSession:
         progress: AAPProgressCallback | None = None,
         wait_for: WaitFor = asyncio.wait_for,
     ) -> None:
-        if open_timeout <= 0 or close_timeout <= 0:
+        if not _rust_core.runtime_positive_timeouts((open_timeout, close_timeout)):
             raise ValueError("AAP channel timeouts must be positive")
         self._open_timeout = open_timeout
         self._close_timeout = close_timeout
@@ -203,21 +204,25 @@ class AAPChannelSession:
     @staticmethod
     def _verify_open_channel(channel: object) -> None:
         try:
-            is_open = channel.state == l2cap.ClassicChannel.State.OPEN
-            is_basic = channel.mode == l2cap.TransmissionMode.BASIC
-            is_aap = channel.psm == AAP_PSM
-            valid_mtus = int(channel.mtu) > 0 and int(channel.peer_mtu) > 0
+            verdict = _rust_core.runtime_channel_facts(
+                channel.state == l2cap.ClassicChannel.State.OPEN,
+                channel.mode == l2cap.TransmissionMode.BASIC,
+                channel.psm,
+                int(channel.mtu),
+                int(channel.peer_mtu),
+                AAP_PSM,
+            )
         except (AttributeError, TypeError, ValueError):
             raise AAPChannelStateError(
                 "Bumble returned an invalid AAP L2CAP channel"
             ) from None
-        if not is_open:
+        if verdict == 1:
             raise AAPChannelStateError("AAP L2CAP channel did not reach OPEN state")
-        if not is_basic:
+        if verdict == 2:
             raise AAPChannelStateError("AAP L2CAP channel is not in Basic mode")
-        if not is_aap:
+        if verdict == 3:
             raise AAPChannelStateError("Bumble returned the wrong L2CAP PSM")
-        if not valid_mtus:
+        if verdict == 4:
             raise AAPChannelStateError("AAP L2CAP channel reported an invalid MTU")
 
     def _emit(self, event: AAPChannelProgress, channel: AAPChannel | None) -> None:

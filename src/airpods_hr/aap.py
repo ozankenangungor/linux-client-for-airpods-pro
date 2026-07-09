@@ -102,7 +102,9 @@ class DescriptorEvidence:
 
     @property
     def required(self) -> bool:
-        return self.sensor_framework and self.heart_rate_service
+        return _rust_core.runtime_descriptors_required(
+            self.sensor_framework, self.heart_rate_service
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,12 +239,12 @@ class BumbleAAPTransport:
         self._queue_limit = queue_limit
         self._frame_size_limit = frame_size_limit
         self._queue: asyncio.Queue[bytes] | None = None
-        self._application_payloads_sent = 0
+        self._policy = _rust_core.TransportPolicy()
         self.dropped_frames = 0
 
     @property
     def application_payloads_sent(self) -> int:
-        return self._application_payloads_sent
+        return self._policy.application_payloads_sent
 
     @property
     def queued_frames(self) -> int:
@@ -256,10 +258,11 @@ class BumbleAAPTransport:
 
     @asynccontextmanager
     async def collect(self) -> AsyncIterator[BumbleAAPTransport]:
-        if self._queue is not None:
+        if self._policy.collection_active:
             raise AAPReceiveStateError("AAP receive collection is already active")
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=self._queue_limit)
         previous_sink = self._raw_channel.sink
+        self._policy.begin_collection()
 
         def receive_sdu(sdu: bytes) -> None:
             if not isinstance(sdu, bytes) or len(sdu) > self._frame_size_limit:
@@ -277,26 +280,29 @@ class BumbleAAPTransport:
         finally:
             self._raw_channel.sink = previous_sink
             self._queue = None
+            self._policy.end_collection()
 
     def send_handshake_request(self) -> None:
-        if self._queue is None:
+        legality = self._policy.send_legality(True)
+        if legality == 1:
             raise AAPReceiveStateError("AAP receive collection is not active")
-        if self._application_payloads_sent != 0:
+        if legality == 2:
             raise AAPHandshakeError("AAP handshake request was already sent")
         self._raw_channel.write(AAP_HANDSHAKE_REQUEST)
-        self._application_payloads_sent = 1
+        self._policy.sent(True)
 
     def send_heart_rate_command(self, command: HeartRateCommand) -> None:
         """Send one member of the verified heart-rate command set."""
 
-        if self._queue is None:
+        legality = self._policy.send_legality(False)
+        if legality == 1:
             raise AAPReceiveStateError("AAP receive collection is not active")
         if not isinstance(command, HeartRateCommand):
             raise TypeError("command must be a HeartRateCommand")
-        if self._application_payloads_sent < 1:
+        if legality == 3:
             raise AAPReceiveStateError("AAP handshake has not been sent")
         self._raw_channel.write(command.payload)
-        self._application_payloads_sent += 1
+        self._policy.sent(False)
 
     async def receive(self, timeout: float) -> bytes:
         if self._queue is None:
@@ -319,7 +325,9 @@ class AAPHandshakeSession:
         progress: AAPProgressCallback | None = None,
         timeline: SafeProtocolTimeline | None = None,
     ) -> None:
-        if ack_timeout <= 0 or descriptor_timeout <= 0:
+        if not _rust_core.runtime_positive_timeouts(
+            (ack_timeout, descriptor_timeout)
+        ):
             raise ValueError("AAP handshake timeouts must be positive")
         if frame_summary_limit <= 0:
             raise ValueError("AAP frame summary limit must be positive")
@@ -329,8 +337,7 @@ class AAPHandshakeSession:
         self._clock = clock
         self._progress = progress
         self.timeline = timeline or SafeProtocolTimeline(clock=clock)
-        self._first_post_ack_frame_observed = False
-        self._first_357_byte_frame_observed = False
+        self._accumulator: _rust_core.HandshakeAccumulator | None = None
 
     async def run(self, transport: ReceiveTransport) -> AAPHandshakeResult:
         """Run the AAP handshake exchange while owning its receive collector."""
@@ -343,8 +350,7 @@ class AAPHandshakeSession:
     ) -> AAPHandshakeResult:
         """Run while a caller-owned receive collector remains active."""
 
-        self._first_post_ack_frame_observed = False
-        self._first_357_byte_frame_observed = False
+        self._accumulator = _rust_core.HandshakeAccumulator(self._frame_summary_limit)
         transport.send_handshake_request()
         handshake_sent_at = self._clock()
         self.timeline.record(ProtocolTimelineKind.HANDSHAKE_SENT)
@@ -354,7 +360,9 @@ class AAPHandshakeSession:
         observation = await self._observe_descriptors(transport, observation)
         self._emit(AAPProgress.DESCRIPTORS_OBSERVED)
 
-        if transport.application_payloads_sent != 1:
+        if not _rust_core.runtime_expected_payload_count(
+            transport.application_payloads_sent
+        ):
             raise AAPHandshakeError("unexpected AAP application payload count")
         return AAPHandshakeResult(
             observation,
@@ -366,9 +374,8 @@ class AAPHandshakeSession:
         self, transport: ReceiveTransport
     ) -> HandshakeObservation:
         deadline = self._clock() + self._ack_timeout
-        evidence = DescriptorEvidence()
-        pre_ack_frame_count = 0
-        summaries: tuple[AAPFrameSummary, ...] = ()
+        accumulator = self._accumulator
+        assert accumulator is not None
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -377,29 +384,16 @@ class AAPHandshakeSession:
                 frame = await transport.receive(remaining)
             except TimeoutError:
                 break
-            if frame == AAP_HANDSHAKE_ACK:
+            ack, first_post, first_357 = accumulator.observe(
+                frame, transport.dropped_frames
+            )
+            self._record_frame_timeline(first_post, first_357)
+            if ack:
                 self.timeline.record(ProtocolTimelineKind.ACK_OBSERVED)
-                return HandshakeObservation(
-                    ack_observed=True,
-                    evidence=evidence,
-                    pre_ack_frame_count=pre_ack_frame_count,
-                    receive_frames_dropped=transport.dropped_frames,
-                    pre_ack_frame_summaries=summaries,
-                )
-            pre_ack_frame_count += 1
-            self._record_frame_timeline(frame, post_ack=False)
-            if len(summaries) < self._frame_summary_limit:
-                summaries += (AAPFrameSummary.from_frame(frame),)
-            evidence = evidence.merged(frame)
+                return self._snapshot(transport)
         raise AAPHandshakeTimeoutError(
             "AAP handshake ACK was not observed",
-            HandshakeObservation(
-                ack_observed=False,
-                evidence=evidence,
-                pre_ack_frame_count=pre_ack_frame_count,
-                receive_frames_dropped=transport.dropped_frames,
-                pre_ack_frame_summaries=summaries,
-            ),
+            self._snapshot(transport),
         )
 
     async def _observe_descriptors(
@@ -407,13 +401,12 @@ class AAPHandshakeSession:
         transport: ReceiveTransport,
         observation: HandshakeObservation,
     ) -> HandshakeObservation:
-        if observation.evidence.required:
+        accumulator = self._accumulator
+        assert accumulator is not None
+        if accumulator.descriptors_complete:
             return observation
 
         deadline = self._clock() + self._descriptor_timeout
-        evidence = observation.evidence
-        post_ack_frame_count = observation.post_ack_frame_count
-        summaries = observation.post_ack_frame_summaries
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -422,45 +415,44 @@ class AAPHandshakeSession:
                 frame = await transport.receive(remaining)
             except TimeoutError:
                 break
-            post_ack_frame_count += 1
-            self._record_frame_timeline(frame, post_ack=True)
-            if (
-                len(observation.pre_ack_frame_summaries) + len(summaries)
-                < self._frame_summary_limit
-            ):
-                summaries += (AAPFrameSummary.from_frame(frame),)
-            evidence = evidence.merged(frame)
-            if evidence.required:
-                return HandshakeObservation(
-                    ack_observed=True,
-                    evidence=evidence,
-                    pre_ack_frame_count=observation.pre_ack_frame_count,
-                    post_ack_frame_count=post_ack_frame_count,
-                    receive_frames_dropped=transport.dropped_frames,
-                    pre_ack_frame_summaries=(
-                        observation.pre_ack_frame_summaries
-                    ),
-                    post_ack_frame_summaries=summaries,
-                )
-        final_observation = HandshakeObservation(
-            ack_observed=True,
-            evidence=evidence,
-            pre_ack_frame_count=observation.pre_ack_frame_count,
-            post_ack_frame_count=post_ack_frame_count,
-            receive_frames_dropped=transport.dropped_frames,
-            pre_ack_frame_summaries=observation.pre_ack_frame_summaries,
-            post_ack_frame_summaries=summaries,
-        )
-        if not evidence.required:
-            raise AAPDescriptorObservationTimeoutError(final_observation)
-        return final_observation
+            _, first_post, first_357 = accumulator.observe(
+                frame, transport.dropped_frames
+            )
+            self._record_frame_timeline(first_post, first_357)
+            if accumulator.descriptors_complete:
+                return self._snapshot(transport)
+        raise AAPDescriptorObservationTimeoutError(self._snapshot(transport))
 
-    def _record_frame_timeline(self, frame: bytes, *, post_ack: bool) -> None:
-        if post_ack and not self._first_post_ack_frame_observed:
-            self._first_post_ack_frame_observed = True
+    def _snapshot(self, transport: ReceiveTransport) -> HandshakeObservation:
+        accumulator = self._accumulator
+        assert accumulator is not None
+        accumulator.snapshot_dropped(transport.dropped_frames)
+        ack, evidence, pre_count, post_count, dropped, pre, post = (
+            accumulator.snapshot()
+        )
+        def adapt(values: tuple) -> AAPFrameSummary:
+            length, header_2_3, header_4_5, type_2b = values
+            return AAPFrameSummary(
+                length, header_2_3, header_4_5,
+                _type_2b_from_native(AAPType2BFrameSummary, type_2b)
+                if type_2b is not None else None,
+            )
+        return HandshakeObservation(
+            ack_observed=ack,
+            evidence=DescriptorEvidence(*evidence),
+            pre_ack_frame_count=pre_count,
+            post_ack_frame_count=post_count,
+            receive_frames_dropped=dropped,
+            pre_ack_frame_summaries=tuple(adapt(item) for item in pre),
+            post_ack_frame_summaries=tuple(adapt(item) for item in post),
+        )
+
+    def _record_frame_timeline(
+        self, first_post: bool, first_357: bool
+    ) -> None:
+        if first_post:
             self.timeline.record(ProtocolTimelineKind.FIRST_POST_ACK_FRAME)
-        if len(frame) == 357 and not self._first_357_byte_frame_observed:
-            self._first_357_byte_frame_observed = True
+        if first_357:
             self.timeline.record(ProtocolTimelineKind.FIRST_357_BYTE_FRAME)
 
     def _emit(self, event: AAPProgress) -> None:
