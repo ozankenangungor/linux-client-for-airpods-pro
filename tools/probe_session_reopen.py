@@ -7,6 +7,7 @@ import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TextIO
+import airpods_hr._airpods_aap_core as _rust_core
 
 from airpods_hr.aap import (
     AAPDescriptorObservationTimeoutError,
@@ -173,22 +174,22 @@ def _classify_session_2_failure(
 ) -> SessionReopenResultCategory:
     handshake_error = getattr(bundle.handshake, "error", None)
     observation = _safe_handshake_observation(bundle)
-    if (
-        isinstance(handshake_error, AAPDescriptorObservationTimeoutError)
-        and observation is not None
-        and observation.ack_observed
-    ):
-        return SessionReopenResultCategory.SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT
-    if isinstance(handshake_error, AAPHandshakeTimeoutError) and (
-        observation is None or not observation.ack_observed
-    ):
-        return SessionReopenResultCategory.SESSION_2_AAP_ACK_FAILURE
     category = getattr(error, "category", None)
-    if category is ProductionSessionCategory.PREFLIGHT_FAILED:
-        return SessionReopenResultCategory.BLUEZ_STATE_CHANGED
-    if category is ProductionSessionCategory.TRANSPORT_FAILED:
-        return SessionReopenResultCategory.SESSION_2_TRANSPORT_FAILURE
-    return SessionReopenResultCategory.OTHER_FAILURE
+    result = _rust_core.runtime_reopen_failure_category(
+        isinstance(handshake_error, AAPDescriptorObservationTimeoutError),
+        isinstance(handshake_error, AAPHandshakeTimeoutError),
+        observation.ack_observed if observation is not None else None,
+        category is ProductionSessionCategory.PREFLIGHT_FAILED,
+        category is ProductionSessionCategory.TRANSPORT_FAILED,
+    )
+    return (
+        SessionReopenResultCategory.BOTH_SESSIONS_PASS,
+        SessionReopenResultCategory.SESSION_2_EXACT_ACK_DESCRIPTOR_TIMEOUT,
+        SessionReopenResultCategory.SESSION_2_AAP_ACK_FAILURE,
+        SessionReopenResultCategory.SESSION_2_TRANSPORT_FAILURE,
+        SessionReopenResultCategory.BLUEZ_STATE_CHANGED,
+        SessionReopenResultCategory.OTHER_FAILURE,
+    )[result]
 
 
 def _aggregate(
@@ -199,44 +200,38 @@ def _aggregate(
     failure: BaseException | None,
 ) -> SessionReopenResult:
     production_counters = [bundle.session.counters for bundle in bundles]
-    first_counters = production_counters[0] if production_counters else None
+    counts = _rust_core.runtime_aggregate_reopen_counts(
+        [
+            (
+                item.transport_opens,
+                int(getattr(bundle.transport, "close_calls", 0)),
+                int(getattr(bundle.handshake, "attempts", 0)),
+                int(getattr(bundle.handshake, "completed", 0)),
+                int(
+                    (observation := _safe_handshake_observation(bundle))
+                    is not None and observation.ack_observed
+                ),
+                item.hr_activations,
+                item.hr_stops,
+                item.reports_received,
+            )
+            for item, bundle in zip(production_counters, bundles, strict=True)
+        ]
+    )
     counters = SessionReopenCounters(
         session_1_mode=session_1_mode,
-        session_objects_created=len(bundles),
-        transport_opens=sum(item.transport_opens for item in production_counters),
-        transport_closes=sum(
-            int(getattr(bundle.transport, "close_calls", 0)) for bundle in bundles
-        ),
-        descriptor_handshakes_attempted=sum(
-            int(getattr(bundle.handshake, "attempts", 0)) for bundle in bundles
-        ),
-        descriptor_handshakes_completed=sum(
-            int(getattr(bundle.handshake, "completed", 0)) for bundle in bundles
-        ),
-        exact_aap_acks=sum(
-            int(
-                observation is not None and observation.ack_observed
-            )
-            for observation in (
-                _safe_handshake_observation(bundle) for bundle in bundles
-            )
-        ),
-        hr_activations=sum(item.hr_activations for item in production_counters),
-        hr_stops=sum(item.hr_stops for item in production_counters),
-        hr_activations_session_1=(
-            first_counters.hr_activations if first_counters is not None else 0
-        ),
-        hr_stops_session_1=(
-            first_counters.hr_stops if first_counters is not None else 0
-        ),
-        reports_received_session_1=(
-            production_counters[0].reports_received if production_counters else 0
-        ),
-        reports_received_session_2=(
-            production_counters[1].reports_received
-            if len(production_counters) > 1
-            else 0
-        ),
+        session_objects_created=counts[0],
+        transport_opens=counts[1],
+        transport_closes=counts[2],
+        descriptor_handshakes_attempted=counts[3],
+        descriptor_handshakes_completed=counts[4],
+        exact_aap_acks=counts[5],
+        hr_activations=counts[6],
+        hr_stops=counts[7],
+        hr_activations_session_1=counts[8],
+        hr_stops_session_1=counts[9],
+        reports_received_session_1=counts[10],
+        reports_received_session_2=counts[11],
     )
     return SessionReopenResult(
         category=category,
@@ -345,7 +340,9 @@ async def run_probe(
                 session_index=1,
                 samples=samples_per_session,
                 report_timeout=report_timeout,
-                activate_hr=selected_mode is Session1Mode.HR_CYCLE,
+                activate_hr=_rust_core.runtime_session1_activate_hr(
+                    selected_mode.value
+                ),
                 output=output,
             )
         except BaseException as error:

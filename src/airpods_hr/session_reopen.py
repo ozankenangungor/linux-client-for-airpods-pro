@@ -7,6 +7,7 @@ It is deliberately absent from :mod:`airpods_hr` exports.
 from __future__ import annotations
 
 import asyncio
+import airpods_hr._airpods_aap_core as _rust_core
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -61,10 +62,8 @@ class BlueZReopenCheckpoint:
 
     @property
     def invariant_holds(self) -> bool:
-        return (
-            self.bluez_reachable
-            and self.adapter_powered
-            and self.device_connected
+        return _rust_core.runtime_reopen_checkpoint_holds(
+            self.bluez_reachable, self.adapter_powered, self.device_connected
         )
 
 
@@ -122,15 +121,22 @@ class _ObservedHandshakeSession:
 
     def __init__(self, delegate: AAPHandshakeSession) -> None:
         self._delegate = delegate
-        self.attempts = 0
-        self.completed = 0
+        self._counts = _rust_core.ReopenObservationCounters()
         self.observation: HandshakeObservation | None = None
         self.error: BaseException | None = None
+
+    @property
+    def attempts(self) -> int:
+        return self._counts.attempts
+
+    @property
+    def completed(self) -> int:
+        return self._counts.completed
 
     async def run_collected(
         self, transport: CoexistenceTransport
     ) -> AAPHandshakeResult:
-        self.attempts += 1
+        self._counts.handshake_attempt()
         try:
             result = await self._delegate.run_collected(transport)
         except (
@@ -143,7 +149,7 @@ class _ObservedHandshakeSession:
         except BaseException as error:
             self.error = error
             raise
-        self.completed += 1
+        self._counts.handshake_complete()
         self.observation = result.observation
         return result
 
@@ -153,18 +159,25 @@ class _TrackedTransport:
 
     def __init__(self, delegate: CoexistenceTransport) -> None:
         self._delegate = delegate
-        self.open_calls = 0
-        self.close_calls = 0
+        self._counts = _rust_core.ReopenObservationCounters()
+
+    @property
+    def open_calls(self) -> int:
+        return self._counts.open_calls
+
+    @property
+    def close_calls(self) -> int:
+        return self._counts.close_calls
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
 
     async def open(self, local_address: str, remote_address: str) -> None:
         await self._delegate.open(local_address, remote_address)
-        self.open_calls += 1
+        self._counts.transport_open()
 
     def close(self) -> None:
-        self.close_calls += 1
+        self._counts.transport_close()
         self._delegate.close()
 
     def collect(self) -> AbstractAsyncContextManager[Any]:

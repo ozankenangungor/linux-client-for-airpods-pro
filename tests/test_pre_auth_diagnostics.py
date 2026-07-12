@@ -563,7 +563,7 @@ class PreAuthModeTests(unittest.IsolatedAsyncioTestCase):
     def _strategy(self) -> PreAuthSequenceStrategy:
         return PreAuthSequenceStrategy(
             PreAuthSequenceMode.BLUEZ_DISCOVERY,
-            remote_discovery=BumbleRemoteDiscovery(operation_timeout=0.001),
+            remote_discovery=BumbleRemoteDiscovery(operation_timeout=0.05),
         )
 
     def _assert_watchers_empty(self, device: FakeDevice) -> None:
