@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import re
+import airpods_hr._airpods_aap_core as _rust_core
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -108,7 +108,9 @@ class ControllerHandoff:
         sleep: Sleep = asyncio.sleep,
         clock: Clock = time.monotonic,
     ) -> None:
-        if state_timeout <= 0 or restore_timeout <= 0 or poll_interval <= 0:
+        if not _rust_core.runtime_positive_timeouts(
+            (state_timeout, restore_timeout, poll_interval)
+        ):
             raise ValueError("timeouts and poll_interval must be positive")
         self._bluez = bluez
         self._transport = transport
@@ -182,7 +184,7 @@ class ControllerHandoff:
                     f"within {timeout:g} seconds"
                 )
 
-            await self._sleep(min(self._poll_interval, deadline - now))
+            await self._sleep(_rust_core.runtime_poll_delay(self._poll_interval, deadline, now))
 
     async def _restore(self, original: AdapterState) -> None:
         deadline = self._clock() + self._restore_timeout
@@ -234,9 +236,12 @@ class ControllerHandoff:
             now = self._clock()
             if now >= deadline:
                 break
-            await self._sleep(min(self._poll_interval, deadline - now))
+            await self._sleep(_rust_core.runtime_poll_delay(self._poll_interval, deadline, now))
 
-        if not saw_adapter:
+        restoration = _rust_core.runtime_restoration(
+            saw_adapter, last_set_error is not None
+        )
+        if restoration == 0:
             error = AdapterReappearanceTimeoutError(
                 f"adapter {original.name} did not reappear in BlueZ "
                 f"within {self._restore_timeout:g} seconds"
@@ -245,7 +250,7 @@ class ControllerHandoff:
                 raise error from last_read_error
             raise error
 
-        if last_set_error is not None:
+        if restoration == 1:
             error = AdapterRestoreError(
                 f"adapter {original.name} reappeared, but Powered="
                 f"{original.powered} was not observed within "
@@ -285,7 +290,6 @@ class DBusNextBlueZBackend:
     OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
     PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
     ADAPTER_INTERFACE = "org.bluez.Adapter1"
-    _ADAPTER_NAME = re.compile(r"^hci(?P<index>[0-9]+)$")
 
     def __init__(self) -> None:
         self._bus: Any | None = None
@@ -391,10 +395,10 @@ class DBusNextBlueZBackend:
 
     @classmethod
     def _adapter_index(cls, adapter_name: str) -> int:
-        match = cls._ADAPTER_NAME.fullmatch(adapter_name)
-        if match is None:
+        digits = _rust_core.runtime_adapter_digits(adapter_name)
+        if digits is None:
             raise ValueError("adapter must use the form hci<index>")
-        return int(match.group("index"))
+        return int(digits)
 
 
 class BumbleHCITransportBackend:

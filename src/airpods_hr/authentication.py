@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager, asynccontextmanager, contextmanag
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import AsyncContextManager, Protocol
+import airpods_hr._airpods_aap_core as _rust_core
 
 from airpods_hr.address import BluetoothAddress
 from airpods_hr.bluetooth import (
@@ -76,9 +77,18 @@ class ClassicAuthenticationResult:
     replacement_key_reported: bool
 
 
-@dataclass(slots=True)
 class _ReplacementKeyState:
-    reported: bool = False
+    def __init__(self, lifecycle: _rust_core.AuthenticationLifecycle) -> None:
+        self._lifecycle = lifecycle
+
+    @property
+    def reported(self) -> bool:
+        return self._lifecycle.replacement_key_reported
+
+    @reported.setter
+    def reported(self, value: bool) -> None:
+        if value:
+            self._lifecycle.report_replacement_key()
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +271,8 @@ class ClassicAuthenticationSession:
 
         candidates = await self._discovery.discover_candidates()
         candidate = select_single_candidate(candidates)
+        lifecycle = _rust_core.AuthenticationLifecycle()
+        lifecycle.advance(0)
         self._emit(AuthenticationProgress.DEVICE_SELECTED, candidate.display_name)
 
         credentials = self._pairing_store.load_classic_credentials(
@@ -272,7 +284,7 @@ class ClassicAuthenticationSession:
             if pre_connect_profile is not None
             else None
         )
-        replacement_key_state = _ReplacementKeyState()
+        replacement_key_state = _ReplacementKeyState(lifecycle)
 
         def on_replacement_key() -> None:
             replacement_key_state.reported = True
@@ -304,6 +316,7 @@ class ClassicAuthenticationSession:
                             raise ClassicConnectionError(
                                 "BR/EDR connection failed"
                             ) from None
+                        lifecycle.advance(1)
                         self._emit(AuthenticationProgress.CONNECTED)
 
                         if self._pre_authentication is not None:
@@ -315,10 +328,13 @@ class ClassicAuthenticationSession:
                             raise ClassicAuthenticationFailedError(
                                 "Classic authentication failed"
                             ) from None
-                        if not connection.authenticated:
+                        if _rust_core.runtime_authentication_observation(
+                            connection.authenticated
+                        ) == 1:
                             raise ClassicAuthenticationFailedError(
                                 "Classic authentication was not observed"
                             )
+                        lifecycle.advance(2)
                         self._emit(AuthenticationProgress.AUTHENTICATED)
 
                         try:
@@ -327,11 +343,15 @@ class ClassicAuthenticationSession:
                             raise ClassicEncryptionFailedError(
                                 "Classic encryption failed"
                             ) from None
-                        if not connection.encrypted:
+                        if _rust_core.runtime_encryption_observation(
+                            connection.encrypted
+                        ) == 2:
                             raise ClassicEncryptionFailedError(
                                 "Classic encryption was not observed"
                             )
+                        lifecycle.advance(3)
                         self._emit(AuthenticationProgress.ENCRYPTED)
+                        lifecycle.advance(4)
                         yield AuthenticatedClassicContext(
                             display_name=candidate.display_name,
                             connection=connection,
@@ -346,20 +366,27 @@ class ClassicAuthenticationSession:
                     raise
                 finally:
                     if connection is not None:
+                        lifecycle.advance(5)
                         try:
                             await connection.disconnect()
                         except BaseException as cleanup_error:
-                            if primary_error is not None:
+                            cleanup = _rust_core.runtime_disconnect_cleanup(
+                                primary_error is not None,
+                                True,
+                                isinstance(cleanup_error, asyncio.CancelledError),
+                            )
+                            if cleanup == 1:
                                 primary_error.add_note(
                                     "BR/EDR disconnect also failed during cleanup"
                                 )
-                            elif isinstance(cleanup_error, asyncio.CancelledError):
+                            elif cleanup == 2:
                                 raise
                             else:
                                 raise ClassicDisconnectError(
                                     "BR/EDR disconnect failed"
                                 ) from None
                         else:
+                            lifecycle.advance(6)
                             self._emit(AuthenticationProgress.DISCONNECTED)
 
     def _emit(
@@ -495,12 +522,9 @@ class BumbleClassicRuntimeFactory:
         runtime_name_profile: RuntimeNameProfile = RuntimeNameProfile.PROJECT_DEFAULT,
         host_state_observer: ClassicHostStateObserver | None = None,
     ) -> None:
-        if min(
-            connect_timeout,
-            security_timeout,
-            disconnect_timeout,
-            power_timeout,
-        ) <= 0:
+        if not _rust_core.runtime_positive_timeouts(
+            (connect_timeout, security_timeout, disconnect_timeout, power_timeout)
+        ):
             raise ValueError("Bumble operation timeouts must be positive")
         self._connect_timeout = connect_timeout
         self._security_timeout = security_timeout

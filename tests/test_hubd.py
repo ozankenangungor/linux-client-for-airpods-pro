@@ -1412,6 +1412,9 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/hr_semantics.py",
                 "airpods_hr/aap.py",
                 "airpods_hr/aap_channel.py",
+                "airpods_hr/authentication.py",
+                "airpods_hr/bluetooth.py",
+                "airpods_hr/discovery.py",
                 "airpods_hr/heart_rate_session.py",
                 "airpods_hr/production_session.py",
                 "airpods_hr/sdp.py",
@@ -1428,6 +1431,7 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/_hubd/server.py",
             },
         )
+
 
 
 

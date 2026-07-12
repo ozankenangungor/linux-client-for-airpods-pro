@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import airpods_hr._airpods_aap_core as _rust_core
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -49,7 +49,7 @@ class BlueZDevice:
 
     @property
     def display_name(self) -> str:
-        return self.alias or self.name or "AirPods"
+        return _rust_core.runtime_display_name(self.alias, self.name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +77,6 @@ class BlueZDeviceDiscovery:
 
     DEVICE_INTERFACE = "org.bluez.Device1"
     ADAPTER_INTERFACE = "org.bluez.Adapter1"
-    _AIRPODS_NAME = re.compile(r"(?<![a-z0-9])airpods(?![a-z0-9])", re.I)
 
     def __init__(self, backend: ManagedObjectsBackend) -> None:
         self._backend = backend
@@ -114,7 +113,7 @@ class BlueZDeviceDiscovery:
                 ) from None
 
             adapter_name = adapter_path.rsplit("/", 1)[-1]
-            if not re.fullmatch(r"hci[0-9]+", adapter_name):
+            if _rust_core.runtime_adapter_digits(adapter_name) is None:
                 raise InvalidDeviceMetadataError(
                     "matching BlueZ device has a malformed adapter path"
                 )
@@ -172,11 +171,7 @@ class BlueZDeviceDiscovery:
     def _matches_supported_name(
         cls, name: str | None, alias: str | None
     ) -> bool:
-        return any(
-            cls._AIRPODS_NAME.search(value) is not None
-            for value in (name, alias)
-            if value
-        )
+        return _rust_core.runtime_supported_airpods_name(name, alias)
 
 
 def select_single_candidate(
@@ -184,9 +179,10 @@ def select_single_candidate(
 ) -> AirPodsCandidate:
     """Select one candidate, preserving ambiguity for a future CLI choice."""
 
-    if not candidates:
+    count = _rust_core.runtime_candidate_count(len(candidates))
+    if count == 0:
         raise NoAirPodsCandidatesError("no paired AirPods candidates found")
-    if len(candidates) > 1:
+    if count == 2:
         raise MultipleAirPodsCandidatesError(candidates)
     return candidates[0]
 
@@ -247,4 +243,4 @@ def _property_value(value: Any) -> Any:
 
 def _optional_string(value: Any) -> str | None:
     unwrapped = _property_value(value)
-    return unwrapped if isinstance(unwrapped, str) and unwrapped else None
+    return _rust_core.runtime_optional_string(unwrapped)
