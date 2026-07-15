@@ -1,0 +1,96 @@
+"""Pin the six migrated modules' effect calls to the reviewed parent tree."""
+
+from __future__ import annotations
+
+import ast
+import subprocess
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PARENT = "64559ae96dc4c3d1f76756720730893b776bf945"
+MODULES = (
+    "aap.py",
+    "aap_channel.py",
+    "authentication.py",
+    "bluetooth.py",
+    "discovery.py",
+    "session_reopen.py",
+)
+EFFECT_CALLS = frozenset(
+    {
+        "write", "receive", "record", "wait_for", "sleep", "get_adapter",
+        "set_powered", "acquire", "create_l2cap_channel", "disconnect",
+        "authenticate", "encrypt", "connect", "power_on", "power_off",
+        "get_managed_objects", "load_classic_credentials",
+        "send_handshake_request", "open_transport", "preflight", "close",
+        "open", "start", "stop", "snapshot", "read_text", "read_bytes",
+        "write_text", "write_bytes", "mkdir", "unlink", "remove",
+        "replace", "system", "Popen",
+    }
+)
+EFFECT_IMPORT_ROOTS = frozenset(
+    {"os", "pathlib", "socket", "subprocess", "shutil", "dbus_next"}
+)
+
+
+def effect_signature(source: str) -> dict[str, tuple[str, ...]]:
+    tree = ast.parse(source)
+    signature = {}
+    for class_node in tree.body:
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        for method in class_node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls = []
+            for node in ast.walk(method):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr in EFFECT_CALLS:
+                        calls.append(node.func.attr)
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id in {"open", "Path", "socket", "Popen"}:
+                        calls.append(node.func.id)
+            if calls:
+                signature[f"{class_node.name}.{method.name}"] = tuple(calls)
+    return signature
+
+
+def effect_imports(source: str) -> tuple[str, ...]:
+    imports = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.append(node.module)
+    return tuple(sorted(name for name in imports if name.split(".")[0] in EFFECT_IMPORT_ROOTS))
+
+
+class RuntimeEffectSafetyTests(unittest.TestCase):
+    def test_parent_effect_calls_remain_in_same_methods_and_order(self) -> None:
+        for filename in MODULES:
+            path = f"src/airpods_hr/{filename}"
+            parent = subprocess.check_output(
+                ["git", "show", f"{PARENT}:{path}"], cwd=ROOT, text=True
+            )
+            current = (ROOT / path).read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                self.assertEqual(effect_imports(current), effect_imports(parent))
+                # The new native accumulator's snapshot is a pure in-memory read.
+                old = effect_signature(parent)
+                new = effect_signature(current)
+                new.pop("AAPHandshakeSession._snapshot", None)
+                self.assertEqual(new, old)
+
+    def test_frozen_hardware_paths_match_parent_blobs(self) -> None:
+        for path in (
+            "src/airpods_hr/bluez_coexistence.py",
+            "src/airpods_hr/heart_rate_session.py",
+            "src/airpods_hr/production_session.py",
+        ):
+            with self.subTest(path=path):
+                parent = subprocess.check_output(
+                    ["git", "show", f"{PARENT}:{path}"], cwd=ROOT
+                )
+                self.assertEqual((ROOT / path).read_bytes(), parent)
