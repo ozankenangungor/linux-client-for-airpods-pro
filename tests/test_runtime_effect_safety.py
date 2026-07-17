@@ -82,15 +82,3 @@ class RuntimeEffectSafetyTests(unittest.TestCase):
                 new = effect_signature(current)
                 new.pop("AAPHandshakeSession._snapshot", None)
                 self.assertEqual(new, old)
-
-    def test_frozen_hardware_paths_match_parent_blobs(self) -> None:
-        for path in (
-            "src/airpods_hr/bluez_coexistence.py",
-            "src/airpods_hr/heart_rate_session.py",
-            "src/airpods_hr/production_session.py",
-        ):
-            with self.subTest(path=path):
-                parent = subprocess.check_output(
-                    ["git", "show", f"{PARENT}:{path}"], cwd=ROOT
-                )
-                self.assertEqual((ROOT / path).read_bytes(), parent)

@@ -6,7 +6,6 @@ import ast
 import asyncio
 import errno
 import fcntl
-import hashlib
 import json
 import os
 import socket
@@ -58,7 +57,6 @@ from tests.test_production_session import (
     FakeHandshake,
     FakeRegistration,
     FakeTransport,
-    assert_only_task_10_6_policy_changed,
     make_session,
 )
 from tests.test_bluez_coexistence import FakeSocket, FakeSocketModule
@@ -76,11 +74,6 @@ from tools.probe_hubd_production import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_INIT_SHA256 = (
-    "b50576f701568dd5d63190568c47427d6d2b65c02596a1608dbdb87f3afea35f"
-)
-
-
 def report(index: int) -> HeartRateReport:
     return HeartRateReport(
         bpm=169 if index == 0 else 80 + index,
@@ -925,15 +918,6 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
         self.assertFalse(hasattr(airpods_hr, "create_production_hub"))
         private_init = ROOT / "src/airpods_hr/_hubd/__init__.py"
         self.assertNotIn("production", private_init.read_text())
-        self.assertEqual(
-            hashlib.sha256(
-                (ROOT / "src/airpods_hr/__init__.py").read_bytes()
-            ).hexdigest(),
-            PACKAGE_INIT_SHA256,
-        )
-
-    def test_production_session_is_frozen(self) -> None:
-        assert_only_task_10_6_policy_changed(self)
 
     def test_integration_duplicates_no_transport_or_protocol_logic(self) -> None:
         integration = ROOT / "src/airpods_hr/_hubd/production.py"

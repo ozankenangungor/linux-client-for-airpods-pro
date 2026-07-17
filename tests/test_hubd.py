@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import math
 import multiprocessing
 import os
 import socket
@@ -1213,6 +1214,17 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SocketPathSafetyTests(unittest.TestCase):
+    def test_invalid_daemon_configuration_is_rejected_before_effects(self) -> None:
+        factory = FakeFactory()
+        path = "/tmp/hubd-configuration-test.sock"
+        for timeout in (0.0, -1.0):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, "operation_timeout"):
+                AirPodsHubDaemon(factory, path, operation_timeout=timeout)
+        for delays in ((), (0.0,), (-1.0,), (math.inf,), (math.nan,)):
+            with self.subTest(delays=delays), self.assertRaisesRegex(ValueError, "recovery delays"):
+                AirPodsHubDaemon(factory, path, recovery_delays=delays)
+        self.assertEqual(factory.calls, 0)
+
     def test_missing_xdg_runtime_directory_has_no_fallback(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(UnsafeSocketPathError, "XDG_RUNTIME_DIR"):

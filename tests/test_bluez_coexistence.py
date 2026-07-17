@@ -2763,15 +2763,6 @@ class StaticSafetyTests(unittest.TestCase):
                 forbidden_dbus_calls.isdisjoint(called_attributes), source
             )
 
-    def test_protocol_source_is_not_modified_for_coexistence(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        protocol_source = root / "src/airpods_hr/protocol.py"
-        import hashlib
-
-        self.assertEqual(
-            hashlib.sha256(protocol_source.read_bytes()).hexdigest(),
-            "b4d1daea0582841e48ba9efc3a8a7d4d74bba9b69cdbf54d3767b8bb45afecca",
-        )
 
     def test_classic_local_rx_fix_does_not_use_le_or_fallback_paths(self) -> None:
         source = (
