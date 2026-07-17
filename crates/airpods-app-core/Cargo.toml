@@ -1,0 +1,9 @@
+[package]
+name = "airpods-app-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure application, daemon, CLI, service and runtime policy for airpods-hr-linux"
+publish = false
+
+[dependencies]
+airpods-hub-core = { path = "../airpods-hub-core" }

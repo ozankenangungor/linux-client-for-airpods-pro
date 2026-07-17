@@ -11,6 +11,7 @@ name = "_airpods_aap_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+airpods-app-core = { path = "../airpods-app-core" }
 airpods-aap-core = { path = "../airpods-aap-core" }
 airpods-hub-core = { path = "../airpods-hub-core" }
 airpods-sdp-core = { path = "../airpods-sdp-core" }
