@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from airpods_hr import _airpods_aap_core as _native
+
 from airpods_hr._hubd.server import AirPodsHubDaemon
 from airpods_hr.bluez_coexistence import BlueZConnectionEpochRefresher
 from airpods_hr.production_session import (
@@ -22,11 +24,9 @@ from airpods_hr.production_session import (
 )
 
 
-DEFAULT_DESCRIPTOR_TIMEOUT = 30.0
-DEFAULT_DAEMON_OPERATION_TIMEOUT = 150.0
-_MAX_PROFILE_REGISTRATIONS = 4
-_OPEN_DBUS_WINDOWS = 2 + _MAX_PROFILE_REGISTRATIONS + 3
-_OUTER_TIMEOUT_MARGIN = 10.0
+DEFAULT_DESCRIPTOR_TIMEOUT, DEFAULT_DAEMON_OPERATION_TIMEOUT = (
+    _native.app_production_defaults()
+)
 
 ProductionSessionBuilder = Callable[..., InternalProductionSession]
 
@@ -42,19 +42,10 @@ def minimum_daemon_operation_timeout(
 ) -> float:
     """Return a conservative floor for the outer production open timeout."""
 
-    open_window = (
-        _OPEN_DBUS_WINDOWS * dbus_timeout
-        + connect_timeout
-        + handshake_timeout
-        + descriptor_timeout
+    return _native.app_production_minimum(
+        descriptor_timeout, dbus_timeout, connect_timeout,
+        handshake_timeout, start_timeout, stop_timeout,
     )
-    cleanup_window = stop_timeout + 5 * dbus_timeout
-    return max(
-        open_window + cleanup_window,
-        start_timeout + cleanup_window,
-        stop_timeout + cleanup_window,
-        cleanup_window,
-    ) + _OUTER_TIMEOUT_MARGIN
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,30 +61,24 @@ class ProductionHubConfig:
     daemon_operation_timeout: float = DEFAULT_DAEMON_OPERATION_TIMEOUT
 
     def __post_init__(self) -> None:
-        values = (
-            self.descriptor_timeout,
-            self.dbus_timeout,
-            self.connect_timeout,
-            self.handshake_timeout,
-            self.start_timeout,
-            self.stop_timeout,
-            self.daemon_operation_timeout,
-        )
-        if min(values) <= 0:
-            raise ValueError("production hub timeouts must be positive")
-        minimum = minimum_daemon_operation_timeout(
-            descriptor_timeout=self.descriptor_timeout,
-            dbus_timeout=self.dbus_timeout,
-            connect_timeout=self.connect_timeout,
-            handshake_timeout=self.handshake_timeout,
-            start_timeout=self.start_timeout,
-            stop_timeout=self.stop_timeout,
-        )
-        if self.daemon_operation_timeout < minimum:
-            raise ValueError(
-                "daemon operation timeout is below the production open window "
-                f"({minimum:g}s minimum)"
+        try:
+            _native.app_production_validate(
+                self.descriptor_timeout, self.dbus_timeout, self.connect_timeout,
+                self.handshake_timeout, self.start_timeout, self.stop_timeout,
+                self.daemon_operation_timeout,
             )
+        except ValueError as error:
+            if "below the production open window" in str(error):
+                minimum = minimum_daemon_operation_timeout(
+                    descriptor_timeout=self.descriptor_timeout,
+                    dbus_timeout=self.dbus_timeout,
+                    connect_timeout=self.connect_timeout,
+                    handshake_timeout=self.handshake_timeout,
+                    start_timeout=self.start_timeout,
+                    stop_timeout=self.stop_timeout,
+                )
+                raise ValueError(f"{error} ({minimum:g}s minimum)") from error
+            raise
 
 
 class ProductionSessionFactory:

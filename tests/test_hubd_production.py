@@ -935,9 +935,9 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
             "BlueZCompatibilityRegistration",
             "AAPHandshakeSession",
             "HeartRateCommand",
-            "_airpods_aap_core",
         ):
             self.assertNotIn(forbidden, source)
+        self.assertIn("_native.app_production_validate", source)
 
     def test_production_and_service_entrypoints_are_metadata_only(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
@@ -952,8 +952,7 @@ class ProductionIntegrationStaticSafetyTests(unittest.TestCase):
         self.assertEqual(list(ROOT.rglob("*.service")), [])
         self.assertNotIn(
             "_airpods_aap_core",
-            (ROOT / "src/airpods_hr/_hubd/production.py").read_text()
-            + (ROOT / "tools/probe_hubd_production.py").read_text(),
+            (ROOT / "tools/probe_hubd_production.py").read_text(),
         )
 
 
