@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from airpods_hr import _airpods_aap_core as _native
+
 from airpods_hr.aap import AAPHandshakeError, AAPHandshakeSession
 from airpods_hr.aap_channel import AAPChannelError, AAPChannelSession
 from airpods_hr.authentication import (
@@ -128,23 +130,25 @@ class MonitorLifecycle:
         """Request graceful stop first, then task cancellation on repetition."""
 
         task = self.active_task
-        if task is None or task.done():
+        action = _native.app_monitor_signal_action(
+            task is not None and not task.done(),
+            self.shutdown_requested, self.start_acknowledged,
+        )
+        if action == "noop":
             return
         if not self.shutdown_requested:
             self.shutdown_requested = True
             self.first_signal = signum
-            if self.start_acknowledged:
-                self.stop_event.set()
-            else:
-                task.cancel()
-            return
-        task.cancel()
+        if action == "graceful_stop":
+            self.stop_event.set()
+        elif action == "cancel":
+            task.cancel()
 
     @property
     def signal_exit_code(self) -> int | None:
-        if self.first_signal is None:
-            return None
-        return 128 + int(self.first_signal)
+        return _native.app_monitor_signal_exit_code(
+            None if self.first_signal is None else int(self.first_signal)
+        )
 
 
 def create_heart_rate_progress(
@@ -155,16 +159,18 @@ def create_heart_rate_progress(
     """Map allowlisted monitor progress to product output streams."""
 
     def emit(event: HeartRateProgress, report: HeartRateReport | None) -> None:
-        if event is HeartRateProgress.START_ACKNOWLEDGED:
+        route = _native.app_monitor_progress_route(
+            event.value, report is not None, lifecycle.diagnostic_recorder is not None
+        )
+        if route == "start_status":
             lifecycle.mark_start_acknowledged()
             stderr("Heart-rate monitoring started.")
             stderr("Press Ctrl+C to stop.")
-        elif event is HeartRateProgress.SAMPLE and report is not None:
-            if lifecycle.diagnostic_recorder is None:
-                stdout(f"Heart rate: {report.bpm} bpm")
-            else:
-                sample = lifecycle.diagnostic_recorder.record_sample(report)
-                stdout(sample.format_human())
+        elif route == "simple_sample":
+            stdout(f"Heart rate: {report.bpm} bpm")
+        elif route == "diagnostic_sample":
+            sample = lifecycle.diagnostic_recorder.record_sample(report)
+            stdout(sample.format_human())
 
     return emit
 
@@ -312,29 +318,25 @@ async def run_live_monitor(
         signal_registrar,
     )
     stderr("Heart-rate monitoring stopped.")
-    if lifecycle.bluez_restored:
-        stderr("Bluetooth ownership and BlueZ state restored.")
-    elif lifecycle.shutdown_requested and not lifecycle.start_acknowledged:
-        stderr("Shutdown completed before heart-rate monitoring started.")
+    completion = _native.app_monitor_completion_message(
+        lifecycle.bluez_restored, lifecycle.shutdown_requested,
+        lifecycle.start_acknowledged,
+    )
+    if completion is not None:
+        stderr(completion)
     return exit_code
 
 
 def _termination_reason(exit_code: int) -> str:
-    if exit_code == 0:
-        return "completed"
-    if exit_code == 130:
-        return "sigint"
-    if exit_code == 143:
-        return "sigterm"
-    return "failure"
+    return _native.app_monitor_termination_reason(exit_code)
 
 
 def _exception_termination_reason(error: BaseException) -> str:
     if isinstance(error, asyncio.CancelledError):
-        return "cancelled"
+        return _native.app_monitor_exception_reason("cancelled")
     if isinstance(error, HeartRateDiagnosticError):
-        return "diagnostic_error"
-    return "failure"
+        return _native.app_monitor_exception_reason("diagnostic")
+    return _native.app_monitor_exception_reason("other")
 
 
 async def _run_diagnostic_monitor(
@@ -388,19 +390,10 @@ async def run_monitor_command(
     """Run a dry plan or map one live monitor outcome to a safe exit code."""
 
     if dry_run:
-        stderr("DRY RUN: no Bluetooth state will be changed.")
-        stderr("Planned operations:")
-        stderr("  1. Discover one paired AirPods candidate.")
-        stderr("  2. Read its existing local Classic credentials in memory.")
-        stderr("  3. Hand the controller from BlueZ to Bumble temporarily.")
-        stderr("  4. Connect securely and start continuous heart-rate monitoring.")
-        stderr("  5. Stop on SIGINT or SIGTERM and restore BlueZ ownership.")
-        if diagnostic:
-            destination = (
-                "JSONL file" if output_path is not None else "standard output"
-            )
-            stderr(f"Diagnostic evidence destination: {destination}.")
-        stderr("No reconnect, retry, or arbitrary protocol command is used.")
+        for line in _native.app_monitor_dry_run_lines(
+            diagnostic, output_path is not None
+        ):
+            stderr(line)
         return 0
 
     try:
@@ -413,32 +406,26 @@ async def run_monitor_command(
                 recorder_factory,
             )
         return await live_runner(stdout, stderr)
-    except DiagnosticOutputOpenError:
-        stderr("Error: the diagnostic output file could not be opened.")
-    except HeartRateDiagnosticError:
-        stderr("Error: diagnostic capture failed; cleanup was attempted.")
-    except NoAirPodsCandidatesError:
-        stderr("Error: no paired AirPods candidate was found.")
-    except MultipleAirPodsCandidatesError:
-        stderr("Error: multiple paired AirPods candidates require selection.")
-    except PairingStoreError:
-        stderr("Error: existing local Classic credentials could not be loaded.")
-    except SDPCompatibilityError:
-        stderr("Error: the local SDP compatibility profile could not be prepared.")
-    except AAPHandshakeError:
-        stderr("Error: the AAP handshake or descriptor phase failed.")
-    except AAPChannelError:
-        stderr("Error: the AAP channel failed.")
-    except HeartRateSessionError:
-        stderr("Error: the heart-rate session failed; cleanup was attempted.")
-    except AdapterRestoreError:
-        stderr("Error: BlueZ adapter restoration failed.")
-    except HandoffError:
-        stderr("Error: controller handoff failed; cleanup was attempted.")
-    except ClassicAuthenticationError:
-        stderr("Error: the Classic security session failed.")
     except asyncio.CancelledError:
         raise
-    except Exception:
-        stderr("Error: an unexpected monitor failure occurred.")
+    except Exception as error:
+        categories = (
+            (DiagnosticOutputOpenError, "diagnostic_open"),
+            (HeartRateDiagnosticError, "diagnostic"),
+            (NoAirPodsCandidatesError, "no_candidates"),
+            (MultipleAirPodsCandidatesError, "multiple_candidates"),
+            (PairingStoreError, "pairing_store"),
+            (SDPCompatibilityError, "sdp_compatibility"),
+            (AAPHandshakeError, "aap_handshake"),
+            (AAPChannelError, "aap_channel"),
+            (HeartRateSessionError, "heart_rate_session"),
+            (AdapterRestoreError, "adapter_restore"),
+            (HandoffError, "handoff"),
+            (ClassicAuthenticationError, "classic_authentication"),
+        )
+        category = next(
+            (name for kind, name in categories if isinstance(error, kind)),
+            "unexpected",
+        )
+        stderr(_native.app_monitor_command_error(category))
     return 1
