@@ -130,6 +130,31 @@ class UnitRenderingTests(unittest.TestCase):
         with self.assertRaisesRegex(ServiceInstallerError, "must be absolute"):
             exec_start_for(Path("venv/bin/python"))
 
+    def test_executable_error_messages_match_historical_contract(self) -> None:
+        paths = (
+            ('/home/a"b/python', "double quote"),
+            ("/home/a'b/python", "single quote"),
+            ("/home/a\\b/python", "backslash"),
+            ("/home/$name/bin/python", "dollar sign"),
+            ("/home/a*b/python", "asterisk"),
+            ("/home/a?b/python", "question mark"),
+            ("/home/a[b/python", "opening square bracket"),
+        )
+        for path, name in paths:
+            with self.subTest(path=path), self.assertRaises(ServiceInstallerError) as caught:
+                render_systemd_executable_path(Path(path))
+            self.assertEqual(
+                str(caught.exception),
+                f"daemon Python executable contains unsupported {name}: {path}",
+            )
+        for path, expected in (
+            ("venv/bin/python", "daemon Python executable must be absolute"),
+            ("/bad\npath", "daemon Python executable contains a control character"),
+        ):
+            with self.subTest(path=path), self.assertRaises(ServiceInstallerError) as caught:
+                render_systemd_executable_path(Path(path))
+            self.assertEqual(str(caught.exception), expected)
+
     def test_generated_unit_preserves_accepted_service_options(self) -> None:
         unit = render_unit(Path("/opt/airpods/bin/python"))
         for expected in (

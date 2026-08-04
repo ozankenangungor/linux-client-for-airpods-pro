@@ -1442,8 +1442,10 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/bluez_sdp_audit.py",
                 "airpods_hr/_hubd/protocol.py",
                 "airpods_hr/_hubd/server.py",
+                "airpods_hr/service_installer.py",
             },
         )
+
 
 
 class HubProbeTests(unittest.TestCase):
