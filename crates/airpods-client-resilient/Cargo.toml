@@ -1,0 +1,17 @@
+[package]
+name = "airpods-client-resilient"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Optional finite daemon reconnect layer for airpods-client"
+readme = "README.md"
+repository = "https://github.com/ozankenangungor/airpods-hr-linux"
+homepage = "https://github.com/ozankenangungor/airpods-hr-linux"
+
+[dependencies]
+airpods-client = { path = "../airpods-client" }
+tokio = { version = "1.47", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt", "test-util"] }
