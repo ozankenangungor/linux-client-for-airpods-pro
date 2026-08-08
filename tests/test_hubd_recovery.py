@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from dbus_next.errors import DBusError
 
@@ -153,6 +154,19 @@ class BlockingSleeper(ImmediateSleeper):
         except asyncio.CancelledError:
             self.cancelled = True
             raise
+
+
+class SteppedSleeper(ImmediateSleeper):
+    def __init__(self) -> None:
+        super().__init__()
+        self.permits: asyncio.Queue[None] = asyncio.Queue()
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        await self.permits.get()
+
+    def release(self) -> None:
+        self.permits.put_nowait(None)
 
 
 class RecordingEpochRefresher:
@@ -341,11 +355,21 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
         restored = ScriptedSession()
         daemon, factory = self.make_daemon([failed, restored], sleeper)
 
-        await daemon.start()
+        retry_boundary: list[tuple[list[str], int]] = []
+        original_transition = daemon._transition
+
+        def record_transition(event: str) -> None:
+            if event == "recovery_retry":
+                retry_boundary.append((list(failed.events), factory.active_sessions))
+            original_transition(event)
+
+        with patch.object(daemon, "_transition", side_effect=record_transition):
+            await daemon.start()
 
         self.assertEqual(factory.calls, 2)
         self.assertEqual(sleeper.delays, [1.0])
         self.assertEqual(failed.events, ["open", "close"])
+        self.assertEqual(retry_boundary, [(["open", "close"], 0)])
         self.assertEqual(restored.events, ["open"])
         self.assertEqual(daemon.state, DaemonState.READY)
 
@@ -465,6 +489,72 @@ class HubRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(factory.calls, 5)
         self.assertEqual(sleeper.delays, [1.0, 2.0, 5.0, 10.0])
         self.assertEqual(daemon.state, DaemonState.STREAMING)
+
+    async def test_recoverable_start_failure_retries_for_original_subscriber(self) -> None:
+        sleeper = SteppedSleeper()
+        initial = ScriptedSession()
+        first_failed_start = ScriptedSession(
+            start_error=RecoverableSessionFailure("temporary start failure")
+        )
+        second_failed_start = ScriptedSession(
+            start_error=RecoverableSessionFailure("temporary start failure")
+        )
+        restored = ScriptedSession()
+        daemon, factory, client = await self.start_streaming(
+            [initial, first_failed_start, second_failed_start, restored], sleeper
+        )
+
+        initial.inject(RecoverableSessionFailure("peer closed"))
+        await self.wait_for(lambda: sleeper.delays == [1.0])
+        self.assertEqual(daemon.state, DaemonState.STARTING)
+        sleeper.release()
+        await self.wait_for(lambda: sleeper.delays == [1.0, 2.0])
+        self.assertEqual(daemon.state, DaemonState.STARTING)
+        sleeper.release()
+        await self.wait_for(lambda: sleeper.delays == [1.0, 2.0, 5.0])
+        self.assertEqual(daemon.state, DaemonState.STARTING)
+        sleeper.release()
+        await self.wait_for(lambda: factory.calls == 4 and not daemon.recovery_active)
+
+        self.assertEqual(daemon.state, DaemonState.STREAMING)
+        self.assertEqual(daemon.subscriber_count, 1)
+        self.assertEqual(sleeper.delays, [1.0, 2.0, 5.0])
+        for failed_start in (first_failed_start, second_failed_start):
+            self.assertEqual(failed_start.events, ["open", "start", "stop", "close"])
+        self.assertEqual(factory.maximum_active_sessions, 1)
+        restored.inject(canonical_report(93))
+        event = await client.read()
+        self.assertEqual(event["event"], "heart_rate")
+        self.assertEqual(event["bpm"], 93)
+        self.assertEqual(event["source_side"], "right")
+        self.assertEqual(daemon.subscriber_count, 1)
+
+    async def test_last_subscriber_leaves_during_start_failure_backoff(self) -> None:
+        sleeper = SteppedSleeper()
+        initial = ScriptedSession()
+        failed_start = ScriptedSession(
+            start_error=RecoverableSessionFailure("temporary start failure")
+        )
+        restored = ScriptedSession()
+        daemon, factory, client = await self.start_streaming(
+            [initial, failed_start, restored], sleeper
+        )
+
+        initial.inject(RecoverableSessionFailure("peer closed"))
+        await self.wait_for(lambda: sleeper.delays == [1.0])
+        sleeper.release()
+        await self.wait_for(lambda: sleeper.delays == [1.0, 2.0])
+        self.assertEqual(daemon.state, DaemonState.STARTING)
+        reply = await client.request("unsubscribe", stream="heart_rate")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(daemon.subscriber_count, 0)
+        sleeper.release()
+        await self.wait_for(lambda: factory.calls == 3 and not daemon.recovery_active)
+
+        self.assertEqual(daemon.state, DaemonState.READY)
+        self.assertEqual(restored.events, ["open"])
+        self.assertEqual(sleeper.delays, [1.0, 2.0])
+        self.assertEqual(factory.maximum_active_sessions, 1)
 
     async def test_backoff_caps_at_ten_seconds(self) -> None:
         sleeper = ImmediateSleeper()

@@ -1127,6 +1127,22 @@ class HubDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.daemon._lock_fd)
         self.assertTrue(self.daemon._lock_path.exists())
 
+    async def test_shutdown_waits_for_inflight_stop_commit(self) -> None:
+        await self.start()
+        client = await self.client()
+        await self.subscribe(client)
+        self.factory.session.stop_gate = asyncio.Event()
+        subscription = next(iter(self.daemon._clients))
+        unsubscribe_task = asyncio.create_task(self.daemon._unsubscribe(subscription))
+        await self.wait_for(lambda: self.factory.session.stop_calls == 1)
+        shutdown_task = asyncio.create_task(self.daemon.shutdown())
+        await self.wait_for(lambda: self.daemon._shutdown_requested)
+        self.factory.session.stop_gate.set()
+        self.assertFalse(await unsubscribe_task)
+        await shutdown_task
+        self.assertEqual(self.daemon.state, DaemonState.STOPPED)
+        self.assertEqual(self.factory.session.stop_calls, 1)
+
     async def test_shutdown_does_not_remove_replacement_regular_file(self) -> None:
         await self.start()
         self.socket_path.unlink()
@@ -1442,11 +1458,12 @@ class SocketPathSafetyTests(unittest.TestCase):
                 "airpods_hr/bluez_sdp_audit.py",
                 "airpods_hr/_hubd/protocol.py",
                 "airpods_hr/_hubd/server.py",
+                "airpods_hr/_hubd/main.py",
+                "airpods_hr/_hubd/production.py",
                 "airpods_hr/monitor_cli.py",
                 "airpods_hr/service_installer.py",
             },
         )
-
 
 
 class HubProbeTests(unittest.TestCase):

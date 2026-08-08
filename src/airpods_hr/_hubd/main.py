@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import math
 import signal
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
+
+from airpods_hr import _airpods_aap_core as _native
 
 from airpods_hr._hubd.production import (
     DEFAULT_DAEMON_OPERATION_TIMEOUT,
@@ -21,6 +22,7 @@ from airpods_hr._hubd.server import (
     DaemonAlreadyRunningError,
     DaemonState,
     HubDaemonError,
+    SessionOperationError,
     UnsafeSocketPathError,
     socket_path_from_environment,
 )
@@ -57,17 +59,25 @@ class AsyncioSignalRegistrar:
 
 def _safe_failure_name(error: BaseException) -> str:
     if isinstance(error, DaemonAlreadyRunningError):
-        return "already_running"
+        return _native.app_runner_safe_failure("already_running")
     if isinstance(error, UnsafeSocketPathError):
-        return "unsafe_socket_path"
+        return _native.app_runner_safe_failure("unsafe_socket_path")
     if isinstance(error, ValueError):
-        return "invalid_configuration"
+        return _native.app_runner_safe_failure("invalid_configuration")
     category = getattr(error, "category", None)
     if category is not None:
-        return getattr(category, "value", "production_session_failed")
+        value = getattr(category, "value", None)
+        if isinstance(value, str):
+            try:
+                return _native.app_runner_production_category(value)
+            except ValueError:
+                pass
+        return _native.app_runner_safe_failure("production_session")
+    if isinstance(error, SessionOperationError):
+        return _native.app_runner_safe_failure("session_operation")
     if isinstance(error, HubDaemonError):
-        return type(error).__name__
-    return "unexpected_failure"
+        return _native.app_runner_safe_failure("hub_daemon")
+    return _native.app_runner_safe_failure("unexpected")
 
 
 async def run_daemon(
@@ -141,11 +151,11 @@ async def run_daemon(
                 await stop_task
 
         if first_signal is not None:
-            exit_code = 128 + int(first_signal)
+            exit_code = _native.app_runner_outcome(None, int(first_signal), True)
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)):
             raise
-        exit_code = EXIT_FAILURE
+        exit_code = _native.app_runner_outcome("unexpected", None, True)
         failure_name = _safe_failure_name(error)
         log.error("daemon failed: %s", failure_name)
         if verbose:
@@ -162,10 +172,10 @@ async def run_daemon(
             try:
                 await hub.daemon.shutdown()
             except BaseException as error:
-                exit_code = EXIT_FAILURE
+                exit_code = _native.app_runner_outcome(None, None, False)
                 log.error("daemon cleanup failed: %s", _safe_failure_name(error))
             if hub.daemon.state is not DaemonState.STOPPED:
-                exit_code = EXIT_FAILURE
+                exit_code = _native.app_runner_outcome(None, None, False)
                 log.error("daemon cleanup failed: incomplete_shutdown")
             else:
                 log.info("daemon stopped")
@@ -210,15 +220,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logger = _configure_logging(args.verbose)
     try:
-        if not math.isfinite(args.operation_timeout):
-            raise ValueError("operation timeout must be finite")
         config = ProductionHubConfig(
             daemon_operation_timeout=args.operation_timeout
         )
         socket_path = args.socket_path or socket_path_from_environment()
     except (ValueError, UnsafeSocketPathError) as error:
         logger.error("configuration failed: %s", _safe_failure_name(error))
-        return EXIT_CONFIGURATION
+        return _native.app_runner_outcome("invalid_configuration", None, True)
     try:
         return asyncio.run(
             run_daemon(
@@ -229,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     except KeyboardInterrupt:
-        return 128 + int(signal.SIGINT)
+        return _native.app_runner_outcome(None, int(signal.SIGINT), True)
 
 
 __all__: list[str] = []
