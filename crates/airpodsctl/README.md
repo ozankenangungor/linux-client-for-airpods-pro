@@ -2,7 +2,7 @@
 
 `airpodsctl` is an experimental, unpublished Rust command-line client for a
 running `airpods-hubd`. It uses the public Rust `airpods-client` SDK and owns no
-Bluetooth connection. It does not start, stop, restart, or reconnect the daemon.
+Bluetooth connection. It does not start, stop, or restart the daemon.
 
 Build it from this repository with `cargo build --locked -p airpodsctl`, then
 run `target/debug/airpodsctl`. The daemon must already be running. By default,
@@ -15,6 +15,7 @@ airpodsctl ping
 airpodsctl status
 airpodsctl status --json
 airpodsctl watch
+airpodsctl watch --reconnect
 airpodsctl watch --count 10 --json
 airpodsctl --socket /path/to/hubd.sock watch
 ```
@@ -30,8 +31,10 @@ stream termination, or an error.
 Normal success exits 0. After an active subscription, Ctrl-C requests
 unsubscribe and waits for the daemon response before exiting 130. Failed
 cleanup and other runtime errors print to stderr and exit 1. Invalid command
-usage follows clap's nonzero usage exit behavior. The CLI never retries a
-terminal daemon disconnect.
+usage follows clap's nonzero usage exit behavior. Ordinary `watch` never retries a terminal daemon disconnect. `watch --reconnect`
+opts into finite Unix reconnect (1, 2, 5, 10, 10 seconds). Human lifecycle
+notices go to stderr; JSON lifecycle objects go to stdout. `--count` counts
+only samples. Ctrl-C during backoff stops before another connection attempt.
 
 This v0.1 output is experimental. BPM values have not been medically validated.
 This software is not a medical device and must not be used for diagnosis,

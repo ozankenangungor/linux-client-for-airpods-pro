@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 use airpods_client::{AirPodsClient, DaemonState, HeartRateSample, Hello, SourceSide, Status};
+use airpods_client_resilient::{
+    ReconnectPolicy, ResilientHeartRateEvent, ResilientHeartRateStream,
+};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::io::{self, Write};
@@ -29,6 +32,9 @@ pub enum Command {
         /// Stop after N samples and confirm unsubscribe
         #[arg(long, value_name = "N")]
         count: Option<NonZeroU64>,
+        /// Retry a lost daemon connection with a finite schedule
+        #[arg(long)]
+        reconnect: bool,
     },
 }
 
@@ -114,8 +120,12 @@ fn client_error(error: airpods_client::Error, explicit_socket: bool) -> String {
 /// Execute one CLI command. Returns the process exit code on non-error outcomes.
 pub async fn run(cli: Cli) -> Result<u8, String> {
     let explicit_socket = cli.socket.is_some();
-    if let Command::Watch { count } = cli.command {
-        return watch(cli.socket, cli.json, count, explicit_socket).await;
+    if let Command::Watch { count, reconnect } = cli.command {
+        return if reconnect {
+            watch_resilient(cli.socket, cli.json, count, explicit_socket).await
+        } else {
+            watch(cli.socket, cli.json, count, explicit_socket).await
+        };
     }
     let client = match cli.socket {
         Some(path) => AirPodsClient::connect_to(path).await,
@@ -148,6 +158,92 @@ pub async fn run(cli: Cli) -> Result<u8, String> {
     };
     output(&line)?;
     Ok(0)
+}
+
+fn resilient_error(error: airpods_client_resilient::Error, explicit_socket: bool) -> String {
+    match error {
+        airpods_client_resilient::Error::Client(error) => client_error(error, explicit_socket),
+        airpods_client_resilient::Error::RetryExhausted {
+            attempts,
+            last_error,
+        } => format!(
+            "daemon reconnect exhausted after {attempts} {}: {}",
+            if attempts == 1 { "attempt" } else { "attempts" },
+            client_error(last_error, explicit_socket),
+        ),
+    }
+}
+
+async fn watch_resilient(
+    socket: Option<PathBuf>,
+    json_mode: bool,
+    count: Option<NonZeroU64>,
+    explicit_socket: bool,
+) -> Result<u8, String> {
+    watch_resilient_with_policy(
+        socket,
+        json_mode,
+        count,
+        explicit_socket,
+        ReconnectPolicy::default(),
+    )
+    .await
+}
+
+async fn watch_resilient_with_policy(
+    socket: Option<PathBuf>,
+    json_mode: bool,
+    count: Option<NonZeroU64>,
+    explicit_socket: bool,
+    policy: ReconnectPolicy,
+) -> Result<u8, String> {
+    let mut stream = match socket {
+        Some(path) => ResilientHeartRateStream::explicit_socket(path, policy),
+        None => ResilientHeartRateStream::default_socket(policy),
+    };
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let mut received = 0_u64;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut interrupt => {
+                result.map_err(|error| format!("waiting for Ctrl-C: {error}"))?;
+                stream.close().await.map_err(|error| resilient_error(error, explicit_socket))?;
+                return Ok(130);
+            }
+            result = stream.next() => {
+                match result.map_err(|error| resilient_error(error, explicit_socket))? {
+                    Some(ResilientHeartRateEvent::Sample(sample)) => {
+                        output(&render_sample(sample, json_mode))?;
+                        received += 1;
+                        if count.is_some_and(|limit| received == limit.get()) {
+                            stream.close().await.map_err(|error| resilient_error(error, explicit_socket))?;
+                            return Ok(0);
+                        }
+                    }
+                    Some(ResilientHeartRateEvent::Reconnecting { attempt, delay }) => {
+                        if json_mode {
+                            output(&json!({"event":"reconnecting","attempt":attempt,"delay_ms":delay.as_millis()}).to_string())?;
+                        } else {
+                            eprintln!("reconnecting to airpods-hubd: attempt {attempt} in {}s", delay.as_secs());
+                        }
+                    }
+                    Some(ResilientHeartRateEvent::Reconnected { attempts }) => {
+                        if json_mode {
+                            output(&json!({"event":"reconnected","attempts":attempts}).to_string())?;
+                        } else {
+                            eprintln!("reconnected to airpods-hubd after {attempts} {}", if attempts == 1 { "attempt" } else { "attempts" });
+                        }
+                    }
+                    None => {
+                        stream.close().await.map_err(|error| resilient_error(error, explicit_socket))?;
+                        return Ok(0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn watch(

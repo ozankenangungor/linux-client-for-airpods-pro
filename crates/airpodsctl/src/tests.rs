@@ -21,12 +21,28 @@ fn cli_parses_commands_and_global_option_positions() {
     assert!(matches!(
         Cli::try_parse_from(["airpodsctl", "watch", "--count", "10"]),
         Ok(Cli {
-            command: Command::Watch { count: Some(_) },
+            command: Command::Watch {
+                count: Some(_),
+                reconnect: false
+            },
             ..
         })
     ));
     assert!(Cli::try_parse_from(["airpodsctl", "watch", "--count", "0"]).is_err());
     assert!(Cli::try_parse_from(["airpodsctl", "watch", "--count", "-1"]).is_err());
+    assert!(matches!(
+        Cli::try_parse_from(["airpodsctl", "watch", "--reconnect"]),
+        Ok(Cli {
+            command: Command::Watch {
+                reconnect: true,
+                ..
+            },
+            ..
+        })
+    ));
+    for command in ["hello", "ping", "status"] {
+        assert!(Cli::try_parse_from(["airpodsctl", command, "--reconnect"]).is_err());
+    }
 }
 
 #[test]
@@ -280,4 +296,92 @@ async fn absent_socket_is_clean_error() {
     let cli =
         Cli::try_parse_from(["airpodsctl", "status", "--socket", path.to_str().unwrap()]).unwrap();
     assert!(run(cli).await.unwrap_err().contains("could not connect"));
+}
+
+#[tokio::test]
+async fn resilient_retry_exhaustion_is_a_runtime_failure() {
+    let path = socket_path();
+    let policy = ReconnectPolicy::new(vec![Duration::from_millis(1)]).unwrap();
+    let error = watch_resilient_with_policy(Some(path), true, None, true, policy)
+        .await
+        .unwrap_err();
+    assert!(error.contains("exhausted after 1 attempt"));
+}
+
+#[test]
+fn resilient_exhaustion_masks_default_socket_path() {
+    let private_path = PathBuf::from("/distinctive/private/review-only.sock");
+    let rendered = resilient_error(
+        airpods_client_resilient::Error::RetryExhausted {
+            attempts: 5,
+            last_error: airpods_client::Error::Connect {
+                path: private_path.clone(),
+                kind: std::io::ErrorKind::ConnectionRefused,
+                message: "connection refused".to_owned(),
+            },
+        },
+        false,
+    );
+    assert!(rendered.contains("daemon reconnect exhausted after 5 attempts"));
+    assert!(
+        rendered.contains("could not connect to default airpods-hubd socket: connection refused")
+    );
+    assert!(!rendered.contains(private_path.to_str().unwrap()));
+}
+
+#[test]
+fn resilient_exhaustion_keeps_explicit_socket_path() {
+    let private_path = PathBuf::from("/distinctive/private/review-only.sock");
+    let rendered = resilient_error(
+        airpods_client_resilient::Error::RetryExhausted {
+            attempts: 5,
+            last_error: airpods_client::Error::Connect {
+                path: private_path.clone(),
+                kind: std::io::ErrorKind::ConnectionRefused,
+                message: "connection refused".to_owned(),
+            },
+        },
+        true,
+    );
+    assert!(rendered.contains("daemon reconnect exhausted after 5 attempts"));
+    assert!(rendered.contains(private_path.to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn resilient_protocol_failure_does_not_retry() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        assert_eq!(read_request(&mut reader).await["operation"], "subscribe");
+        respond(
+            &mut write,
+            json!({"protocol_version":2,"ok":true,"operation":"subscribe"}),
+        )
+        .await;
+        let mut extra = String::new();
+        timeout(Duration::from_secs(3), reader.read_line(&mut extra))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extra.is_empty());
+    });
+    let cli = Cli::try_parse_from([
+        "airpodsctl",
+        "watch",
+        "--reconnect",
+        "--socket",
+        path.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        run(cli)
+            .await
+            .unwrap_err()
+            .contains("unsupported daemon protocol version")
+    );
+    server.await.unwrap();
+    std::fs::remove_file(path).unwrap();
 }
