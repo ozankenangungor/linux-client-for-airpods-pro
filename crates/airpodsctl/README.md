@@ -16,6 +16,7 @@ airpodsctl status
 airpodsctl status --json
 airpodsctl watch
 airpodsctl watch --reconnect
+airpodsctl top
 airpodsctl watch --count 10 --json
 airpodsctl --socket /path/to/hubd.sock watch
 ```
@@ -35,6 +36,22 @@ usage follows clap's nonzero usage exit behavior. Ordinary `watch` never retries
 opts into finite Unix reconnect (1, 2, 5, 10, 10 seconds). Human lifecycle
 notices go to stderr; JSON lifecycle objects go to stdout. `--count` counts
 only samples. Ctrl-C during backoff stops before another connection attempt.
+
+`top` is an interactive dashboard using the existing resilient client. It
+requires terminal stdin and stdout, and rejects `--json` before opening the
+terminal or connecting. It does not start or restart the daemon. Its current
+reading, connection status, sparkline, and recent rows show unmodified samples,
+including duplicates and unknown source bytes. It retains at most 120 samples
+for display and keeps a separate total count. It provides no medical
+interpretation. Terminals smaller than 50 columns or 18 rows show compact help.
+
+Press `q` or Esc for a clean exit (0), or Ctrl-C for an interrupt exit (130).
+SIGTERM exits 143. On these and other catchable ordinary exits, the CLI
+restores raw mode and the alternate screen before confirmed stream cleanup and
+before printing an error. Cleanup failures exit 1. SIGKILL, kill -9, and
+machine failure cannot be intercepted, so application-level restoration is
+impossible in those cases. `top` is part of this unpublished CLI, not a
+separate release artifact.
 
 This v0.1 output is experimental. BPM values have not been medically validated.
 This software is not a medical device and must not be used for diagnosis,

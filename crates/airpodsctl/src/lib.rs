@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod top;
 use airpods_client::{AirPodsClient, DaemonState, HeartRateSample, Hello, SourceSide, Status};
 use airpods_client_resilient::{
     ReconnectPolicy, ResilientHeartRateEvent, ResilientHeartRateStream,
@@ -10,6 +9,8 @@ use serde_json::json;
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+
+mod top;
 
 #[derive(Debug, Parser)]
 #[command(name = "airpodsctl", version, about = "Inspect a running airpods-hubd")]
@@ -29,6 +30,7 @@ pub enum Command {
     Hello,
     Ping,
     Status,
+    Top,
     Watch {
         /// Stop after N samples and confirm unsubscribe
         #[arg(long, value_name = "N")]
@@ -121,6 +123,9 @@ fn client_error(error: airpods_client::Error, explicit_socket: bool) -> String {
 /// Execute one CLI command. Returns the process exit code on non-error outcomes.
 pub async fn run(cli: Cli) -> Result<u8, String> {
     let explicit_socket = cli.socket.is_some();
+    if let Command::Top = cli.command {
+        return top::run(cli.socket, cli.json, explicit_socket).await;
+    }
     if let Command::Watch { count, reconnect } = cli.command {
         return if reconnect {
             watch_resilient(cli.socket, cli.json, count, explicit_socket).await
@@ -156,6 +161,7 @@ pub async fn run(cli: Cli) -> Result<u8, String> {
             cli.json,
         ),
         Command::Watch { .. } => unreachable!("watch dispatched above"),
+        Command::Top => unreachable!("top dispatched above"),
     };
     output(&line)?;
     Ok(0)

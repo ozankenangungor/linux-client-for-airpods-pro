@@ -1,9 +1,9 @@
-use super :: * ;
-use airpods_client :: SourceSide ;
-use crossterm :: event :: KeyEvent ;
-use ratatui :: Terminal ;
-use ratatui :: backend :: TestBackend ;
-use std :: cell :: RefCell ;
+use super::*;
+use airpods_client::SourceSide;
+use crossterm::event::KeyEvent;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use std::cell::RefCell;
 
 fn sample(bpm: u8, source_side: SourceSide) -> HeartRateSample {
     HeartRateSample { bpm, source_side }

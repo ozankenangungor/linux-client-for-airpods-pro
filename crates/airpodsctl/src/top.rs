@@ -1,24 +1,26 @@
 //! Interactive, opt-in dashboard for the existing resilient heart-rate stream.
 
-use airpods_client :: HeartRateSample ;
-use airpods_client_resilient :: { ResilientHeartRateEvent } ;
-use crossterm :: event :: { self , Event , KeyCode , KeyEventKind , KeyModifiers } ;
-use ratatui :: layout :: { Constraint , Layout , Rect } ;
-use ratatui :: widgets :: { Block , List , ListItem , Paragraph , Sparkline } ;
-use ratatui :: { DefaultTerminal , Frame } ;
-use std :: collections :: VecDeque ;
-use std :: future :: Future ;
-
-
-use std :: time :: Duration ;
-
-
+use airpods_client::HeartRateSample;
+use airpods_client_resilient::{
+    ReconnectPolicy, ResilientHeartRateEvent, ResilientHeartRateStream,
+};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Sparkline};
+use ratatui::{DefaultTerminal, Frame};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::io::{self, IsTerminal};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::MissedTickBehavior;
 
 const HISTORY_CAPACITY: usize = 120;
 // Below this size, a compact help screen avoids truncated dashboard sections.
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 18;
-
+const INPUT_TICK: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TopConnectionState {
@@ -245,7 +247,96 @@ where
     }
 }
 
-
+pub(super) async fn run(
+    socket: Option<PathBuf>,
+    json_mode: bool,
+    explicit_socket: bool,
+) -> Result<u8, String> {
+    if json_mode {
+        return Err("--json cannot be used with top".into());
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("top requires terminal stdin and stdout".into());
+    }
+    let mut term = signal(SignalKind::terminate())
+        .map_err(|error| format!("listening for SIGTERM: {error}"))?;
+    let mut interrupt = signal(SignalKind::interrupt())
+        .map_err(|error| format!("listening for SIGINT: {error}"))?;
+    let mut stream = match socket {
+        Some(path) => ResilientHeartRateStream::explicit_socket(path, ReconnectPolicy::default()),
+        None => ResilientHeartRateStream::default_socket(ReconnectPolicy::default()),
+    };
+    let mut guard = TerminalGuard::init()?;
+    let mut model = TopModel::default();
+    let mut dirty = true;
+    let mut ended = false;
+    let mut tick = tokio::time::interval(INPUT_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let outcome = 'event_loop: loop {
+        // Keep this future alive across input ticks and resizes. Dropping it on
+        // every tick could cancel an in-flight connect or subscribe repeatedly.
+        let was_ended = ended;
+        let next = async {
+            if was_ended {
+                std::future::pending().await
+            } else {
+                stream.next().await
+            }
+        };
+        tokio::pin!(next);
+        loop {
+            if dirty {
+                if let Err(error) = guard.draw(&model) {
+                    break 'event_loop Err(error);
+                }
+                dirty = false;
+            }
+            tokio::select! {
+                biased;
+                received = interrupt.recv() => {
+                    break 'event_loop received.map(|()| 130).ok_or_else(|| "SIGINT listener ended".into());
+                }
+                received = term.recv() => {
+                    break 'event_loop received.map(|()| 143).ok_or_else(|| "SIGTERM listener ended".into());
+                }
+                _ = tick.tick() => {
+                    for _ in 0..64 {
+                        match event::poll(Duration::ZERO) {
+                            Ok(false) => break,
+                            Ok(true) => match event::read() {
+                                Ok(input) => match input_action(input) {
+                                    InputAction::Ignore => {},
+                                    InputAction::Redraw => dirty = true,
+                                    InputAction::Quit(code) => break 'event_loop Ok(code),
+                                },
+                                Err(error) => break 'event_loop Err(format!("reading terminal event: {error}")),
+                            },
+                            Err(error) => break 'event_loop Err(format!("polling terminal events: {error}")),
+                        }
+                    }
+                }
+                result = &mut next => {
+                    match result {
+                        Ok(Some(event)) => { model.apply(event); dirty = true; break; }
+                        Ok(None) => { model.connection = TopConnectionState::Ended; ended = true; dirty = true; break; }
+                        Err(error) => break 'event_loop Err(super::resilient_error(error, explicit_socket)),
+                    }
+                }
+            }
+        }
+    };
+    settle(
+        outcome,
+        || guard.restore(),
+        || async {
+            stream
+                .close()
+                .await
+                .map_err(|error| super::resilient_error(error, explicit_socket))
+        },
+    )
+    .await
+}
 
 #[cfg(test)]
 mod tests;

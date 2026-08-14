@@ -7,7 +7,7 @@ use tokio::time::{Duration, timeout};
 
 #[test]
 fn cli_parses_commands_and_global_option_positions() {
-    for command in ["hello", "ping", "status", "watch"] {
+    for command in ["hello", "ping", "status", "watch", "top"] {
         assert!(Cli::try_parse_from(["airpodsctl", command]).is_ok());
         for args in [
             vec!["airpodsctl", "--json", command],
@@ -31,6 +31,22 @@ fn cli_parses_commands_and_global_option_positions() {
     assert!(Cli::try_parse_from(["airpodsctl", "watch", "--count", "0"]).is_err());
     assert!(Cli::try_parse_from(["airpodsctl", "watch", "--count", "-1"]).is_err());
     assert!(matches!(
+        Cli::try_parse_from(["airpodsctl", "--socket", "/chosen.sock", "top"]),
+        Ok(Cli {
+            socket: Some(_),
+            command: Command::Top,
+            ..
+        })
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["airpodsctl", "top", "--socket", "/chosen.sock"]),
+        Ok(Cli {
+            socket: Some(_),
+            command: Command::Top,
+            ..
+        })
+    ));
+    assert!(matches!(
         Cli::try_parse_from(["airpodsctl", "watch", "--reconnect"]),
         Ok(Cli {
             command: Command::Watch {
@@ -42,6 +58,17 @@ fn cli_parses_commands_and_global_option_positions() {
     ));
     for command in ["hello", "ping", "status"] {
         assert!(Cli::try_parse_from(["airpodsctl", command, "--reconnect"]).is_err());
+    }
+}
+
+#[tokio::test]
+async fn top_json_is_rejected_before_terminal_or_socket_effects() {
+    for args in [
+        ["airpodsctl", "--json", "top", "--socket", "/missing.sock"],
+        ["airpodsctl", "top", "--json", "--socket", "/missing.sock"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(run(cli).await, Err("--json cannot be used with top".into()));
     }
 }
 
