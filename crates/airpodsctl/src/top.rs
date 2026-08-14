@@ -2,12 +2,12 @@
 
 use airpods_client :: HeartRateSample ;
 use airpods_client_resilient :: { ResilientHeartRateEvent } ;
-use crossterm :: event :: { self } ;
+use crossterm :: event :: { self , Event , KeyCode , KeyEventKind , KeyModifiers } ;
 use ratatui :: layout :: { Constraint , Layout , Rect } ;
 use ratatui :: widgets :: { Block , List , ListItem , Paragraph , Sparkline } ;
-use ratatui :: { Frame } ;
+use ratatui :: { DefaultTerminal , Frame } ;
 use std :: collections :: VecDeque ;
-
+use std :: future :: Future ;
 
 
 use std :: time :: Duration ;
@@ -153,18 +153,97 @@ impl TopModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputAction {
+    Ignore,
+    Redraw,
+    Quit(u8),
+}
 
+fn input_action(event: Event) -> InputAction {
+    match event {
+        Event::Resize(..) => InputAction::Redraw,
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::Quit(130)
+            }
+            KeyCode::Char('q') | KeyCode::Esc => InputAction::Quit(0),
+            _ => InputAction::Ignore,
+        },
+        _ => InputAction::Ignore,
+    }
+}
 
+struct TerminalGuard {
+    terminal: Option<DefaultTerminal>,
+}
 
+impl TerminalGuard {
+    fn init() -> Result<Self, String> {
+        match ratatui::try_init() {
+            Ok(terminal) => Ok(Self {
+                terminal: Some(terminal),
+            }),
+            Err(error) => {
+                let restore = ratatui::try_restore().err();
+                let mut message = format!("initializing terminal: {error}");
+                if let Some(restore) = restore {
+                    message.push_str(&format!("; restoring terminal: {restore}"));
+                }
+                Err(message)
+            }
+        }
+    }
 
+    fn draw(&mut self, model: &TopModel) -> Result<(), String> {
+        match self.terminal.as_mut() {
+            Some(terminal) => terminal
+                .draw(|frame| model.render(frame))
+                .map(|_| ())
+                .map_err(|error| format!("drawing terminal: {error}")),
+            None => Err("terminal has already been restored".into()),
+        }
+    }
 
+    fn restore(&mut self) -> Result<(), String> {
+        self.terminal.take();
+        ratatui::try_restore().map_err(|error| format!("restoring terminal: {error}"))
+    }
+}
 
-
-
-
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.terminal.is_some() {
+            let _ = self.restore();
+        }
+    }
+}
 
 // Both effects run in order on every ordinary exit. The primary runtime error wins.
-
+async fn settle<R, C, F>(primary: Result<u8, String>, restore: R, close: C) -> Result<u8, String>
+where
+    R: FnOnce() -> Result<(), String>,
+    C: FnOnce() -> F,
+    F: Future<Output = Result<(), String>>,
+{
+    let restore_error = restore().err();
+    let close_error = close().await.err();
+    let mut errors = Vec::new();
+    if let Err(error) = primary.as_ref() {
+        errors.push(error.clone());
+    }
+    if let Some(error) = restore_error {
+        errors.push(error);
+    }
+    if let Some(error) = close_error {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        primary
+    } else {
+        Err(errors.join("; "))
+    }
+}
 
 
 
