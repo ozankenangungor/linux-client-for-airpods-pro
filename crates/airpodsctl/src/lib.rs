@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod top;
 use airpods_client::{AirPodsClient, DaemonState, HeartRateSample, Hello, SourceSide, Status};
 use airpods_client_resilient::{
     ReconnectPolicy, ResilientHeartRateEvent, ResilientHeartRateStream,
