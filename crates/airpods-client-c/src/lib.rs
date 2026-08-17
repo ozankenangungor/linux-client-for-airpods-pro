@@ -5,6 +5,7 @@
 mod error;
 mod ffi;
 mod model;
+mod worker;
 
 #[cfg(test)]
 mod tests;

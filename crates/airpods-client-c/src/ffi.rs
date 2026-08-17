@@ -6,16 +6,16 @@
 //! Serialize operations on each client, including close/free. NULL getters are
 //! invalid usage but receive defensive fallbacks. Dangling pointers are caller UB.
 
-use crate :: error :: Error ;
-use crate :: model :: { Hello , Status , StringView } ;
+use crate::error::Error;
+use crate::model::{Hello, HrSample, Status, StringView};
+use crate::worker::{Client, Connect, Operation, Reply, Wait};
+use std::ffi::{CStr, OsString, c_char};
+use std::os::unix::ffi::OsStringExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-
-
-use std :: panic :: { AssertUnwindSafe , catch_unwind } ;
-
-
-
-
+pub(crate) const OK: u32 = 0;
+pub(crate) const TIMEOUT: u32 = 1;
+pub(crate) const END: u32 = 2;
 pub(crate) const ERROR: u32 = 3;
 
 pub(crate) fn guarded<T>(fallback: T, work: impl FnOnce() -> T) -> T {
@@ -58,9 +58,20 @@ unsafe fn result_boundary(
     })
 }
 
+unsafe fn output<T>(pointer: *mut *mut T) -> Result<(), Error> {
+    if pointer.is_null() {
+        return Err(Error::invalid_argument());
+    }
+    // SAFETY: the caller guarantees a live, aligned, writable output slot.
+    unsafe { pointer.write(std::ptr::null_mut()) };
+    Ok(())
+}
 
-
-
+unsafe fn required<'a, T>(pointer: *const T) -> Result<&'a T, Error> {
+    // SAFETY: non-null input is live and aligned for the call. No reference
+    // escapes the call; caller serialization prevents concurrent client free.
+    unsafe { pointer.as_ref() }.ok_or_else(Error::invalid_argument)
+}
 
 unsafe fn view<T, R: Copy>(pointer: *const T, fallback: R, read: impl FnOnce(&T) -> R) -> R {
     guarded(fallback, || {
@@ -92,25 +103,193 @@ pub extern "C" fn airpods_client_protocol_version() -> u64 {
     })
 }
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_connect(
+    out_client: *mut *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: outputs are caller-owned writable slots; the handle is transferred once.
+    unsafe {
+        result_boundary(out_error, || {
+            output(out_client)?;
+            let client = Client::connect(Connect::Default)?;
+            out_client.write(Box::into_raw(Box::new(client)));
+            Ok(OK)
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments satisfy the caller contract; path is NUL terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_connect_to(
+    socket_path: *const c_char,
+    out_client: *mut *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: path is readable through its NUL and outputs are valid writable slots.
+    unsafe {
+        result_boundary(out_error, || {
+            output(out_client)?;
+            if socket_path.is_null() {
+                return Err(Error::invalid_argument());
+            }
+            let path = OsString::from_vec(CStr::from_ptr(socket_path).to_bytes().to_vec());
+            let client = Client::connect(Connect::Explicit(path.into()))?;
+            out_client.write(Box::into_raw(Box::new(client)));
+            Ok(OK)
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_ping(
+    client: *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client remains alive and its operations are serialized; error slot is valid.
+    unsafe {
+        result_boundary(out_error, || {
+            required(client)?.request(Operation::Ping)?;
+            Ok(OK)
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_hello(
+    client: *mut Client,
+    out_hello: *mut *mut Hello,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client is live; outputs are writable and do not alias client or each other.
+    unsafe {
+        result_boundary(out_error, || {
+            output(out_hello)?;
+            match required(client)?.request(Operation::Hello)? {
+                Reply::Hello(hello) => {
+                    out_hello.write(Box::into_raw(Box::new(hello)));
+                    Ok(OK)
+                }
+                _ => Err(Error::internal()),
+            }
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_status(
+    client: *mut Client,
+    out_status: *mut *mut Status,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client is live; outputs are writable and do not alias client or each other.
+    unsafe {
+        result_boundary(out_error, || {
+            output(out_status)?;
+            match required(client)?.request(Operation::Status)? {
+                Reply::Status(status) => {
+                    out_status.write(Box::into_raw(Box::new(status)));
+                    Ok(OK)
+                }
+                _ => Err(Error::internal()),
+            }
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_hr_subscribe(
+    client: *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client remains alive with serialized calls; optional error slot is writable.
+    unsafe {
+        result_boundary(out_error, || {
+            required(client)?.request(Operation::Subscribe)?;
+            Ok(OK)
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_hr_unsubscribe(
+    client: *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client remains alive with serialized calls; optional error slot is writable.
+    unsafe {
+        result_boundary(out_error, || {
+            required(client)?.request(Operation::Unsubscribe)?;
+            Ok(OK)
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_hr_next(
+    client: *mut Client,
+    timeout_ms: u32,
+    out_sample: *mut HrSample,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: sample/error outputs are writable and disjoint; client is live and serialized.
+    unsafe {
+        result_boundary(out_error, || {
+            if out_sample.is_null() {
+                return Err(Error::invalid_argument());
+            }
+            out_sample.write(HrSample::default());
+            match required(client)?.request(Operation::Next(Wait::milliseconds(timeout_ms)))? {
+                Reply::Sample(sample) => {
+                    out_sample.write(sample);
+                    Ok(OK)
+                }
+                Reply::Timeout => Ok(TIMEOUT),
+                Reply::End => Ok(END),
+                _ => Err(Error::internal()),
+            }
+        })
+    }
+}
 
+/// # Safety
+/// Pointer arguments must satisfy this module's caller contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_close(
+    client: *mut Client,
+    out_error: *mut *mut Error,
+) -> u32 {
+    // SAFETY: client stays allocated through its serialized close; error output is writable.
+    unsafe {
+        result_boundary(out_error, || {
+            required(client)?.close()?;
+            Ok(OK)
+        })
+    }
+}
 
-
-
-
-
-
-
-
-
-
-
+/// # Safety
+/// The live owned handle is freed once, without overlapping operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn airpods_client_free(client: *mut Client) {
+    // SAFETY: caller transfers its unique handle ownership; NULL is a no-op.
+    unsafe { release(client) }
+}
 
 /// # Safety
 /// Non-null error is a live object returned by this ABI.
