@@ -1,0 +1,16 @@
+[package]
+name = "airpods-client-c"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+airpods-client = { path = "../airpods-client", version = "0.1.0" }
+tokio = { version = "1.47", features = ["rt", "net", "sync", "time", "macros"] }
+
+[dev-dependencies]
+serde_json = "1.0"

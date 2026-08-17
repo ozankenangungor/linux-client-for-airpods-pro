@@ -4,6 +4,7 @@ members = [
     "crates/airpods-aap-core",
     "crates/airpods-aap-py",
     "crates/airpods-client",
+    "crates/airpods-client-c",
     "crates/airpods-client-resilient",
     "crates/airpodsctl",
     "crates/airpods-hub-core",

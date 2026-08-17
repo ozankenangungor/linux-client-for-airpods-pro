@@ -34,6 +34,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "airpods-client-c"
+version = "0.1.0"
+dependencies = [
+ "airpods-client",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "airpods-client-resilient"
 version = "0.1.0"
 dependencies = [
