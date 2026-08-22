@@ -3,8 +3,10 @@
 
 
 
+mod command;
 
 
+mod env;
 
 
 mod paths;
