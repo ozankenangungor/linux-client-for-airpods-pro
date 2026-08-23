@@ -1,16 +1,13 @@
 #![forbid(unsafe_code)]
 
-
+mod archive;
 
 
 mod command;
 
 
 mod env;
-
-
 mod paths;
-
 
 
 #[cfg(test)]

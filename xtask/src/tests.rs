@@ -1,6 +1,6 @@
-use crate :: { command , env , paths } ;
+use crate :: { archive , command , env , paths } ;
 
-use std :: { ffi :: OsString , fs , time :: { Duration , Instant } } ;
+use std :: { ffi :: OsString , fs , io :: Write , path :: Path , time :: { Duration , Instant } } ;
 
 
 
@@ -228,19 +228,152 @@ fn dangling_symlink_output_rejected() {
 
 
 
+fn write_zip(path: &Path, members: &[(&str, &[u8])]) {
+    let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());
+    for (name, data) in members {
+        archive
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(data).unwrap();
+    }
+    archive.finish().unwrap();
+}
+fn write_tar(path: &Path, members: &[(&str, &[u8])], timestamp: u32) {
+    let encoder = flate2::GzBuilder::new().mtime(timestamp).write(
+        fs::File::create(path).unwrap(),
+        flate2::Compression::default(),
+    );
+    let mut archive = tar::Builder::new(encoder);
+    for (name, data) in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(timestamp.into());
+        header.set_uid(timestamp.into());
+        // Raw name allows malicious traversal fixtures that Builder's normal API rejects.
+        let bytes = header.as_mut_bytes();
+        bytes[..100].fill(0);
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        archive.append(&header, *data).unwrap();
+    }
+    archive.into_inner().unwrap().finish().unwrap();
+}
+#[test]
+fn zip_traversal_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("x.whl");
+    for name in [
+        "../escape",
+        "/absolute",
+        "a/../../escape",
+        "C:/escape",
+        "a\\..\\escape",
+    ] {
+        write_zip(&p, &[(name, b"x")]);
+        assert!(archive::zip(&p).is_err(), "{name}");
+    }
+}
+#[test]
+fn tar_traversal_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("x.tar.gz");
+    for name in ["../escape", "/absolute", "a/../../escape"] {
+        write_tar(&p, &[(name, b"x")], 1);
+        assert!(archive::tar(&p, true).is_err(), "{name}");
+    }
+}
+#[test]
+fn tar_symlink_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("link.tar");
+    let mut builder = tar::Builder::new(fs::File::create(&p).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_cksum();
+    builder
+        .append_link(&mut header, "link", "../escape")
+        .unwrap();
+    builder.finish().unwrap();
+    assert!(archive::tar(&p, false).is_err());
+}
 
 
 
 
-
-
-
-
-
-
-
-
-
+#[test]
+fn sdist_semantic_digest_ignores_metadata() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("a.tar.gz");
+    let b = t.path().join("b.tar.gz");
+    write_tar(&a, &[("root/a", b"one"), ("root/b", b"two")], 1);
+    write_tar(&b, &[("root/b", b"two"), ("root/./a", b"one")], 2);
+    assert_ne!(archive::hash(&a).unwrap(), archive::hash(&b).unwrap());
+    assert_eq!(
+        archive::semantic_sdist_digest(&a).unwrap(),
+        archive::semantic_sdist_digest(&b).unwrap()
+    );
+}
+#[test]
+fn sdist_semantic_digest_tracks_content() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("a.tar.gz");
+    let b = t.path().join("b.tar.gz");
+    write_tar(&a, &[("root/a", b"one")], 1);
+    write_tar(&b, &[("root/a", b"changed")], 1);
+    assert_ne!(
+        archive::semantic_sdist_digest(&a).unwrap(),
+        archive::semantic_sdist_digest(&b).unwrap()
+    );
+}
+#[test]
+fn extraction_cannot_follow_existing_symlink() {
+    let t = tempfile::tempdir().unwrap();
+    let out = t.path().join("out");
+    let elsewhere = t.path().join("elsewhere");
+    fs::create_dir(&out).unwrap();
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.join("link")).unwrap();
+    let p = t.path().join("x.tar.gz");
+    write_tar(&p, &[("link/file", b"x")], 1);
+    assert!(archive::extract_tar(&p, &out, true).is_err());
+    assert!(!elsewhere.join("file").exists());
+}
+#[test]
+fn source_export_matches_data_filter_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("modes.tar");
+    let mut builder = tar::Builder::new(fs::File::create(&path).unwrap());
+    for (name, mode) in [
+        ("data", 0o664),
+        ("non_owner_exec", 0o665),
+        ("executable", 0o775),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, b"x".as_slice())
+            .unwrap();
+    }
+    builder.finish().unwrap();
+    let out = t.path().join("out");
+    archive::extract_tar(&path, &out, false).unwrap();
+    for (name, expected) in [
+        ("data", 0o644),
+        ("non_owner_exec", 0o644),
+        ("executable", 0o755),
+    ] {
+        assert_eq!(
+            fs::metadata(out.join(name)).unwrap().permissions().mode() & 0o777,
+            expected
+        );
+    }
+}
 
 
 
