@@ -7,6 +7,7 @@ mod command;
 
 
 mod env;
+mod git;
 mod paths;
 
 

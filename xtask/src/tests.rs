@@ -1,4 +1,4 @@
-use crate :: { archive , command , env , paths } ;
+use crate :: { archive , command , env , git , paths } ;
 
 use std :: { ffi :: OsString , fs , io :: Write , path :: Path , time :: { Duration , Instant } } ;
 
@@ -200,8 +200,50 @@ fn dangling_symlink_output_rejected() {
 
 
 
-
-
+#[test]
+fn commit_sha_policy() {
+    assert!(git::valid_commit(&"a".repeat(40)));
+    assert!(!git::valid_commit(&"A".repeat(40)));
+    assert!(!git::valid_commit(&"g".repeat(40)));
+}
+#[test]
+fn committed_source_export_handles_git_pax_metadata() {
+    let t = tempfile::tempdir().unwrap();
+    let repo = t.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    command::output(["git", "init", "--quiet"], &repo).unwrap();
+    fs::write(repo.join("committed.txt"), "committed bytes\n").unwrap();
+    command::output(["git", "add", "committed.txt"], &repo).unwrap();
+    command::output(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        &repo,
+    )
+    .unwrap();
+    let commit = git::clean_commit(&repo).unwrap();
+    let destination = t.path().join("export");
+    git::export(&repo, &commit, &destination).unwrap();
+    assert_eq!(
+        fs::read(destination.join("committed.txt")).unwrap(),
+        b"committed bytes\n"
+    );
+    assert!(!destination.join(".git").exists());
+    assert!(!destination.join("pax_global_header").exists());
+    assert!(git::unchanged(&repo, &"b".repeat(40)).is_err());
+    fs::write(repo.join("untracked.txt"), b"dirty fixture").unwrap();
+    assert!(git::clean_commit(&repo).is_err());
+}
 
 
 
