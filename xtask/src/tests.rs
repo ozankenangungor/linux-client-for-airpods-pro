@@ -1,8 +1,41 @@
-use crate :: { archive , command , env , git , paths , static_policy } ;
+use crate::{archive, command, env, git, manifest, paths, static_policy};
+use serde_json::{Value, json};
+use std::{
+    ffi::OsString,
+    fs,
+    io::Write,
+    path::Path,
+    time::{Duration, Instant},
+};
 
-use std :: { ffi :: OsString , fs , io :: Write , path :: Path , time :: { Duration , Instant } } ;
-
-
+fn fixture_manifest() -> Value {
+    let artifacts: Vec<_> = manifest::ARTIFACT_SET
+        .iter()
+        .zip([
+            "production.whl",
+            "production.tar.gz",
+            "client.whl",
+            "client.tar.gz",
+            "client.crate",
+        ])
+        .map(|((kind, package), name)| {
+            json!({"kind": kind, "package": package, "version": crate::VERSION,
+        "filename": name, "sha256": "a".repeat(64), "size": 1})
+        })
+        .collect();
+    let repeated: Vec<_> = artifacts
+        .iter()
+        .map(|a| json!({"filename": a["filename"], "byte_for_byte_equal": true}))
+        .collect();
+    json!({"schema_version": 1, "release_version": crate::VERSION,
+        "git": {"commit": "a".repeat(40), "clean": true}, "source_date_epoch": 1,
+        "toolchain": {"python": "3.14.7", "python_implementation": "CPython", "python_build_frontend": "build 1.3.0",
+            "setuptools": "84.0.0", "wheel": "0.48.0", "maturin": "1.15.0", "rustc": "rustc test", "cargo": "cargo test", "platform": "Linux-test"},
+        "artifacts": artifacts,
+        "repeat_build_check": {"source_date_epoch": 1, "artifact_count": 5, "matched_artifact_count": 5,
+            "byte_for_byte_equal": true, "artifacts": repeated, "scope": manifest::REPEAT_SCOPE, "reproducible_build_guarantee": false},
+        "validation": {"bluetooth_hardware_used": false, "production_daemon_started": false, "published": false}})
+}
 
 // Use this test executable as the deterministic child; no shell, hardware or network.
 #[test]
@@ -294,30 +327,81 @@ fn committed_source_export_handles_git_pax_metadata() {
     assert!(git::clean_commit(&repo).is_err());
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#[test]
+fn manifest_valid() {
+    manifest::validate(&fixture_manifest()).unwrap();
+}
+macro_rules! bad_manifest {
+    ($name:ident, $value:ident, $change:block) => { #[test] fn $name() { let mut $value = fixture_manifest(); $change assert!(manifest::validate(&$value).is_err()); } };
+}
+bad_manifest!(manifest_missing_field, m, {
+    m.as_object_mut().unwrap().remove("source_date_epoch");
+});
+bad_manifest!(manifest_extra_field, m, {
+    m["extra"] = json!(1);
+});
+bad_manifest!(manifest_duplicate_filename, m, {
+    m["artifacts"][1]["filename"] = m["artifacts"][0]["filename"].clone();
+});
+bad_manifest!(manifest_private_filename, m, {
+    m["artifacts"][0]["filename"] = json!("/private/production.whl");
+});
+bad_manifest!(manifest_relative_filename, m, {
+    m["artifacts"][0]["filename"] = json!("../production.whl");
+});
+bad_manifest!(manifest_sixth_c_artifact, m, {
+    let mut extra = m["artifacts"][4].clone();
+    extra["package"] = json!("airpods-client-c");
+    m["artifacts"].as_array_mut().unwrap().push(extra);
+});
+bad_manifest!(manifest_c_artifact_replacement, m, {
+    m["artifacts"][4]["package"] = json!("airpods-client-c");
+});
+bad_manifest!(manifest_ffi_filename, m, {
+    m["artifacts"][4]["filename"] = json!("ffi.crate");
+});
+bad_manifest!(manifest_xtask_artifact, m, {
+    m["artifacts"][4]["package"] = json!("xtask");
+});
+bad_manifest!(manifest_xtask_filename, m, {
+    m["artifacts"][4]["filename"] = json!("xtask.crate");
+});
+bad_manifest!(manifest_validation_boolean, m, {
+    m["validation"]["published"] = json!(true);
+});
+bad_manifest!(manifest_repeat_names, m, {
+    m["repeat_build_check"]["artifacts"][0]["filename"] = json!("other.whl");
+});
+bad_manifest!(manifest_reproducibility_claim, m, {
+    m["repeat_build_check"]["reproducible_build_guarantee"] = json!(true);
+});
+bad_manifest!(manifest_dirty_git, m, {
+    m["git"]["clean"] = json!(false);
+});
+bad_manifest!(manifest_bad_commit, m, {
+    m["git"]["commit"] = json!("z".repeat(40));
+});
+bad_manifest!(manifest_bad_hash, m, {
+    m["artifacts"][0]["sha256"] = json!("z".repeat(64));
+});
+bad_manifest!(manifest_zero_size, m, {
+    m["artifacts"][0]["size"] = json!(0);
+});
+bad_manifest!(manifest_nonpositive_epoch, m, {
+    m["source_date_epoch"] = json!(0);
+});
+bad_manifest!(manifest_bad_repeat_count, m, {
+    m["repeat_build_check"]["matched_artifact_count"] = json!(6);
+});
+bad_manifest!(manifest_inconsistent_repeat_count, m, {
+    m["repeat_build_check"]["matched_artifact_count"] = json!(3);
+});
+bad_manifest!(manifest_wrong_version, m, {
+    m["release_version"] = json!("0.2.0");
+});
+bad_manifest!(manifest_wrong_schema, m, {
+    m["schema_version"] = json!(2);
+});
 
 fn write_zip(path: &Path, members: &[(&str, &[u8])]) {
     let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());

@@ -8,6 +8,7 @@ mod command;
 
 mod env;
 mod git;
+mod manifest;
 mod paths;
 
 
