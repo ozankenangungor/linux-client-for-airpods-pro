@@ -1,4 +1,4 @@
-use crate :: { archive , command , env , git , paths } ;
+use crate :: { archive , command , env , git , paths , static_policy } ;
 
 use std :: { ffi :: OsString , fs , io :: Write , path :: Path , time :: { Duration , Instant } } ;
 
@@ -194,12 +194,61 @@ fn dangling_symlink_output_rejected() {
     assert!(paths::output_dir(&out, &r).is_err());
 }
 
-
-
-
-
-
-
+#[test]
+fn static_version_mismatch() {
+    assert!(static_policy::version("0.2.0").is_err());
+}
+#[test]
+fn static_version_documents() {
+    for section in ["project", "package"] {
+        static_policy::version_document(
+            &format!("[{section}]\nname='fixture'\nversion='0.1.0'\n"),
+            section,
+        )
+        .unwrap();
+        assert!(
+            static_policy::version_document(&format!("[{section}]\nversion='0.2.0'\n"), section)
+                .is_err()
+        );
+        assert!(
+            static_policy::version_document(&format!("[{section}]\nname='fixture'\n"), section)
+                .is_err()
+        );
+    }
+}
+#[test]
+fn static_sensitive_paths() {
+    for p in [
+        "captures/file",
+        "dump.PCAP",
+        "keys/LinkKey.json",
+        "target/a",
+        "secret.pem",
+    ] {
+        assert!(static_policy::sensitive(p).is_err(), "{p}");
+    }
+}
+#[test]
+fn static_private_docs_paths() {
+    for text in [
+        "checkout /home/kenan/project",
+        "checkout ~/airpods-hr-linux",
+    ] {
+        assert!(static_policy::documentation(text).is_err());
+    }
+}
+#[test]
+fn static_stale_docs() {
+    for marker in static_policy::STALE {
+        assert!(static_policy::documentation(marker).is_err());
+    }
+}
+#[test]
+fn static_safe_examples() {
+    static_policy::version(crate::VERSION).unwrap();
+    static_policy::sensitive("xtask/src/paths.rs").unwrap();
+    static_policy::documentation("cargo xtask release parity; Python remains canonical").unwrap();
+}
 #[test]
 fn commit_sha_policy() {
     assert!(git::valid_commit(&"a".repeat(40)));
@@ -341,9 +390,43 @@ fn tar_symlink_rejected() {
     builder.finish().unwrap();
     assert!(archive::tar(&p, false).is_err());
 }
-
-
-
+#[test]
+fn archive_c_sdk_contamination() {
+    for name in [
+        "crates/airpods-client-c/src/lib.rs",
+        "include/airpods_client.h",
+        "libairpods_client_c.so",
+        "libairpods_client_c.a",
+        "tests/c_ffi_probe.c",
+        "debug/c-probe",
+        "src/ffi.rs",
+    ] {
+        assert!(archive::policy(name).is_err(), "{name}");
+    }
+}
+#[test]
+fn archive_xtask_contamination() {
+    for name in [
+        "root/xtask/src/main.rs",
+        "root/.cargo/config.toml",
+        "root/release-shadow-debug.txt",
+    ] {
+        assert!(archive::policy(name).is_err(), "{name}");
+    }
+}
+#[test]
+fn archive_generated_contamination() {
+    for name in [
+        "root/tests/x.py",
+        "root/target/x",
+        "root/captures/x",
+        "root/__pycache__/x",
+        "root/a.log",
+        "root/LinkKey.json",
+    ] {
+        assert!(archive::policy(name).is_err(), "{name}");
+    }
+}
 
 #[test]
 fn sdist_semantic_digest_ignores_metadata() {

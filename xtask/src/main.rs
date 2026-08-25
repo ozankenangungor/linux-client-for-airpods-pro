@@ -11,6 +11,7 @@ mod git;
 mod paths;
 
 
+mod static_policy;
 #[cfg(test)]
 mod tests;
 

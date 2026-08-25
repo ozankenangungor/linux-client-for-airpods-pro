@@ -207,10 +207,69 @@ pub fn semantic_sdist_digest(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+pub fn policy(name: &str) -> Result<()> {
+    member_policy(name, false)
+}
 
-
-
-
+fn member_policy(name: &str, packaged_rust_tests: bool) -> Result<()> {
+    let lower = name.to_lowercase();
+    for marker in [
+        "airpods-client-c",
+        "airpods_client_c",
+        "airpods_client.h",
+        "c_ffi",
+        "c-probe",
+        "/ffi.rs",
+    ] {
+        ensure!(
+            !lower.contains(marker),
+            "repository-only C SDK material: {name}"
+        );
+    }
+    let parts: Vec<_> = lower.split('/').collect();
+    ensure!(
+        !parts.contains(&"xtask")
+            && !lower.ends_with(".cargo/config.toml")
+            && !parts
+                .iter()
+                .any(|p| p.starts_with("release-parity") || p.starts_with("release-shadow")),
+        "repository-only xtask/release tooling: {name}"
+    );
+    ensure!(
+        !lower.contains("airpodsctl") && !lower.contains("airpods-client-resilient"),
+        "independent application material: {name}"
+    );
+    ensure!(
+        !parts.iter().any(|p| [
+            "captures",
+            "dumps",
+            "target",
+            "__pycache__",
+            "secrets",
+            "credentials"
+        ]
+        .contains(p)
+            || (!packaged_rust_tests && *p == "tests")),
+        "generated/private material: {name}"
+    );
+    ensure!(
+        !parts.iter().any(|p| [
+            ".log", ".pcap", ".pcapng", ".btsnoop", ".pem", ".key", ".pyc"
+        ]
+        .iter()
+        .any(|suffix| p.ends_with(suffix))
+            || p.contains("linkkey")
+            || p.contains("link-key")),
+        "generated/credential-like material: {name}"
+    );
+    Ok(())
+}
+pub fn audit_members(members: &Members) -> Result<()> {
+    for name in members.keys() {
+        policy(name)?;
+    }
+    Ok(())
+}
 
 
 
