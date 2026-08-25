@@ -1,8 +1,14 @@
 //! Archives are inspected as data. Extraction accepts only safe regular files/directories.
-use anyhow :: { Context , Result , ensure } ;
-use flate2 :: read :: GzDecoder ;
-use sha2 :: { Digest , Sha256 } ;
-use std :: { collections :: BTreeMap , fs :: { self , File } , io :: { Read , Write } , os :: unix :: fs :: PermissionsExt , path :: Path } ;
+use anyhow::{Context, Result, ensure};
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::{Read, Write},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+};
 
 const MAX_MEMBER: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE: usize = 512 * 1024 * 1024;
@@ -271,13 +277,266 @@ pub fn audit_members(members: &Members) -> Result<()> {
     Ok(())
 }
 
+type Metadata = BTreeMap<String, Vec<String>>;
+type Entries = BTreeMap<String, String>;
+pub fn wheel_metadata(members: &Members) -> Result<(Metadata, Entries)> {
+    let metadata: Vec<_> = members
+        .iter()
+        .filter(|(name, _)| name.ends_with(".dist-info/METADATA"))
+        .collect();
+    ensure!(metadata.len() == 1, "expected one METADATA file");
+    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let text = std::str::from_utf8(metadata[0].1.as_ref().context("METADATA is not regular")?)?;
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            let key = last.as_ref().context("invalid metadata continuation")?;
+            fields
+                .get_mut(key)
+                .context("metadata field")?
+                .last_mut()
+                .context("metadata value")?
+                .push_str(line.trim());
+        } else if let Some((key, value)) = line.split_once(':') {
+            last = Some(key.to_owned());
+            fields
+                .entry(key.to_owned())
+                .or_default()
+                .push(value.trim().to_owned());
+        }
+    }
+    let mut entries = BTreeMap::new();
+    if let Some((_, Some(data))) = members
+        .iter()
+        .find(|(n, _)| n.ends_with(".dist-info/entry_points.txt"))
+    {
+        let mut console = false;
+        for line in std::str::from_utf8(data)?.lines().map(str::trim) {
+            if line.starts_with('[') {
+                console = line == "[console_scripts]";
+            } else if console && let Some((key, value)) = line.split_once('=') {
+                entries.insert(key.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+    }
+    Ok((fields, entries))
+}
 
-
-
-
-
-
-
-
-
-
+pub fn production_wheel(path: &Path) -> Result<()> {
+    let members = zip(path)?;
+    audit_members(&members)?;
+    ensure!(
+        members.keys().any(|n| n.starts_with("airpods_hr/")),
+        "production wheel lacks airpods_hr"
+    );
+    ensure!(
+        members.contains_key("airpods_hr/service_installer.py"),
+        "production wheel lacks service installer"
+    );
+    ensure!(
+        members
+            .keys()
+            .filter(|n| n.starts_with("airpods_hr/_airpods_aap_core.") && n.ends_with(".so"))
+            .count()
+            == 1,
+        "production wheel must contain exactly one native Rust extension"
+    );
+    ensure!(
+        !members.keys().any(|n| n.starts_with("airpods_client/")),
+        "production wheel contains standalone client"
+    );
+    let (fields, entries) = wheel_metadata(&members)?;
+    identity(&members, &fields, "airpods-hr-linux")?;
+    let dependencies: std::collections::BTreeSet<_> = fields
+        .get("Requires-Dist")
+        .into_iter()
+        .flatten()
+        .map(|v| v.split(';').next().unwrap_or_default().trim())
+        .collect();
+    ensure!(
+        dependencies
+            == ["bumble==0.0.234", "dbus-next>=0.2.3"]
+                .into_iter()
+                .collect(),
+        "production dependency metadata mismatch: {dependencies:?}"
+    );
+    ensure!(
+        entries.keys().map(String::as_str).collect::<Vec<_>>()
+            == ["airpods-hr", "airpods-hubd", "airpods-hubd-service"],
+        "production console entrypoints mismatch"
+    );
+    Ok(())
+}
+fn identity(
+    members: &Members,
+    fields: &BTreeMap<String, Vec<String>>,
+    package: &str,
+) -> Result<()> {
+    for (field, expected) in [
+        ("Name", package),
+        ("Version", crate::VERSION),
+        ("License-Expression", "MIT"),
+    ] {
+        ensure!(
+            fields
+                .get(field)
+                .and_then(|v| v.first())
+                .map(String::as_str)
+                == Some(expected),
+            "wheel {field} mismatch"
+        );
+    }
+    ensure!(
+        members
+            .keys()
+            .any(|n| n.ends_with(".dist-info/licenses/LICENSE")),
+        "wheel lacks packaged license"
+    );
+    Ok(())
+}
+pub fn client_wheel(path: &Path) -> Result<()> {
+    let members = zip(path)?;
+    audit_members(&members)?;
+    ensure!(
+        members.keys().any(|n| n.starts_with("airpods_client/")),
+        "client wheel lacks airpods_client"
+    );
+    for name in members.keys() {
+        let root = name.split('/').next().unwrap_or_default();
+        ensure!(
+            root == "airpods_client" || root.ends_with(".dist-info"),
+            "unexpected client wheel root: {root}"
+        );
+        ensure!(
+            !name.contains("airpods_hr"),
+            "client wheel contains daemon material"
+        );
+    }
+    let (fields, entries) = wheel_metadata(&members)?;
+    identity(&members, &fields, "airpods-client")?;
+    ensure!(
+        !fields.contains_key("Requires-Dist") && entries.is_empty(),
+        "client wheel dependencies/entrypoints must be empty"
+    );
+    Ok(())
+}
+pub const PRODUCTION_SOURCES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "pyproject.toml",
+    "crates/airpods-aap-core/Cargo.toml",
+    "crates/airpods-aap-core/src/lib.rs",
+    "crates/airpods-aap-core/src/heart_rate.rs",
+    "crates/airpods-aap-core/src/production.rs",
+    "crates/airpods-aap-core/src/recovery.rs",
+    "crates/airpods-aap-py/Cargo.toml",
+    "crates/airpods-aap-py/src/lib.rs",
+    "crates/airpods-aap-py/src/app_runtime_policy_bridge.rs",
+    "crates/airpods-app-core/Cargo.toml",
+    "crates/airpods-app-core/src/lib.rs",
+    "crates/airpods-app-core/src/daemon.rs",
+    "crates/airpods-app-core/src/production_config.rs",
+    "crates/airpods-app-core/src/runner.rs",
+    "crates/airpods-app-core/src/monitor.rs",
+    "crates/airpods-app-core/src/service.rs",
+    "crates/airpods-app-core/src/path_policy.rs",
+];
+pub fn sdist(path: &Path, package: &str) -> Result<()> {
+    let members = tar(path, true)?;
+    audit_members(&members)?;
+    let production = package == "airpods-hr-linux";
+    let required = if production {
+        "src/airpods_hr/"
+    } else {
+        "src/airpods_client/"
+    };
+    ensure!(
+        members.keys().any(|n| n.contains(required)),
+        "sdist lacks {required}"
+    );
+    ensure!(
+        members.keys().any(|n| n.ends_with("/LICENSE")),
+        "sdist lacks packaged license"
+    );
+    if production {
+        ensure!(
+            !members.keys().any(|n| n.contains("/src/airpods_client/")),
+            "production sdist contains standalone client"
+        );
+        let root = members
+            .keys()
+            .next()
+            .context("sdist root")?
+            .split('/')
+            .next()
+            .context("sdist root name")?;
+        for source in PRODUCTION_SOURCES {
+            ensure!(
+                members
+                    .get(&format!("{root}/{source}"))
+                    .is_some_and(Option::is_some),
+                "production sdist lacks {source}"
+            );
+        }
+        ensure!(
+            !members
+                .keys()
+                .any(|n| n.ends_with(".so") || n.ends_with(".pyd")),
+            "sdist contains prebuilt native extension"
+        );
+    } else {
+        ensure!(
+            !members
+                .keys()
+                .any(|n| n.contains("airpods_hr") || n.contains("/crates/")),
+            "client sdist contains daemon/Rust material"
+        );
+    }
+    Ok(())
+}
+pub fn rust_crate(path: &Path, root: &Path) -> Result<()> {
+    let members = tar(path, true)?;
+    // The public crate carries its own tests; repository integration probes
+    // are excluded below. Wheels and sdists still exclude all test trees.
+    for name in members.keys() {
+        member_policy(name, true)?;
+    }
+    let license = format!("airpods-client-{}/LICENSE", crate::VERSION);
+    ensure!(
+        members.get(&license).and_then(Option::as_ref) == Some(&fs::read(root.join("LICENSE"))?),
+        "Rust crate license differs"
+    );
+    let (_, data) = members
+        .iter()
+        .find(|(n, _)| n.ends_with("/Cargo.toml"))
+        .context("crate lacks Cargo.toml")?;
+    let manifest: toml::Value = toml::from_str(std::str::from_utf8(
+        data.as_ref().context("crate manifest not regular")?,
+    )?)?;
+    ensure!(
+        manifest["package"]["license"].as_str() == Some("MIT"),
+        "Rust crate license metadata mismatch"
+    );
+    for name in members.keys() {
+        ensure!(
+            ![
+                "integration_probe.rs",
+                "/target/",
+                ".py",
+                "airpods_hr",
+                "airpods-client-python"
+            ]
+            .iter()
+            .any(|m| name.contains(m)),
+            "Rust crate contains repository-only material: {name}"
+        );
+    }
+    ensure!(
+        members.keys().any(|n| n.ends_with("/src/lib.rs")),
+        "Rust crate lacks src/lib.rs"
+    );
+    Ok(())
+}

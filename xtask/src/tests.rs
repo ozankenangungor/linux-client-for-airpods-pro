@@ -427,7 +427,18 @@ fn archive_generated_contamination() {
         assert!(archive::policy(name).is_err(), "{name}");
     }
 }
-
+#[test]
+fn wheel_metadata_extraction() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("x.whl");
+    write_zip(&p, &[("p.dist-info/METADATA", b"Name: package\nVersion: 0.1.0\nRequires-Dist: first\nRequires-Dist: second\n\nbody\n"),
+        ("p.dist-info/entry_points.txt", b"[console_scripts]\nthing = package:main\n[other]\nignored = x\n")]);
+    let (metadata, entries) = archive::wheel_metadata(&archive::zip(&p).unwrap()).unwrap();
+    assert_eq!(metadata["Name"], ["package"]);
+    assert_eq!(metadata["Requires-Dist"], ["first", "second"]);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries["thing"], "package:main");
+}
 #[test]
 fn sdist_semantic_digest_ignores_metadata() {
     let t = tempfile::tempdir().unwrap();
@@ -499,7 +510,74 @@ fn source_export_matches_data_filter_file_permissions() {
         );
     }
 }
-
-
-
+#[test]
+fn production_sdist_requires_full_build_sources() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path().join("p.tar.gz");
+    let mut names = vec![
+        "root/LICENSE".to_owned(),
+        "root/src/airpods_hr/__init__.py".to_owned(),
+    ];
+    names.extend(
+        archive::PRODUCTION_SOURCES
+            .iter()
+            .map(|s| format!("root/{s}")),
+    );
+    let all: Vec<_> = names
+        .iter()
+        .map(|s| (s.as_str(), b"fixture".as_slice()))
+        .collect();
+    write_tar(&p, &all, 1);
+    archive::sdist(&p, "airpods-hr-linux").unwrap();
+    for missing in archive::PRODUCTION_SOURCES {
+        let subset: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(s, _)| *s != format!("root/{missing}"))
+            .collect();
+        write_tar(&p, &subset, 1);
+        assert!(archive::sdist(&p, "airpods-hr-linux").is_err(), "{missing}");
+    }
+}
+#[test]
+fn rust_crate_manifest_document_audit() {
+    let t = tempfile::tempdir().unwrap();
+    fs::write(t.path().join("LICENSE"), b"fixture license").unwrap();
+    let path = t.path().join("fixture.crate");
+    write_tar(
+        &path,
+        &[
+            ("airpods-client-0.1.0/LICENSE", b"fixture license"),
+            (
+                "airpods-client-0.1.0/tests/client.rs",
+                b"// public crate contract tests",
+            ),
+            (
+                "airpods-client-0.1.0/src/lib.rs",
+                b"pub struct AirPodsClient;",
+            ),
+            (
+                "airpods-client-0.1.0/Cargo.toml",
+                b"[package]\nname='airpods-client'\nversion='0.1.0'\nlicense='MIT'\n",
+            ),
+        ],
+        1,
+    );
+    archive::rust_crate(&path, t.path()).unwrap();
+}
+#[test]
+fn all_audits_reject_xtask_and_c_sdk_first() {
+    let t = tempfile::tempdir().unwrap();
+    for name in ["xtask/src/main.rs", "crates/airpods-client-c/src/lib.rs"] {
+        let wheel = t.path().join("x.whl");
+        write_zip(&wheel, &[(name, b"x")]);
+        assert!(archive::production_wheel(&wheel).is_err());
+        assert!(archive::client_wheel(&wheel).is_err());
+        let tar = t.path().join("x.tar.gz");
+        write_tar(&tar, &[(name, b"x")], 1);
+        assert!(archive::sdist(&tar, "airpods-hr-linux").is_err());
+        assert!(archive::sdist(&tar, "airpods-client").is_err());
+        assert!(archive::rust_crate(&tar, t.path()).is_err());
+    }
+}
 
