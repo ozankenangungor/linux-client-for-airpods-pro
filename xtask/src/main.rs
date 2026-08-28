@@ -4,6 +4,7 @@ mod archive;
 
 
 mod command;
+mod consumer;
 mod env;
 mod git;
 mod manifest;
