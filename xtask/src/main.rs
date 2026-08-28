@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod artifact;
 mod archive;
 
 
