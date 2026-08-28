@@ -1,6 +1,11 @@
-use crate :: { archive , command :: { self , COMMAND_TIMEOUT , TEST_TIMEOUT } , env , python :: Python } ;
-use anyhow :: { Context , Result , ensure } ;
-use std :: { fs , path :: Path , time :: Duration } ;
+use crate::{
+    archive,
+    command::{self, COMMAND_TIMEOUT, TEST_TIMEOUT},
+    env,
+    python::Python,
+};
+use anyhow::{Context, Result, ensure};
+use std::{fs, path::Path, time::Duration};
 
 pub fn production(wheel: &Path, work: &Path, selected: &Python) -> Result<()> {
     let python = selected.venv(work)?;
@@ -195,4 +200,27 @@ pub fn production_sdist(
     archive::production_wheel(&paths[0])?;
     production(&paths[0], &work.join("consumer"), selected)
 }
-
+pub fn rust(crate_path: &Path, work: &Path) -> Result<()> {
+    archive::extract_tar(crate_path, &work.join("package"), true)?;
+    let consumer = work.join("consumer");
+    fs::create_dir_all(consumer.join("src"))?;
+    fs::write(
+        consumer.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"release-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nairpods-client = {{ path = \"../package/airpods-client-{}\" }}\n",
+            crate::VERSION
+        ),
+    )?;
+    fs::write(
+        consumer.join("src/main.rs"),
+        include_str!("../probes/rust_consumer.rs"),
+    )?;
+    for args in [
+        vec!["cargo", "generate-lockfile"],
+        vec!["cargo", "check", "--locked"],
+    ] {
+        command::run(args, &consumer, &env::clean(), TEST_TIMEOUT, false)
+            .context("external packaged Rust consumer")?;
+    }
+    Ok(())
+}

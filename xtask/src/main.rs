@@ -5,6 +5,7 @@ mod archive;
 
 mod command;
 mod consumer;
+mod cross_language;
 mod env;
 mod git;
 mod manifest;
