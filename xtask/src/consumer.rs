@@ -1,5 +1,5 @@
 use crate::{
-    archive,
+    archive, artifact,
     command::{self, COMMAND_TIMEOUT, TEST_TIMEOUT},
     env,
     python::Python,
@@ -174,22 +174,20 @@ pub fn production_sdist(
     archive::extract_tar(sdist, &work.join("source"), true)?;
     let project = work.join(format!("source/airpods_hr_linux-{}", crate::VERSION));
     let wheels = work.join("wheels");
-    command::run(
-        [
-            build_python.as_os_str(),
-            "-m".as_ref(),
-            "build".as_ref(),
-            "--no-isolation".as_ref(),
-            "--wheel".as_ref(),
-            "--outdir".as_ref(),
-            wheels.as_os_str(),
-            project.as_os_str(),
-        ],
-        work,
-        &env::build(build_python)?,
-        TEST_TIMEOUT,
-        false,
-    )?;
+    let mut args = vec![
+        build_python.as_os_str().to_owned(),
+        "-m".into(),
+        "build".into(),
+        "--no-isolation".into(),
+        "--wheel".into(),
+    ];
+    args.extend(artifact::python_build_settings(&project, false)?);
+    args.extend([
+        "--outdir".into(),
+        wheels.as_os_str().to_owned(),
+        project.as_os_str().to_owned(),
+    ]);
+    command::run(args, work, &env::build(build_python)?, TEST_TIMEOUT, false)?;
     let paths: Vec<_> = fs::read_dir(wheels)?
         .map(|p| p.map(|p| p.path()))
         .collect::<std::io::Result<_>>()?;

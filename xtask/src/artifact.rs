@@ -32,6 +32,30 @@ fn build_venv(selected: &Python, destination: &Path) -> Result<PathBuf> {
     )?;
     Ok(python)
 }
+pub(crate) fn python_build_settings(source: &Path, locked: bool) -> Result<Vec<OsString>> {
+    let config: toml::Value = toml::from_str(&fs::read_to_string(source.join("pyproject.toml"))?)?;
+    if config["build-system"]["build-backend"].as_str() != Some("maturin") {
+        return Ok(Vec::new());
+    }
+    let compatibility = config
+        .get("tool")
+        .and_then(|tool| tool.get("maturin"))
+        .and_then(|maturin| maturin.get("compatibility"))
+        .and_then(toml::Value::as_str);
+    ensure!(
+        compatibility == Some("manylinux_2_34"),
+        "production build must configure compatibility = manylinux_2_34"
+    );
+    // Maturin 1.15.0's PEP 517 wrapper otherwise overrides pyproject with "off".
+    Ok(vec![
+        format!(
+            "--config-setting=build-args={}--compatibility manylinux_2_34",
+            if locked { "--locked " } else { "" }
+        )
+        .into(),
+    ])
+}
+
 fn python_package(
     python: &Path,
     source: &Path,
@@ -41,7 +65,6 @@ fn python_package(
     fs::create_dir_all(destination)?;
     let mut environment = env::build(python)?;
     environment.insert("SOURCE_DATE_EPOCH".into(), epoch.to_string().into());
-    let config: toml::Value = toml::from_str(&fs::read_to_string(source.join("pyproject.toml"))?)?;
     let mut args = vec![
         python.as_os_str().to_owned(),
         "-m".into(),
@@ -50,9 +73,7 @@ fn python_package(
         "--wheel".into(),
         "--sdist".into(),
     ];
-    if config["build-system"]["build-backend"].as_str() == Some("maturin") {
-        args.push("--config-setting=build-args=--locked".into());
-    }
+    args.extend(python_build_settings(source, true)?);
     args.extend([
         OsString::from("--outdir"),
         destination.as_os_str().to_owned(),

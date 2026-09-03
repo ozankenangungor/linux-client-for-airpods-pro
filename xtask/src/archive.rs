@@ -325,9 +325,46 @@ pub fn wheel_metadata(members: &Members) -> Result<(Metadata, Entries)> {
     Ok((fields, entries))
 }
 
+fn production_wheel_tag(path: &Path, members: &Members) -> Result<()> {
+    const TAG: &str = "cp314-cp314-manylinux_2_34_x86_64";
+    let stem = format!("airpods_hr_linux-{}", crate::VERSION);
+    let expected = format!("{stem}-{TAG}.whl");
+    ensure!(
+        path.file_name().and_then(|name| name.to_str()) == Some(expected.as_str()),
+        "production wheel filename must be {expected}"
+    );
+    let wheel_files: Vec<_> = members
+        .iter()
+        .filter(|(name, _)| name.ends_with(".dist-info/WHEEL"))
+        .collect();
+    ensure!(
+        wheel_files.len() == 1 && *wheel_files[0].0 == format!("{stem}.dist-info/WHEEL"),
+        "production wheel must contain exactly one matching WHEEL metadata file"
+    );
+    let text = std::str::from_utf8(wheel_files[0].1.as_ref().context("WHEEL is not regular")?)?;
+    let mut tags = Vec::new();
+    for line in text.lines().take_while(|line| !line.is_empty()) {
+        ensure!(
+            !line.starts_with([' ', '\t']),
+            "folded production WHEEL headers are unsupported"
+        );
+        if let Some((key, value)) = line.split_once(':')
+            && key.eq_ignore_ascii_case("Tag")
+        {
+            tags.push(value.trim());
+        }
+    }
+    ensure!(
+        tags == [TAG],
+        "production WHEEL Tag must match filename: {TAG}"
+    );
+    Ok(())
+}
+
 pub fn production_wheel(path: &Path) -> Result<()> {
     let members = zip(path)?;
     audit_members(&members)?;
+    production_wheel_tag(path, &members)?;
     ensure!(
         members.keys().any(|n| n.starts_with("airpods_hr/")),
         "production wheel lacks airpods_hr"

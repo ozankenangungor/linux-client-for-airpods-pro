@@ -1,4 +1,4 @@
-use crate::{archive, command, env, git, manifest, parity, paths, static_policy};
+use crate::{archive, artifact, command, env, git, manifest, parity, paths, static_policy};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -524,6 +524,211 @@ fn wheel_metadata_extraction() {
     assert_eq!(entries["thing"], "package:main");
 }
 #[test]
+fn maturin_pep517_compatibility_is_explicit_for_both_build_paths() {
+    let t = tempfile::tempdir().unwrap();
+    fs::write(
+        t.path().join("pyproject.toml"),
+        "[build-system]\nbuild-backend='maturin'\n[tool.maturin]\ncompatibility='manylinux_2_34'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        artifact::python_build_settings(t.path(), true).unwrap(),
+        [OsString::from(
+            "--config-setting=build-args=--locked --compatibility manylinux_2_34"
+        )]
+    );
+    assert_eq!(
+        artifact::python_build_settings(t.path(), false).unwrap(),
+        [OsString::from(
+            "--config-setting=build-args=--compatibility manylinux_2_34"
+        )]
+    );
+}
+#[test]
+fn maturin_missing_or_wrong_compatibility_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    for policy in [
+        "",
+        "[tool.maturin]\ncompatibility='off'\n",
+        "[tool.maturin]\ncompatibility='manylinux_2_28'\n",
+    ] {
+        fs::write(
+            t.path().join("pyproject.toml"),
+            format!("[build-system]\nbuild-backend='maturin'\n{policy}"),
+        )
+        .unwrap();
+        assert!(
+            artifact::python_build_settings(t.path(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("must configure compatibility")
+        );
+    }
+}
+#[test]
+fn python_client_build_settings_unchanged() {
+    let t = tempfile::tempdir().unwrap();
+    fs::write(
+        t.path().join("pyproject.toml"),
+        "[build-system]\nbuild-backend='setuptools.build_meta'\n",
+    )
+    .unwrap();
+    for locked in [true, false] {
+        assert!(
+            artifact::python_build_settings(t.path(), locked)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+const PRODUCTION_WHEEL_NAME: &str = "airpods_hr_linux-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl";
+const PRODUCTION_WHEEL_INFO: &str = "airpods_hr_linux-0.1.0.dist-info/WHEEL";
+const PRODUCTION_WHEEL_HEADERS: &[u8] =
+    b"Wheel-Version: 1.0\nTag: cp314-cp314-manylinux_2_34_x86_64\n";
+
+fn write_release_wheel(path: &Path, production: bool, wheels: &[(&str, &[u8])]) {
+    let (info, package) = if production {
+        ("airpods_hr_linux-0.1.0.dist-info", "airpods-hr-linux")
+    } else {
+        ("airpods_client-0.1.0.dist-info", "airpods-client")
+    };
+    let mut metadata = format!("Name: {package}\nVersion: 0.1.0\nLicense-Expression: MIT\n");
+    if production {
+        metadata.push_str("Requires-Dist: bumble==0.0.234\nRequires-Dist: dbus-next>=0.2.3\n");
+    }
+    let mut members = vec![
+        (format!("{info}/METADATA"), metadata.as_bytes()),
+        (
+            format!("{info}/licenses/LICENSE"),
+            b"fixture license".as_slice(),
+        ),
+    ];
+    if production {
+        members.extend([
+            ("airpods_hr/__init__.py".into(), b"".as_slice()),
+            ("airpods_hr/service_installer.py".into(), b"".as_slice()),
+            (
+                "airpods_hr/_airpods_aap_core.cpython-314-x86_64-linux-gnu.so".into(),
+                b"fixture".as_slice(),
+            ),
+            (
+                format!("{info}/entry_points.txt"),
+                b"[console_scripts]\nairpods-hr = airpods_hr.cli:main\nairpods-hubd = airpods_hr._hubd.main:main\nairpods-hubd-service = airpods_hr.service_installer:main\n".as_slice(),
+            ),
+        ]);
+    } else {
+        members.push(("airpods_client/__init__.py".into(), b"".as_slice()));
+    }
+    members.extend(wheels.iter().map(|(name, data)| ((*name).into(), *data)));
+    let members: Vec<_> = members
+        .iter()
+        .map(|(name, data)| (name.as_str(), *data))
+        .collect();
+    write_zip(path, &members);
+}
+
+#[test]
+fn expected_manylinux_production_wheel_accepted() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join(PRODUCTION_WHEEL_NAME);
+    write_release_wheel(
+        &path,
+        true,
+        &[(PRODUCTION_WHEEL_INFO, PRODUCTION_WHEEL_HEADERS)],
+    );
+    archive::production_wheel(&path).unwrap();
+}
+#[test]
+fn generic_linux_production_wheel_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t
+        .path()
+        .join("airpods_hr_linux-0.1.0-cp314-cp314-linux_x86_64.whl");
+    write_release_wheel(
+        &path,
+        true,
+        &[(PRODUCTION_WHEEL_INFO, b"Tag: cp314-cp314-linux_x86_64\n")],
+    );
+    assert!(
+        archive::production_wheel(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("filename must be")
+    );
+}
+#[test]
+fn other_production_filename_tags_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    for tag in [
+        "cp313-cp313-manylinux_2_34_x86_64",
+        "cp314-abi3-manylinux_2_34_x86_64",
+        "cp314-cp314-manylinux_2_28_x86_64",
+        "cp314-cp314-manylinux_2_34_aarch64",
+    ] {
+        let path = t.path().join(format!("airpods_hr_linux-0.1.0-{tag}.whl"));
+        let headers = format!("Tag: {tag}\n");
+        write_release_wheel(&path, true, &[(PRODUCTION_WHEEL_INFO, headers.as_bytes())]);
+        assert!(
+            archive::production_wheel(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("filename must be")
+        );
+    }
+}
+#[test]
+fn production_filename_and_wheel_tags_must_agree() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join(PRODUCTION_WHEEL_NAME);
+    for headers in [
+        "Tag: cp314-cp314-linux_x86_64\n",
+        "Tag: cp313-cp313-manylinux_2_34_x86_64\n",
+        "Wheel-Version: 1.0\n",
+        "Tag: cp314-cp314-manylinux_2_34_x86_64\nTag: cp314-cp314-linux_x86_64\n",
+        "Tag: cp314-cp314-manylinux_2_34_x86_64\n extra\n",
+    ] {
+        write_release_wheel(&path, true, &[(PRODUCTION_WHEEL_INFO, headers.as_bytes())]);
+        assert!(archive::production_wheel(&path).is_err(), "{headers}");
+    }
+}
+#[test]
+fn production_wheel_metadata_must_be_unique_and_match_distribution() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join(PRODUCTION_WHEEL_NAME);
+    for wheels in [
+        vec![],
+        vec![("other.dist-info/WHEEL", PRODUCTION_WHEEL_HEADERS)],
+        vec![
+            (PRODUCTION_WHEEL_INFO, PRODUCTION_WHEEL_HEADERS),
+            ("other.dist-info/WHEEL", PRODUCTION_WHEEL_HEADERS),
+        ],
+    ] {
+        write_release_wheel(&path, true, &wheels);
+        assert!(
+            archive::production_wheel(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("one matching WHEEL")
+        );
+    }
+}
+#[test]
+fn python_client_py3_none_any_remains_accepted() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("airpods_client-0.1.0-py3-none-any.whl");
+    write_release_wheel(
+        &path,
+        false,
+        &[(
+            "airpods_client-0.1.0.dist-info/WHEEL",
+            b"Wheel-Version: 1.0\nTag: py3-none-any\n",
+        )],
+    );
+    archive::client_wheel(&path).unwrap();
+}
+
+#[test]
 fn sdist_semantic_digest_ignores_metadata() {
     let t = tempfile::tempdir().unwrap();
     let a = t.path().join("a.tar.gz");
@@ -662,6 +867,16 @@ fn all_audits_reject_xtask_and_c_sdk_first() {
         assert!(archive::sdist(&tar, "airpods-hr-linux").is_err());
         assert!(archive::sdist(&tar, "airpods-client").is_err());
         assert!(archive::rust_crate(&tar, t.path()).is_err());
+    }
+}
+
+#[test]
+fn parity_oracle_pin_accepts_reviewed_validator_and_rejects_other_blobs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let blob = command::output(["git", "hash-object", "tools/validate_release.py"], root).unwrap();
+    parity::require_oracle_blob(&blob).unwrap();
+    for other in ["5198a248a920e493702deb1bc895183bf4c16cb0", &"a".repeat(40)] {
+        assert!(parity::require_oracle_blob(other).is_err());
     }
 }
 
