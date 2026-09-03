@@ -1,4 +1,4 @@
-use crate::{archive, command, env, git, manifest, paths, static_policy};
+use crate::{archive, command, env, git, manifest, parity, paths, static_policy};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -665,3 +665,267 @@ fn all_audits_reject_xtask_and_c_sdk_first() {
     }
 }
 
+fn parity_fixture() -> (tempfile::TempDir, Value, Value) {
+    let t = tempfile::tempdir().unwrap();
+    let oracle = t.path().join("oracle");
+    let shadow = t.path().join("shadow");
+    fs::create_dir(&oracle).unwrap();
+    fs::create_dir(&shadow).unwrap();
+    let mut m = fixture_manifest();
+    for a in m["artifacts"].as_array_mut().unwrap() {
+        let name = a["filename"].as_str().unwrap().to_owned();
+        if a["kind"] == "python-sdist" {
+            write_tar(&oracle.join(&name), &[("root/file", b"source")], 1);
+            write_tar(&shadow.join(&name), &[("root/file", b"source")], 2);
+        } else {
+            fs::write(oracle.join(&name), b"deterministic package").unwrap();
+            fs::write(shadow.join(&name), b"deterministic package").unwrap();
+        }
+        a["sha256"] = json!(archive::hash(&oracle.join(&name)).unwrap());
+        a["size"] = json!(fs::metadata(oracle.join(&name)).unwrap().len());
+    }
+    let mut s = m.clone();
+    update_shadow_records(&mut s, &shadow);
+    (t, m, s)
+}
+fn update_shadow_records(m: &mut Value, dir: &Path) {
+    for a in m["artifacts"].as_array_mut().unwrap() {
+        let path = dir.join(a["filename"].as_str().unwrap());
+        a["sha256"] = json!(archive::hash(&path).unwrap());
+        a["size"] = json!(fs::metadata(path).unwrap().len());
+    }
+}
+fn comparison(t: &tempfile::TempDir, m: &Value, s: &Value) -> anyhow::Result<Value> {
+    parity::compare(m, s, &t.path().join("oracle"), &t.path().join("shadow"))
+}
+#[test]
+fn parity_sdist_gzip_difference_passes() {
+    let (t, m, s) = parity_fixture();
+    assert_ne!(m["artifacts"][1]["sha256"], s["artifacts"][1]["sha256"]);
+    comparison(&t, &m, &s).unwrap();
+}
+#[test]
+fn parity_exact_field_mismatch_fails() {
+    for field in manifest::TOOLCHAIN_FIELDS {
+        let (t, m, mut s) = parity_fixture();
+        s["toolchain"][field] = json!("different");
+        let error = comparison(&t, &m, &s).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("toolchain.{field}"))
+                && error.contains("oracle=")
+                && error.contains("shadow=")
+        );
+    }
+    let (t, m, mut s) = parity_fixture();
+    s["git"]["commit"] = json!("b".repeat(40));
+    assert!(comparison(&t, &m, &s).is_err());
+}
+#[test]
+fn parity_wheel_hash_mismatch_fails() {
+    let (t, m, mut s) = parity_fixture();
+    fs::write(t.path().join("shadow/production.whl"), b"changed").unwrap();
+    update_shadow_records(&mut s, &t.path().join("shadow"));
+    let error = comparison(&t, &m, &s).unwrap_err().to_string();
+    assert!(
+        error.contains("production.whl")
+            && error.contains("oracle digest=")
+            && error.contains("shadow digest=")
+    );
+}
+#[test]
+fn parity_rust_crate_hash_mismatch_fails() {
+    let (t, m, mut s) = parity_fixture();
+    fs::write(t.path().join("shadow/client.crate"), b"changed").unwrap();
+    update_shadow_records(&mut s, &t.path().join("shadow"));
+    assert!(comparison(&t, &m, &s).is_err());
+}
+#[test]
+fn parity_sdist_content_mismatch_fails() {
+    let (t, m, mut s) = parity_fixture();
+    write_tar(
+        &t.path().join("shadow/client.tar.gz"),
+        &[("root/file", b"changed")],
+        2,
+    );
+    update_shadow_records(&mut s, &t.path().join("shadow"));
+    assert!(comparison(&t, &m, &s).is_err());
+}
+#[test]
+fn parity_independent_repeat_counts_allowed() {
+    let (t, m, mut s) = parity_fixture();
+    s["repeat_build_check"]["artifacts"][0]["byte_for_byte_equal"] = json!(false);
+    s["repeat_build_check"]["matched_artifact_count"] = json!(4);
+    s["repeat_build_check"]["byte_for_byte_equal"] = json!(false);
+    comparison(&t, &m, &s).unwrap();
+}
+#[test]
+fn parity_never_authorizes_switch() {
+    let (t, m, s) = parity_fixture();
+    assert_eq!(
+        comparison(&t, &m, &s).unwrap()["canonical_switch_authorized"],
+        false
+    );
+}
+
+#[test]
+fn parity_stage_reuses_path_with_independent_payloads() {
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    let first = staging.prepare(parity::Phase::Oracle).unwrap();
+    assert_eq!(first, t.path().join(".validator-stage"));
+    fs::create_dir(&first).unwrap();
+    fs::write(first.join("oracle-only"), b"first independent build").unwrap();
+    let oracle = staging.finish(parity::Phase::Oracle).unwrap();
+    assert_eq!(oracle, t.path().join("python-oracle"));
+    assert!(!first.exists());
+    let second = staging.prepare(parity::Phase::Shadow).unwrap();
+    assert_eq!(first, second);
+    fs::create_dir(&second).unwrap();
+    assert!(!second.join("oracle-only").exists());
+    fs::write(second.join("shadow-only"), b"second independent build").unwrap();
+    let shadow = staging.finish(parity::Phase::Shadow).unwrap();
+    assert_eq!(shadow, t.path().join("rust-shadow"));
+    assert_ne!(oracle, shadow);
+    assert_eq!(
+        fs::read(oracle.join("oracle-only")).unwrap(),
+        b"first independent build"
+    );
+    assert_eq!(
+        fs::read(shadow.join("shadow-only")).unwrap(),
+        b"second independent build"
+    );
+    assert!(!oracle.join("shadow-only").exists());
+    assert!(!shadow.join("oracle-only").exists());
+    assert!(!second.exists());
+    let mut names: Vec<_> = fs::read_dir(t.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["python-oracle", "rust-shadow"]);
+}
+
+#[test]
+fn parity_stage_rejects_preexisting_stage() {
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    fs::create_dir(t.path().join(".validator-stage")).unwrap();
+    for phase in [parity::Phase::Oracle, parity::Phase::Shadow] {
+        assert!(staging.prepare(phase).is_err());
+    }
+}
+
+#[test]
+fn parity_stage_rejects_preexisting_oracle() {
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    fs::create_dir(t.path().join("python-oracle")).unwrap();
+    assert!(staging.prepare(parity::Phase::Oracle).is_err());
+}
+
+#[test]
+fn parity_stage_rejects_preexisting_shadow() {
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    fs::create_dir(t.path().join("rust-shadow")).unwrap();
+    assert!(staging.prepare(parity::Phase::Shadow).is_err());
+}
+
+#[test]
+fn parity_stage_rechecks_destination_before_finish() {
+    for (phase, name) in [
+        (parity::Phase::Oracle, "python-oracle"),
+        (parity::Phase::Shadow, "rust-shadow"),
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        let staging = parity::ValidatorStage::new(t.path()).unwrap();
+        let stage = staging.prepare(phase).unwrap();
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("payload"), b"retain diagnostics").unwrap();
+        fs::write(t.path().join(name), b"existing destination").unwrap();
+        assert!(staging.finish(phase).is_err());
+        assert_eq!(
+            fs::read(t.path().join(name)).unwrap(),
+            b"existing destination"
+        );
+        assert!(stage.join("payload").exists());
+    }
+}
+
+#[test]
+fn parity_stage_atomic_rename_rejects_destination_race() {
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    let stage = staging.prepare(parity::Phase::Oracle).unwrap();
+    fs::create_dir(&stage).unwrap();
+    fs::write(stage.join("payload"), b"never copied").unwrap();
+    // Model a destination appearing after the preflight check: the actual rename
+    // must refuse even an empty directory that ordinary rename would overwrite.
+    let destination = t.path().join("python-oracle");
+    fs::create_dir(&destination).unwrap();
+    let directory = fs::File::open(t.path()).unwrap();
+    let error = parity::rename_stage(&directory, parity::Phase::Oracle).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<nix::errno::Errno>(),
+        Some(&nix::errno::Errno::EEXIST)
+    );
+    assert!(stage.join("payload").exists());
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+}
+
+#[test]
+fn parity_stage_rename_failure_propagates_without_copy() {
+    let t = tempfile::tempdir().unwrap();
+    let directory = fs::File::open(t.path()).unwrap();
+    let error = parity::rename_stage(&directory, parity::Phase::Shadow).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<nix::errno::Errno>(),
+        Some(&nix::errno::Errno::ENOENT)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("rename .validator-stage to rust-shadow")
+    );
+    assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn parity_stage_rejects_symlinks_including_dangling_paths() {
+    use std::os::unix::fs::symlink;
+    let t = tempfile::tempdir().unwrap();
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    for (phase, name) in [
+        (parity::Phase::Oracle, ".validator-stage"),
+        (parity::Phase::Oracle, "python-oracle"),
+        (parity::Phase::Shadow, "rust-shadow"),
+    ] {
+        let path = t.path().join(name);
+        symlink(t.path().join("missing"), &path).unwrap();
+        assert!(staging.prepare(phase).is_err());
+        fs::remove_file(path).unwrap();
+    }
+    let alias = t.path().join("alias");
+    symlink(t.path(), &alias).unwrap();
+    assert!(parity::ValidatorStage::new(&alias).is_err());
+    let stage = staging.prepare(parity::Phase::Oracle).unwrap();
+    symlink(t.path(), &stage).unwrap();
+    assert!(staging.finish(parity::Phase::Oracle).is_err());
+}
+
+#[test]
+fn parity_stage_equalizes_path_bearing_sbom_build_roots() {
+    let t = tempfile::tempdir().unwrap();
+    let reference = |root: &Path| json!({"bom-ref": root.join(".work/source-first/crates/airpods-aap-py").to_string_lossy()});
+    assert_ne!(
+        reference(&t.path().join("python-oracle")),
+        reference(&t.path().join("rust-shadow"))
+    );
+    let staging = parity::ValidatorStage::new(t.path()).unwrap();
+    let first = staging.prepare(parity::Phase::Oracle).unwrap();
+    let oracle_reference = reference(&first);
+    fs::create_dir(&first).unwrap();
+    staging.finish(parity::Phase::Oracle).unwrap();
+    let second = staging.prepare(parity::Phase::Shadow).unwrap();
+    assert_eq!(oracle_reference, reference(&second));
+}

@@ -9,6 +9,7 @@ mod cross_language;
 mod env;
 mod git;
 mod manifest;
+mod parity;
 mod paths;
 mod python;
 mod rust;
@@ -72,6 +73,12 @@ fn execute() -> Result<()> {
         } => {
             let python = python::Python::select(args.python.as_deref(), &root)?;
             validate(&root, &python, args.scope, args.output_dir.as_deref())
+        }
+        Command::Release {
+            command: Release::Parity(args),
+        } => {
+            let python = python::Python::select(args.python.as_deref(), &root)?;
+            parity::run(&root, &python, &args.output_dir)
         }
     }
 }

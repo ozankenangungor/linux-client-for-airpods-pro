@@ -21,6 +21,8 @@ pub enum Command {
 pub enum Release {
     /// Run the independent Rust shadow validator (does not publish)
     Validate(Validate),
+    /// Compare independent Python oracle and Rust shadow outputs locally
+    Parity(Parity),
 }
 #[derive(Args)]
 pub struct Validate {
@@ -30,6 +32,14 @@ pub struct Validate {
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
     /// Explicit release interpreter; otherwise AIRPODS_RELEASE_PYTHON, .venv, python3.14
+    #[arg(long)]
+    pub python: Option<PathBuf>,
+}
+#[derive(Args)]
+pub struct Parity {
+    /// Outside-repository absent/empty comparison directory, not a release bundle
+    #[arg(long)]
+    pub output_dir: PathBuf,
     #[arg(long)]
     pub python: Option<PathBuf>,
 }
