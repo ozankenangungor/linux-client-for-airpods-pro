@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "xtask",
     "crates/airpods-app-core",
     "crates/airpods-aap-core",
     "crates/airpods-aap-py",
