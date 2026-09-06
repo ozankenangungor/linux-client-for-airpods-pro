@@ -5,26 +5,27 @@ mod process;
 #[cfg(test)]
 mod tests;
 
-use airpods_app_core :: service ;
-use airpods_client :: { AirPodsClient , DaemonState } ;
-use process :: { CommandResult , CommandSpec , ProcessError } ;
-use std :: ffi :: OsString ;
-use std :: future :: Future ;
-use std :: os :: unix :: fs :: PermissionsExt ;
-use std :: path :: { Path , PathBuf } ;
-use std :: time :: Duration ;
-use tokio :: fs ;
-use tokio :: io :: AsyncReadExt ;
-use tokio :: sync :: watch ;
+use airpods_app_core::service;
+use airpods_client::{AirPodsClient, DaemonState};
+use process::{CommandResult, CommandSpec, ProcessError};
+use std::ffi::OsString;
+use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
-
-
-
-
-
-
-
-
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(900);
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const ENV_MARKER: &str = "airpods-desktop daemon environment v1\n";
+const VERSION_CHECK: &str =
+    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')";
+const ENV_CHECK: &str = "import sys, pathlib, importlib.metadata; assert sys.version_info[:2] == (3, 14); assert pathlib.Path(sys.prefix) == pathlib.Path(sys.argv[1]); import airpods_hr._airpods_aap_core, airpods_hr.service_installer, bumble, dbus_next; assert importlib.metadata.version('airpods-hr-linux') == '0.1.0'";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
@@ -292,9 +293,39 @@ impl Host for NativeHost {
     }
 }
 
+pub async fn prepare_default<F, Fut>(
+    stop: &mut watch::Receiver<bool>,
+    progress: F,
+) -> Result<(), Failure>
+where
+    F: FnMut(Stage) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let socket = AirPodsClient::default_socket_path().map_err(|_| Failure::Socket)?;
+    if !socket.is_absolute() {
+        return Err(Failure::Socket);
+    }
+    prepare(
+        &socket,
+        InstallPaths::discover,
+        &mut NativeHost,
+        stop,
+        progress,
+    )
+    .await
+}
 
-
-
+async fn progress<F, Fut>(report: &mut F, stage: Stage) -> Result<(), Failure>
+where
+    F: FnMut(Stage) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    if report(stage).await {
+        Ok(())
+    } else {
+        Err(Failure::Cancelled)
+    }
+}
 
 async fn cancellable<T>(
     stop: &mut watch::Receiver<bool>,
@@ -310,9 +341,38 @@ async fn cancellable<T>(
     }
 }
 
+async fn read_unit(path: &Path) -> Result<Option<String>, Failure> {
+    match fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return Err(Failure::ForeignService),
+    }
+    let file = fs::File::open(path)
+        .await
+        .map_err(|_| Failure::ForeignService)?;
+    let mut data = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut data)
+        .await
+        .map_err(|_| Failure::ForeignService)?;
+    if data.len() > 65_536 {
+        return Err(Failure::ForeignService);
+    }
+    String::from_utf8(data)
+        .map(Some)
+        .map_err(|_| Failure::ForeignService)
+}
 
-
-
+fn owned_unit(contents: &Option<String>) -> Result<(), Failure> {
+    if contents
+        .as_deref()
+        .is_some_and(|unit| !service::is_project_owned(unit))
+    {
+        Err(Failure::ForeignService)
+    } else {
+        Ok(())
+    }
+}
 
 async fn run(
     host: &mut impl Host,
@@ -329,8 +389,398 @@ async fn run(
     })
 }
 
+async fn require(
+    host: &mut impl Host,
+    stop: &mut watch::Receiver<bool>,
+    command: CommandSpec,
+    failure: Failure,
+) -> Result<(), Failure> {
+    if run(host, stop, command, failure).await?.success {
+        Ok(())
+    } else {
+        Err(failure)
+    }
+}
 
+async fn prepare<H, F, Fut>(
+    socket: &Path,
+    installation: impl FnOnce() -> Result<InstallPaths, Failure>,
+    host: &mut H,
+    stop: &mut watch::Receiver<bool>,
+    mut report: F,
+) -> Result<(), Failure>
+where
+    H: Host,
+    F: FnMut(Stage) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    progress(&mut report, Stage::CheckingDaemon).await?;
+    match host.probe(socket, stop).await? {
+        Probe::Ready => return progress(&mut report, Stage::Ready).await,
+        Probe::Starting => return wait_ready(socket, host, stop, &mut report, false).await,
+        Probe::Missing => {}
+    }
+    progress(&mut report, Stage::InspectingInstallation).await?;
+    let paths = installation()?;
+    let unit = cancellable(stop, read_unit(&paths.unit)).await??;
+    owned_unit(&unit)?;
+    let expected = service::exec_start(paths.python().to_str().ok_or(Failure::Storage)?)
+        .map_err(|_| Failure::Storage)?;
+    let lock = cancellable(stop, async {
+        fs::create_dir_all(&paths.data)
+            .await
+            .map_err(|_| Failure::Storage)?;
+        fs::set_permissions(
+            &paths.data,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .await
+        .map_err(|_| Failure::Storage)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(paths.data.join("desktop-bootstrap.lock"))
+            .await
+            .map_err(|_| Failure::Storage)?
+            .try_into_std()
+            .map_err(|_| Failure::Storage)
+    })
+    .await??;
+    let deadline = Instant::now() + INSTALL_TIMEOUT;
+    let mut reported_waiting = false;
+    loop {
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                if Instant::now() >= deadline {
+                    return Err(Failure::SetupBusy);
+                }
+                if !reported_waiting {
+                    progress(&mut report, Stage::WaitingForSetup).await?;
+                    reported_waiting = true;
+                }
+                cancellable(stop, tokio::time::sleep(POLL_INTERVAL)).await?;
+            }
+            Err(_) => return Err(Failure::Storage),
+        }
+    }
+    // Another app may have completed setup while this instance waited.
+    match host.probe(socket, stop).await? {
+        Probe::Ready => return progress(&mut report, Stage::Ready).await,
+        Probe::Starting => return wait_ready(socket, host, stop, &mut report, false).await,
+        Probe::Missing => {}
+    }
+    let unit = cancellable(stop, read_unit(&paths.unit)).await??;
+    owned_unit(&unit)?;
+    require(
+        host,
+        stop,
+        CommandSpec::new(
+            "systemctl",
+            ["--user", "show", "--property=Version", "--value"],
+            COMMAND_TIMEOUT,
+        ),
+        Failure::SystemdUnavailable,
+    )
+    .await?;
+    // Loaded units elsewhere and local overrides must not be shadowed silently.
+    let loaded = run(
+        host,
+        stop,
+        CommandSpec::new(
+            "systemctl",
+            [
+                "--user",
+                "show",
+                service::UNIT_NAME,
+                "--property=LoadState",
+                "--property=FragmentPath",
+                "--property=DropInPaths",
+            ],
+            COMMAND_TIMEOUT,
+        ),
+        Failure::SystemdUnavailable,
+    )
+    .await?;
+    let loaded_text = std::str::from_utf8(&loaded.stdout).map_err(|_| Failure::ForeignService)?;
+    if loaded.stdout.len() >= 4096 {
+        return Err(Failure::ForeignService);
+    }
+    if !loaded.success
+        && !loaded_text
+            .lines()
+            .any(|line| line == "LoadState=not-found")
+    {
+        return Err(Failure::SystemdUnavailable);
+    }
+    for line in loaded_text.lines() {
+        if let Some(fragment) = line
+            .strip_prefix("FragmentPath=")
+            .filter(|value| !value.is_empty())
+        {
+            let contents = cancellable(stop, read_unit(Path::new(fragment))).await??;
+            if contents.is_none() {
+                return Err(Failure::ForeignService);
+            }
+            owned_unit(&contents)?;
+        }
+        if line
+            .strip_prefix("DropInPaths=")
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(Failure::ForeignService);
+        }
+    }
+    let environment = paths.environment();
+    match cancellable(stop, fs::symlink_metadata(&environment)).await? {
+        Ok(metadata) if metadata.is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(Failure::Storage),
+    }
+    let mut complete = true;
+    for file in [
+        paths.python(),
+        paths.installer(),
+        environment.join("bin/airpods-hubd"),
+    ] {
+        complete &= cancellable(stop, fs::metadata(file))
+            .await?
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    }
+    complete &= cancellable(stop, fs::metadata(environment.join("pyvenv.cfg")))
+        .await?
+        .is_ok_and(|metadata| metadata.is_file());
+    let env_check = || {
+        CommandSpec::new(
+            paths.python(),
+            [
+                OsString::from("-I"),
+                OsString::from("-c"),
+                OsString::from(ENV_CHECK),
+                environment.as_os_str().into(),
+            ],
+            COMMAND_TIMEOUT,
+        )
+    };
+    if complete {
+        complete = match run(host, stop, env_check(), Failure::Environment).await {
+            Ok(result) => result.success,
+            Err(Failure::Cancelled) => return Err(Failure::Cancelled),
+            Err(_) => false,
+        };
+    }
+    if !complete {
+        progress(&mut report, Stage::FindingPython).await?;
+        let version = run(
+            host,
+            stop,
+            CommandSpec::new("python3.14", ["-I", "-c", VERSION_CHECK], COMMAND_TIMEOUT),
+            Failure::PythonMissing,
+        )
+        .await?;
+        if !version.success || version.stdout != b"3.14\n" {
+            return Err(Failure::PythonVersion);
+        }
+        let marker = paths.data.join("managed-environment-v1");
+        let owned = cancellable(stop, fs::read(&marker))
+            .await?
+            .is_ok_and(|contents| contents == ENV_MARKER.as_bytes());
+        // Never clear an unrelated directory that happens to occupy this path.
+        if !owned
+            && cancellable(stop, fs::symlink_metadata(&environment))
+                .await?
+                .is_ok()
+        {
+            return Err(Failure::Environment);
+        }
+        cancellable(stop, fs::write(marker, ENV_MARKER))
+            .await?
+            .map_err(|_| Failure::Storage)?;
+        progress(&mut report, Stage::CreatingEnvironment).await?;
+        require(
+            host,
+            stop,
+            CommandSpec::new(
+                "python3.14",
+                [
+                    OsString::from("-I"),
+                    OsString::from("-m"),
+                    OsString::from("venv"),
+                    OsString::from("--clear"),
+                    environment.as_os_str().into(),
+                ],
+                Duration::from_secs(90),
+            ),
+            Failure::Environment,
+        )
+        .await?;
+        progress(&mut report, Stage::InstallingDaemon).await?;
+        require(
+            host,
+            stop,
+            CommandSpec::new(
+                paths.python(),
+                [
+                    OsString::from("-I"),
+                    OsString::from("-m"),
+                    OsString::from("pip"),
+                    OsString::from("--isolated"),
+                    OsString::from("--disable-pip-version-check"),
+                    OsString::from("install"),
+                    OsString::from("--no-input"),
+                    OsString::from("--config-settings=build-args=--locked"),
+                    paths.source.as_os_str().into(),
+                ],
+                INSTALL_TIMEOUT,
+            ),
+            Failure::PackageInstall,
+        )
+        .await?;
+        require(host, stop, env_check(), Failure::Environment).await?;
+        for file in [
+            paths.python(),
+            paths.installer(),
+            environment.join("bin/airpods-hubd"),
+        ] {
+            if !cancellable(stop, fs::metadata(file))
+                .await?
+                .is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            {
+                return Err(Failure::Environment);
+            }
+        }
+    }
+    // Setup may have taken minutes. Recheck ownership before asking the
+    // authoritative installer to replace anything; it also checks at write time.
+    let unit = cancellable(stop, read_unit(&paths.unit)).await??;
+    owned_unit(&unit)?;
+    let state = service::installation_state(unit.as_deref(), &expected);
+    let pending = paths.data.join("service-install-pending");
+    if !service::installation_valid(unit.is_some(), state.owned, state.exec_start_matches)
+        || cancellable(stop, fs::symlink_metadata(&pending))
+            .await?
+            .is_ok()
+    {
+        progress(&mut report, Stage::InstallingService).await?;
+        cancellable(stop, fs::write(&pending, b"install\n"))
+            .await?
+            .map_err(|_| Failure::Storage)?;
+        let installation = run(
+            host,
+            stop,
+            CommandSpec::new(paths.installer(), ["install"], COMMAND_TIMEOUT),
+            Failure::ServiceInstall,
+        )
+        .await?;
+        if !installation.success {
+            owned_unit(&cancellable(stop, read_unit(&paths.unit)).await??)?;
+            return Err(Failure::ServiceInstall);
+        }
+        let installed = cancellable(stop, read_unit(&paths.unit)).await??;
+        let state = service::installation_state(installed.as_deref(), &expected);
+        if !service::installation_valid(installed.is_some(), state.owned, state.exec_start_matches)
+        {
+            return Err(Failure::ServiceInstall);
+        }
+        cancellable(stop, fs::remove_file(pending))
+            .await?
+            .map_err(|_| Failure::Storage)?;
+    }
+    // Recheck immediately before activation; never restart an external session.
+    match host.probe(socket, stop).await? {
+        Probe::Ready => return progress(&mut report, Stage::Ready).await,
+        Probe::Starting => return wait_ready(socket, host, stop, &mut report, false).await,
+        Probe::Missing => {}
+    }
+    progress(&mut report, Stage::StartingDaemon).await?;
+    require(
+        host,
+        stop,
+        CommandSpec::new(
+            "systemctl",
+            ["--user", "start", service::UNIT_NAME],
+            COMMAND_TIMEOUT,
+        ),
+        Failure::ServiceStart,
+    )
+    .await?;
+    wait_ready(socket, host, stop, &mut report, true).await
+}
 
-
-
-
+async fn wait_ready<H, F, Fut>(
+    socket: &Path,
+    host: &mut H,
+    stop: &mut watch::Receiver<bool>,
+    report: &mut F,
+    started_service: bool,
+) -> Result<(), Failure>
+where
+    H: Host,
+    F: FnMut(Stage) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    progress(report, Stage::WaitingForDaemon).await?;
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let mut waiting_for_airpods = false;
+    loop {
+        let timeout_failure = if waiting_for_airpods {
+            Failure::AirPodsUnavailable
+        } else {
+            Failure::ReadinessTimeout
+        };
+        match tokio::time::timeout_at(deadline, host.probe(socket, stop))
+            .await
+            .map_err(|_| timeout_failure)??
+        {
+            Probe::Ready => return progress(report, Stage::Ready).await,
+            Probe::Starting => waiting_for_airpods = true,
+            Probe::Missing => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(if waiting_for_airpods {
+                Failure::AirPodsUnavailable
+            } else {
+                Failure::ReadinessTimeout
+            });
+        }
+        if started_service {
+            let state = run(
+                host,
+                stop,
+                CommandSpec::new(
+                    "systemctl",
+                    [
+                        "--user",
+                        "show",
+                        service::UNIT_NAME,
+                        "--property=ActiveState",
+                        "--property=SubState",
+                    ],
+                    COMMAND_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                Failure::ReadinessTimeout,
+            )
+            .await?;
+            if !state.success
+                || state.stdout.split(|byte| *byte == b'\n').any(|line| {
+                    matches!(
+                        line,
+                        b"ActiveState=failed" | b"ActiveState=inactive" | b"SubState=dead"
+                    )
+                })
+            {
+                return Err(Failure::DaemonExited);
+            }
+        }
+        cancellable(
+            stop,
+            tokio::time::sleep_until((Instant::now() + POLL_INTERVAL).min(deadline)),
+        )
+        .await?;
+    }
+}
