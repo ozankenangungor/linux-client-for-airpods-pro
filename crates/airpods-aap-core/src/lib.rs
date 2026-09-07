@@ -4,6 +4,11 @@
 //! This crate owns production heart-rate parsing and pure AAP frame analysis.
 //! It performs no operating-system I/O. Python retains the public models,
 //! errors, and Linux integration.
+//!
+//! ## Core Architecture
+//!
+//! AAP framing performs zero-allocation packet validation against known
+//! Apple Accessory Protocol byte layouts before extracting metrics.
 
 pub mod aap_config_diagnostics;
 pub mod aap_local_rx_diagnostics;
