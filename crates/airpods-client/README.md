@@ -35,6 +35,10 @@ best-effort unsubscribe. If it is dropped outside a current Tokio context, the
 client closes and becomes unusable so it cannot retain a silently orphaned
 subscription. Call `unsubscribe().await` when confirmed cleanup is required.
 
+## Stream Contracts
+
+Heart-rate streams yield samples preserving sequence order and duplicate readings. Disconnections are surfaced immediately as typed errors, allowing callers to handle reconnection explicitly.
+
 Patch releases in the v0.1 line should not intentionally break the documented
 surface. A future v0.2 may make deliberate breaking changes. Protocol version
 1 remains experimental and may evolve through coordinated daemon and SDK
