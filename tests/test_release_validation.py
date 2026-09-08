@@ -1,4 +1,12 @@
-"""Release manifest, version, and packaging-policy foundation tests."""
+"""Release manifest, version, and packaging-policy foundation tests.
+
+Canonical validation scopes:
+  - static: Semantic version coherence, file permissions, and clean git status.
+  - python: Native extension loading, FFI parity, and daemon lifecycle transitions.
+  - rust: Workspace compile checks, clippy conformance, and package export audit.
+  - cross-language: End-to-end integration between Rust core and Python runtime.
+  - artifacts: Tarball and wheel reproducibility verification.
+"""
 
 from __future__ import annotations
 
