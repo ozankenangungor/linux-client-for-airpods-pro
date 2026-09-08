@@ -53,6 +53,10 @@ machine failure cannot be intercepted, so application-level restoration is
 impossible in those cases. `top` is part of this unpublished CLI, not a
 separate release artifact.
 
+## Daemon Architecture
+
+`airpods-hubd` operates as an unprivileged user daemon managing the BlueZ Bluetooth session and L2CAP channels. Client tools communicate via a local Unix domain socket (`$XDG_RUNTIME_DIR/airpods-hubd.sock`), separating hardware connection ownership from client telemetry processing.
+
 This v0.1 output is experimental. BPM values have not been medically validated.
 This software is not a medical device and must not be used for diagnosis,
 treatment, or safety-critical monitoring.
