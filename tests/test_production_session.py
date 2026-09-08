@@ -1244,8 +1244,8 @@ class ProductionProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DRY RUN", first.getvalue())
 
 
-# Differential expectations from the pre-10.5 Python guards and assignments in
-# 280204e76019b2d8afceebdbe752f6d9372c298a (not from the Rust tables).
+# Differential expectations from earlier Python guards and state assignments
+# (not from the Rust tables).
 # _record_failed_operation assigned FAILED unconditionally in the parent, but
 # only OPENING, STARTING and STOPPING reach it through public operations;
 # FAILED is also possible if an unlocked receive fails during stop cleanup.

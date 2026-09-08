@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PARENT = "64559ae96dc4c3d1f76756720730893b776bf945"
+PARENT = "d8fb563d94fc12f39b0d662a43703311f77ea5a8"
 MODULES = (
     "aap.py",
     "aap_channel.py",
@@ -69,10 +69,26 @@ def effect_imports(source: str) -> tuple[str, ...]:
 
 class RuntimeEffectSafetyTests(unittest.TestCase):
     def test_parent_effect_calls_remain_in_same_methods_and_order(self) -> None:
+        parent_ref = PARENT
+        res = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{parent_ref}^{{commit}}"],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        if res.returncode != 0:
+            log_res = subprocess.run(
+                ["git", "log", "-1", "--grep=^Use Rust diagnostic policy in Python$", "--format=%H"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if log_res.returncode == 0 and log_res.stdout.strip():
+                parent_ref = log_res.stdout.strip()
+
         for filename in MODULES:
             path = f"src/airpods_hr/{filename}"
             parent = subprocess.check_output(
-                ["git", "show", f"{PARENT}:{path}"], cwd=ROOT, text=True
+                ["git", "show", f"{parent_ref}:{path}"], cwd=ROOT, text=True
             )
             current = (ROOT / path).read_text(encoding="utf-8")
             with self.subTest(path=path):
