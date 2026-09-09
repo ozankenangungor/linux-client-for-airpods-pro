@@ -13,8 +13,8 @@ jobs:
     name: Static release policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
       - run: python tools/validate_release.py --scope static
@@ -23,15 +23,15 @@ jobs:
     name: Python production and installer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         id: setup-python
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@0f870b6babcd9f4faebaee75d487ff6763f18c07 # 1.97.0
       - name: Build and install production package (editable)
         run: python -m pip install -e . --config-settings=build-args=--locked
       - name: Verify production native parser
@@ -51,8 +51,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -69,8 +69,8 @@ jobs:
     name: Rust workspace and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@0f870b6babcd9f4faebaee75d487ff6763f18c07 # 1.97.0
         with:
           components: rustfmt, clippy
       - run: python3 tools/validate_release.py --scope rust
@@ -80,12 +80,12 @@ jobs:
     name: Rust and Python clients with fake hubd
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@0f870b6babcd9f4faebaee75d487ff6763f18c07 # 1.97.0
       - run: python -m pip install -e . --config-settings=build-args=--locked
       - run: python tools/validate_release.py --scope cross-language
 
@@ -99,17 +99,17 @@ jobs:
       - cross-language
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
           cache: pip
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@0f870b6babcd9f4faebaee75d487ff6763f18c07 # 1.97.0
       - run: python tools/validate_release.py --scope artifacts --output-dir "${{ runner.temp }}/release"
       - name: Retain validated release candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: airpods-hr-linux-0.1.0-${{ github.sha }}
           path: ${{ runner.temp }}/release
