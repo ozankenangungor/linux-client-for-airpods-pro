@@ -34,7 +34,7 @@ from airpods_hr.service_installer import (
 )
 
 
-REPOSITORY = "/home/kenan/airpods-hr-linux"
+REPOSITORY = "/home/example/airpods-hr-linux"
 
 
 class FakeSystemctl(Systemctl):

@@ -6,8 +6,8 @@ license = "MIT"
 publish = false
 description = "Optional finite daemon reconnect layer for airpods-client"
 readme = "README.md"
-repository = "https://github.com/ozankenangungor/airpods-hr-linux"
-homepage = "https://github.com/ozankenangungor/airpods-hr-linux"
+repository = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+homepage = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
 
 [dependencies]
 airpods-client = { path = "../airpods-client" }

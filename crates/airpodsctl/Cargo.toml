@@ -6,8 +6,8 @@ license = "MIT"
 publish = false
 description = "Local command-line client for airpods-hubd"
 readme = "README.md"
-repository = "https://github.com/ozankenangungor/airpods-hr-linux"
-homepage = "https://github.com/ozankenangungor/airpods-hr-linux"
+repository = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
+homepage = "https://github.com/ozankenangungor/linux-client-for-airpods-pro"
 
 [dependencies]
 airpods-client = { path = "../airpods-client" }

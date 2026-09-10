@@ -1,7 +1,7 @@
 # Source layout
 
-This directory contains the production Python implementation for
-`airpods-hr-linux`.
+This directory contains the production Python implementation for Linux Client
+for AirPods Pro. Its distribution name remains `airpods-hr-linux`.
 
 - [`airpods_hr/`](airpods_hr/) is the importable Python package.
 - The distribution name on PyPI is `airpods-hr-linux`.
