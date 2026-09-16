@@ -1,9 +1,9 @@
 use crate :: bootstrap :: Stage ;
-
+use crate :: chart ;
 use crate :: demo :: LOOP_DURATION ;
-use crate :: model :: { AppEvent , Connection , Freshness , Model , Problem , TimedEvent , clock_time } ;
+use crate :: model :: { AppEvent , Connection , Freshness , Model , Problem , TimedEvent , clock_time , side_label } ;
 use crate :: source :: DataSource ;
-use crate :: theme :: { self , AMBER , BACKGROUND , BORDER , ERROR , GAP , MUTED , PAD , SECONDARY , TEAL , TEXT } ;
+use crate :: theme :: { self , AMBER , BACKGROUND , BORDER , ERROR , GAP , MUTED , PAD , PINK , SECONDARY , TEAL , TEXT } ;
 use eframe :: egui :: { self , Align2 , Color32 , Rect , Stroke } ;
 use std :: path :: PathBuf ;
 use std :: time :: { Duration , Instant } ;
@@ -81,6 +81,18 @@ impl DesktopApp {
         self.header(ui.painter(), header, now);
         ui.add_space(PAD);
         self.notice(ui, now);
+        let below_chart =
+            theme::STAT_HEIGHT + theme::DETAIL_HEIGHT + theme::FOOTER_HEIGHT + 3.0 * GAP;
+        let used_height = ui.cursor().top() - start_y;
+        let top_height = (viewport_height - used_height - below_chart)
+            .clamp(theme::MIN_HERO_HEIGHT, theme::HERO_HEIGHT);
+        let top = allocate(ui, top_height);
+        let hero_width = (width * 0.25).clamp(238.0, 320.0);
+        let hero = Rect::from_min_size(top.min, egui::vec2(hero_width, top.height()));
+        self.hero(ui.painter(), hero, now);
+        let chart = Rect::from_min_max(egui::pos2(hero.right() + GAP, top.top()), top.max);
+        chart::show(ui, chart, &self.model, now, &mut self.chart_window);
+        ui.add_space(GAP);
         let footer = allocate(ui, theme::FOOTER_HEIGHT);
         theme::text(
             ui.painter(),
@@ -167,7 +179,131 @@ impl DesktopApp {
         );
     }
 
-    
+    fn hero(&self, painter: &egui::Painter, rect: Rect, now: Duration) {
+        theme::surface(painter, rect, theme::ELEVATED);
+        theme::text(
+            painter,
+            rect.min + egui::vec2(PAD, PAD),
+            Align2::LEFT_CENTER,
+            "LIVE HEART RATE",
+            theme::CAPTION,
+            SECONDARY,
+        );
+        let freshness = self.model.freshness(now);
+        let pulse = self.sample_pulse(now);
+        let center = egui::pos2(rect.right() - PAD, rect.top() + PAD);
+        painter.circle_filled(
+            center,
+            16.0 + 3.0 * pulse,
+            PINK.gamma_multiply(0.04 + 0.04 * pulse),
+        );
+        theme::heart(
+            painter,
+            center,
+            16.0 + 2.0 * pulse,
+            if freshness == Freshness::Fresh {
+                PINK
+            } else {
+                MUTED
+            },
+        );
+        let value = if freshness != Freshness::Unavailable {
+            self.model
+                .latest
+                .map_or_else(|| "—".into(), |point| point.sample.bpm.to_string())
+        } else {
+            "—".into()
+        };
+        let number_y = (rect.height() - 60.0) / 2.0;
+        let number_size =
+            (rect.height() * 0.5 - 28.0).min(if rect.width() < 280.0 { 104.0 } else { 120.0 });
+        theme::text(
+            painter,
+            egui::pos2(rect.center().x, rect.top() + number_y),
+            Align2::CENTER_CENTER,
+            value,
+            number_size,
+            if freshness == Freshness::Fresh {
+                TEXT
+            } else {
+                MUTED
+            },
+        );
+        theme::text(
+            painter,
+            egui::pos2(
+                rect.center().x,
+                rect.top() + number_y + number_size / 2.0 + 2.0,
+            ),
+            Align2::CENTER_CENTER,
+            "BPM",
+            theme::BODY,
+            SECONDARY,
+        );
+        let detail = match freshness {
+            Freshness::Fresh => "Live reading",
+            Freshness::Waiting => "Waiting for next reading",
+            Freshness::Unavailable => self.status(now).0,
+        };
+        theme::text(
+            painter,
+            egui::pos2(
+                rect.center().x,
+                rect.top() + number_y + number_size / 2.0 + 20.0,
+            ),
+            Align2::CENTER_CENTER,
+            detail,
+            theme::LABEL,
+            if freshness == Freshness::Fresh {
+                SECONDARY
+            } else {
+                MUTED
+            },
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + PAD, rect.bottom() - 72.0),
+                egui::pos2(rect.right() - PAD, rect.bottom() - 72.0),
+            ],
+            Stroke::new(1.0, BORDER),
+        );
+        let source = self.model.latest.map_or("Awaiting first reading", |point| {
+            side_label(point.sample.source_side)
+        });
+        theme::badge(
+            painter,
+            Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() - 48.0),
+                egui::vec2(160.0, 28.0),
+            ),
+            source,
+            if freshness == Freshness::Fresh {
+                SECONDARY
+            } else {
+                MUTED
+            },
+            false,
+        );
+        let age = self.model.latest.map_or_else(
+            || "No samples received yet".into(),
+            |point| {
+                let seconds = now.saturating_sub(point.at).as_secs();
+                if freshness == Freshness::Fresh && seconds == 0 {
+                    "Received just now".into()
+                } else {
+                    format!("Last reading {seconds}s ago")
+                }
+            },
+        );
+        theme::text(
+            painter,
+            egui::pos2(rect.center().x, rect.bottom() - 20.0),
+            Align2::CENTER_CENTER,
+            age,
+            theme::CAPTION,
+            MUTED,
+        );
+    }
 
     fn sample_pulse(&self, now: Duration) -> f32 {
         if self.model.freshness(now) == Freshness::Fresh {
