@@ -93,6 +93,9 @@ impl DesktopApp {
         let chart = Rect::from_min_max(egui::pos2(hero.right() + GAP, top.top()), top.max);
         chart::show(ui, chart, &self.model, now, &mut self.chart_window);
         ui.add_space(GAP);
+        let stats = allocate(ui, theme::STAT_HEIGHT);
+        self.statistics(ui.painter(), stats);
+        ui.add_space(GAP);
         let footer = allocate(ui, theme::FOOTER_HEIGHT);
         theme::text(
             ui.painter(),
@@ -315,7 +318,75 @@ impl DesktopApp {
         }
     }
 
-    
+    fn statistics(&self, painter: &egui::Painter, rect: Rect) {
+        let values = [
+            (
+                "Average",
+                self.model
+                    .stats
+                    .average()
+                    .map_or_else(|| "—".into(), |value| format!("{value:.1}")),
+                "BPM",
+            ),
+            (
+                "Lowest",
+                self.model
+                    .stats
+                    .min
+                    .map_or_else(|| "—".into(), |value| value.to_string()),
+                "BPM",
+            ),
+            (
+                "Highest",
+                self.model
+                    .stats
+                    .max
+                    .map_or_else(|| "—".into(), |value| value.to_string()),
+                "BPM",
+            ),
+            (
+                "Samples received",
+                if self.model.stats.count == 0 {
+                    "—".into()
+                } else {
+                    self.model.stats.count.to_string()
+                },
+                "",
+            ),
+        ];
+        let width = (rect.width() - 3.0 * GAP) / 4.0;
+        for (index, (label, value, unit)) in values.into_iter().enumerate() {
+            let card = Rect::from_min_size(
+                rect.min + egui::vec2(index as f32 * (width + GAP), 0.0),
+                egui::vec2(width, rect.height()),
+            );
+            theme::card(painter, card);
+            theme::text(
+                painter,
+                card.min + egui::vec2(PAD, PAD),
+                Align2::LEFT_CENTER,
+                label,
+                theme::LABEL,
+                SECONDARY,
+            );
+            let value = theme::text(
+                painter,
+                card.min + egui::vec2(PAD, 62.0),
+                Align2::LEFT_CENTER,
+                value,
+                30.0,
+                TEXT,
+            );
+            theme::text(
+                painter,
+                egui::pos2(value.right() + theme::SMALL_GAP, value.center().y + 6.0),
+                Align2::LEFT_CENTER,
+                unit,
+                theme::CAPTION,
+                MUTED,
+            );
+        }
+    }
 
     
 
