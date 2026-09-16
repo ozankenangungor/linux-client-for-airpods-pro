@@ -1,12 +1,17 @@
-use crate :: bootstrap :: Stage ;
-use crate :: chart ;
-use crate :: demo :: LOOP_DURATION ;
-use crate :: model :: { AppEvent , Connection , Freshness , Model , Problem , TimedEvent , clock_time , side_label } ;
-use crate :: source :: DataSource ;
-use crate :: theme :: { self , AMBER , BACKGROUND , BORDER , ERROR , GAP , MUTED , PAD , PINK , SECONDARY , TEAL , TEXT } ;
-use eframe :: egui :: { self , Align2 , Color32 , Rect , Stroke } ;
-use std :: path :: PathBuf ;
-use std :: time :: { Duration , Instant } ;
+use crate::bootstrap::Stage;
+use crate::chart;
+use crate::demo::LOOP_DURATION;
+use crate::model::{
+    ActivityKind, AppEvent, Connection, Freshness, Model, Problem, TimedEvent, clock_time,
+    side_label,
+};
+use crate::source::DataSource;
+use crate::theme::{
+    self, AMBER, BACKGROUND, BORDER, ERROR, GAP, MUTED, PAD, PINK, SECONDARY, TEAL, TEXT,
+};
+use eframe::egui::{self, Align2, Color32, Rect, Stroke};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 pub struct DesktopApp {
     model: Model,
@@ -95,6 +100,13 @@ impl DesktopApp {
         ui.add_space(GAP);
         let stats = allocate(ui, theme::STAT_HEIGHT);
         self.statistics(ui.painter(), stats);
+        ui.add_space(GAP);
+        let bottom = allocate(ui, theme::DETAIL_HEIGHT);
+        let session = Rect::from_min_size(bottom.min, egui::vec2(hero_width, bottom.height()));
+        self.session(ui.painter(), session, now);
+        let activity =
+            Rect::from_min_max(egui::pos2(session.right() + GAP, bottom.top()), bottom.max);
+        self.activity(ui.painter(), activity);
         ui.add_space(GAP);
         let footer = allocate(ui, theme::FOOTER_HEIGHT);
         theme::text(
@@ -388,9 +400,178 @@ impl DesktopApp {
         }
     }
 
-    
+    fn session(&self, painter: &egui::Painter, rect: Rect, now: Duration) {
+        theme::card(painter, rect);
+        theme::text(
+            painter,
+            rect.min + egui::vec2(PAD, 28.0),
+            Align2::LEFT_CENTER,
+            "Session",
+            theme::TITLE,
+            TEXT,
+        );
+        let (status, color) = self.status(now);
+        let daemon = if self.model.connection.has_connection() {
+            "Connected"
+        } else {
+            match self.model.connection {
+                Connection::Preparing(_) => "Preparing",
+                Connection::Reconnecting { .. } => "Reconnecting",
+                Connection::Connecting => "Awaiting stream",
+                _ => "Unavailable",
+            }
+        };
+        let rows = [
+            ("Daemon", daemon.to_string(), color),
+            ("Stream", status.to_string(), color),
+            (
+                "Source",
+                self.model
+                    .latest
+                    .map_or("—", |point| side_label(point.sample.source_side))
+                    .into(),
+                SECONDARY,
+            ),
+        ];
+        for (index, (label, value, color)) in rows.into_iter().enumerate() {
+            let y = rect.top() + 68.0 + index as f32 * 32.0;
+            theme::text(
+                painter,
+                egui::pos2(rect.left() + PAD, y),
+                Align2::LEFT_CENTER,
+                label,
+                theme::LABEL,
+                MUTED,
+            );
+            theme::text(
+                painter,
+                egui::pos2(rect.right() - PAD, y),
+                Align2::RIGHT_CENTER,
+                value,
+                theme::LABEL,
+                color,
+            );
+        }
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + PAD, rect.bottom() - 56.0),
+                egui::pos2(rect.right() - PAD, rect.bottom() - 56.0),
+            ],
+            Stroke::new(1.0, BORDER),
+        );
+        let (label, value) = match self.model.connection {
+            Connection::Reconnecting { attempt, retry_at } => (format!("Attempt {attempt}"), {
+                let seconds = retry_at.saturating_sub(now).as_secs_f64().ceil() as u64;
+                if seconds == 0 {
+                    "Trying now…".into()
+                } else {
+                    format!("Retry in {seconds}s")
+                }
+            }),
+            _ => (
+                "Connection uptime".into(),
+                self.model
+                    .uptime(now)
+                    .map_or_else(|| "—".into(), clock_time),
+            ),
+        };
+        theme::text(
+            painter,
+            egui::pos2(rect.left() + PAD, rect.bottom() - 28.0),
+            Align2::LEFT_CENTER,
+            label,
+            theme::CAPTION,
+            MUTED,
+        );
+        theme::text(
+            painter,
+            egui::pos2(rect.right() - PAD, rect.bottom() - 28.0),
+            Align2::RIGHT_CENTER,
+            value,
+            theme::LABEL,
+            if matches!(self.model.connection, Connection::Reconnecting { .. }) {
+                AMBER
+            } else {
+                SECONDARY
+            },
+        );
+    }
 
-    
+    fn activity(&self, painter: &egui::Painter, rect: Rect) {
+        theme::card(painter, rect);
+        theme::text(
+            painter,
+            rect.min + egui::vec2(PAD, 28.0),
+            Align2::LEFT_CENTER,
+            "Activity",
+            theme::TITLE,
+            TEXT,
+        );
+        theme::text(
+            painter,
+            egui::pos2(rect.right() - PAD, rect.top() + 28.0),
+            Align2::RIGHT_CENTER,
+            "Latest first · session time",
+            theme::CAPTION,
+            MUTED,
+        );
+        if self.model.activity.is_empty() {
+            theme::text(
+                painter,
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Session events will appear here",
+                theme::BODY,
+                SECONDARY,
+            );
+        }
+        let count = self.model.activity.len().min(6);
+        if count > 1 {
+            let x = rect.left() + PAD;
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.top() + 64.0),
+                    egui::pos2(
+                        x,
+                        rect.top() + 64.0 + (count - 1) as f32 * theme::TIMELINE_ROW,
+                    ),
+                ],
+                Stroke::new(1.0, BORDER),
+            );
+        }
+        for (index, event) in self.model.activity.iter().rev().take(6).enumerate() {
+            let y = rect.top() + 64.0 + index as f32 * theme::TIMELINE_ROW;
+            let color = match event.kind {
+                ActivityKind::Info => MUTED,
+                ActivityKind::Success => TEAL,
+                ActivityKind::Recovery => AMBER,
+                ActivityKind::Error => ERROR,
+            };
+            let at = egui::pos2(rect.left() + PAD, y);
+            painter.circle_filled(at, 6.0, theme::SURFACE);
+            if index == 0 {
+                painter.circle_filled(at, 6.0, color.gamma_multiply(0.08));
+            }
+            painter.circle_filled(at, 3.0, color);
+            theme::mono(
+                painter,
+                at + egui::vec2(20.0, 0.0),
+                clock_time(event.at),
+                theme::CAPTION,
+                MUTED,
+            );
+            theme::ellipsis(
+                painter,
+                Rect::from_min_max(
+                    at + egui::vec2(88.0, -12.0),
+                    egui::pos2(rect.right() - PAD, y + 12.0),
+                ),
+                &event.text,
+                theme::BODY,
+                if index == 0 { TEXT } else { SECONDARY },
+            );
+        }
+    }
 
     fn notice(&mut self, ui: &mut egui::Ui, now: Duration) {
         let needs_notice = self.model.problem.is_some()
@@ -558,8 +739,8 @@ fn allocate(ui: &mut egui::Ui, height: f32) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super :: * ;
-    use crate :: source :: RealSource ;
+    use super::*;
+    use crate::source::RealSource;
 
     #[test]
     fn receipt_animation_is_bounded_and_idle_repaints_stay_slow() {
