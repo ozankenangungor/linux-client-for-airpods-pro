@@ -246,8 +246,15 @@ def install_service(
     enable: bool = False,
     force: bool = False,
     writer: Callable[[Path, str], None] = atomic_write_unit,
+    appimage: Path | None = None,
 ) -> None:
-    rendered = render_unit(python)
+    if appimage is None:
+        rendered = render_unit(python)
+    else:
+        try:
+            rendered = _native.app_service_render_appimage_unit(os.fspath(appimage))
+        except ValueError as error:
+            raise ServiceInstallerError(str(error)) from error
     exists = _path_exists(unit_path)
     owned = is_project_owned(_read_unit(unit_path)) if exists else False
     try:
@@ -315,6 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     install = subparsers.add_parser(
         "install", help="install the user-service unit"
     )
+    install.add_argument("--appimage", type=Path, help=argparse.SUPPRESS)
     install.add_argument(
         "--enable", action="store_true", help="enable at login without starting now"
     )
@@ -363,7 +371,13 @@ def main(
         python = installed_python()
         if args.action == "install":
             operations = _native.app_service_dry_run_operations(True, args.enable)
-            if args.dry_run:
+            if args.dry_run and args.appimage is not None:
+                # Internal packaged mode has a fixed command, never a shell fragment.
+                output(f"unit_path={path}")
+                output(f"exec_start={_native.app_service_appimage_exec_start(os.fspath(args.appimage))}")
+                for operation in operations:
+                    output(f"would_run={' '.join(command.argv_for(operation))}")
+            elif args.dry_run:
                 _print_plan(
                     unit_path=path,
                     python=python,
@@ -378,6 +392,7 @@ def main(
                     systemctl=command,
                     enable=args.enable,
                     force=args.force,
+                    appimage=args.appimage,
                 )
                 output(f"installed={path}")
             return 0

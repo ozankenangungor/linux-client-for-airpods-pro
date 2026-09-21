@@ -272,6 +272,18 @@ fn app_service_render_unit(path: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn app_service_appimage_exec_start(path: &str) -> PyResult<String> {
+    service::appimage_exec_start(path)
+        .map_err(|error| PyValueError::new_err(error.format_message(path)))
+}
+
+#[pyfunction]
+fn app_service_render_appimage_unit(path: &str) -> PyResult<String> {
+    service::render_appimage_unit(path)
+        .map_err(|error| PyValueError::new_err(error.format_message(path)))
+}
+
+#[pyfunction]
 fn app_service_owned(contents: &str) -> bool {
     service::is_project_owned(contents)
 }
@@ -365,6 +377,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(app_service_render_executable, module)?)?;
     module.add_function(wrap_pyfunction!(app_service_exec_start, module)?)?;
     module.add_function(wrap_pyfunction!(app_service_render_unit, module)?)?;
+    module.add_function(wrap_pyfunction!(app_service_appimage_exec_start, module)?)?;
+    module.add_function(wrap_pyfunction!(app_service_render_appimage_unit, module)?)?;
     module.add_function(wrap_pyfunction!(app_service_owned, module)?)?;
     module.add_function(wrap_pyfunction!(app_service_installed_exec_start, module)?)?;
     module.add_function(wrap_pyfunction!(app_service_installation_state, module)?)?;
