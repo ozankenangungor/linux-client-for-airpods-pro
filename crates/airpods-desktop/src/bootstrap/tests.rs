@@ -21,6 +21,7 @@ impl Fixture {
         Self {
             paths: InstallPaths {
                 source: root.join("source checkout"),
+                packaged: None,
                 data: root.join("data home/airpods-hr-linux"),
                 unit: root.join("config home/systemd/user/airpods-hubd.service"),
             },
@@ -137,7 +138,13 @@ impl FakeHost {
             } else {
                 Action::EnvCheck
             }
-        } else if spec.program == self.paths.installer() {
+        } else if spec.program == self.paths.installer()
+            || self
+                .paths
+                .packaged
+                .as_ref()
+                .is_some_and(|payload| spec.program == payload.python())
+        {
             Action::Installer
         } else {
             assert_eq!(spec.program, "systemctl");
@@ -222,7 +229,14 @@ impl Host for FakeHost {
                     .unwrap();
                 fs::write(
                     &self.paths.unit,
-                    service::render_unit(self.paths.python().to_str().unwrap()).unwrap(),
+                    if self.paths.packaged.is_some() {
+                        service::render_appimage_unit(
+                            Payload::stable_image(&self.paths.data).to_str().unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        service::render_unit(self.paths.python().to_str().unwrap()).unwrap()
+                    },
                 )
                 .await
                 .unwrap();
@@ -832,4 +846,91 @@ async fn native_probe_uses_only_hello_and_status_on_a_fake_socket() {
         );
         server.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn packaged_provider_migrates_source_unit_without_host_python_or_pip() {
+    let payload = crate::packaged::tests::Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.paths.packaged = Some(payload.payload.clone());
+    fixture.unit("/tmp/deleted-environment/bin/python");
+    let mut host = FakeHost::new(&fixture);
+    let (result, stages) = execute(&fixture, &mut host).await;
+    assert_eq!(result, Ok(()));
+    assert!(stages.contains(&Stage::PreparingBundle));
+    assert_eq!(
+        host.actions(),
+        vec![
+            Action::Manager,
+            Action::LoadedUnit,
+            Action::Installer,
+            Action::Start
+        ]
+    );
+    let installer = &host.commands[2].1;
+    assert_eq!(installer.program, payload.payload.python());
+    assert_eq!(
+        installer.args[..5],
+        [
+            "-I",
+            "-m",
+            "airpods_hr.service_installer",
+            "install",
+            "--appimage"
+        ]
+        .map(OsString::from)
+    );
+    assert_eq!(
+        installer.args[5],
+        Payload::stable_image(&fixture.paths.data)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.paths.unit).await.unwrap(),
+        service::render_appimage_unit(Payload::stable_image(&fixture.paths.data).to_str().unwrap())
+            .unwrap()
+    );
+    assert!(!fixture.paths.environment().exists());
+}
+
+#[tokio::test]
+async fn packaged_existing_installation_skips_installer_and_reuses_image() {
+    let payload = crate::packaged::tests::Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.paths.packaged = Some(payload.payload.clone());
+    let mut host = FakeHost::new(&fixture);
+    assert_eq!(execute(&fixture, &mut host).await.0, Ok(()));
+    let before = std::fs::metadata(Payload::stable_image(&fixture.paths.data)).unwrap();
+    let mut host = FakeHost::new(&fixture);
+    assert_eq!(execute(&fixture, &mut host).await.0, Ok(()));
+    assert_eq!(
+        host.actions(),
+        vec![Action::Manager, Action::LoadedUnit, Action::Start]
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(Payload::stable_image(&fixture.paths.data))
+            .unwrap()
+            .ino(),
+        before.ino()
+    );
+}
+
+#[tokio::test]
+async fn packaged_foreign_service_is_untouched_before_copy_or_commands() {
+    let payload = crate::packaged::tests::Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.paths.packaged = Some(payload.payload.clone());
+    fs::create_dir_all(fixture.paths.unit.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&fixture.paths.unit, "[Service]\nExecStart=/foreign\n")
+        .await
+        .unwrap();
+    let mut host = FakeHost::new(&fixture);
+    assert_eq!(
+        execute(&fixture, &mut host).await.0,
+        Err(Failure::ForeignService)
+    );
+    assert!(host.commands.is_empty());
+    assert!(!fixture.paths.data.exists());
 }
