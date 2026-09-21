@@ -5,6 +5,7 @@ mod process;
 #[cfg(test)]
 mod tests;
 
+use crate::packaged::Payload;
 use airpods_app_core::service;
 use airpods_client::{AirPodsClient, DaemonState};
 use process::{CommandResult, CommandSpec, ProcessError};
@@ -35,6 +36,7 @@ pub enum Stage {
     FindingPython,
     CreatingEnvironment,
     InstallingDaemon,
+    PreparingBundle,
     InstallingService,
     StartingDaemon,
     WaitingForDaemon,
@@ -58,6 +60,7 @@ impl Stage {
             Self::WaitingForSetup => "Another app instance is preparing the daemon…",
             Self::FindingPython => "Looking for Python 3.14…",
             Self::CreatingEnvironment => "Creating a local daemon environment…",
+            Self::PreparingBundle => "Saving the bundled daemon in your local data directory…",
             Self::InstallingDaemon => {
                 "Installing the daemon and its dependencies. First setup can take a few minutes…"
             }
@@ -74,6 +77,7 @@ pub enum Failure {
     Cancelled,
     Storage,
     SourceCheckout,
+    PackagedDistribution,
     PythonMissing,
     PythonVersion,
     Environment,
@@ -95,6 +99,7 @@ impl Failure {
             Self::Cancelled => "Daemon setup was cancelled",
             Self::Storage => "The daemon data directory is not usable",
             Self::SourceCheckout => "The source checkout is not available",
+            Self::PackagedDistribution => "The bundled daemon is not available",
             Self::PythonMissing | Self::PythonVersion => "Python 3.14 is required",
             Self::Environment => "The local daemon environment could not be prepared",
             Self::PackageInstall => "The daemon package could not be installed",
@@ -114,6 +119,7 @@ impl Failure {
             Self::Cancelled => "Retry when you are ready.",
             Self::Storage => "Use an absolute, persistent XDG data directory owned by your user.",
             Self::SourceCheckout => "Run the app from a build of this repository checkout.",
+            Self::PackagedDistribution => "Download a complete AppImage and retry.",
             Self::PythonMissing | Self::PythonVersion => "Install Python 3.14, then retry.",
             Self::Environment => {
                 "Check Python 3.14 venv support and available disk space, then retry."
@@ -145,21 +151,36 @@ impl Failure {
 #[derive(Clone, Debug)]
 struct InstallPaths {
     source: PathBuf,
+    packaged: Option<Payload>,
     data: PathBuf,
     unit: PathBuf,
 }
 
 impl InstallPaths {
     fn discover() -> Result<Self, Failure> {
-        Self::from_environment(
+        let packaged = Payload::discover(
+            |key| std::env::var_os(key),
+            &std::env::current_exe().map_err(|_| Failure::PackagedDistribution)?,
+        )?;
+        Self::from_environment_with_payload(
             |key| std::env::var_os(key),
             Path::new(env!("CARGO_MANIFEST_DIR")),
+            packaged,
         )
     }
 
+    #[cfg(test)]
     fn from_environment(
         env: impl Fn(&str) -> Option<OsString>,
         manifest: &Path,
+    ) -> Result<Self, Failure> {
+        Self::from_environment_with_payload(env, manifest, None)
+    }
+
+    fn from_environment_with_payload(
+        env: impl Fn(&str) -> Option<OsString>,
+        manifest: &Path,
+        packaged: Option<Payload>,
     ) -> Result<Self, Failure> {
         let base = |key: &str, fallback: &str| {
             let path = match env(key).filter(|value| !value.is_empty()) {
@@ -187,23 +208,29 @@ impl InstallPaths {
             }
         }
         let data = resolved.join(data.strip_prefix(parent).map_err(|_| Failure::Storage)?);
-        let source = manifest
-            .parent()
-            .and_then(Path::parent)
-            .ok_or(Failure::SourceCheckout)?
-            .canonicalize()
-            .map_err(|_| Failure::SourceCheckout)?;
-        let project = std::fs::read_to_string(source.join("pyproject.toml"))
-            .map_err(|_| Failure::SourceCheckout)?;
-        if !project.contains("\nname = \"airpods-hr-linux\"\n")
-            || !source.join("Cargo.toml").is_file()
-            || !source.join("Cargo.lock").is_file()
-            || !source.join("src/airpods_hr/service_installer.py").is_file()
-        {
-            return Err(Failure::SourceCheckout);
-        }
+        let source = if packaged.is_some() {
+            PathBuf::new()
+        } else {
+            let source = manifest
+                .parent()
+                .and_then(Path::parent)
+                .ok_or(Failure::SourceCheckout)?
+                .canonicalize()
+                .map_err(|_| Failure::SourceCheckout)?;
+            let project = std::fs::read_to_string(source.join("pyproject.toml"))
+                .map_err(|_| Failure::SourceCheckout)?;
+            if !project.contains("\nname = \"airpods-hr-linux\"\n")
+                || !source.join("Cargo.toml").is_file()
+                || !source.join("Cargo.lock").is_file()
+                || !source.join("src/airpods_hr/service_installer.py").is_file()
+            {
+                return Err(Failure::SourceCheckout);
+            }
+            source
+        };
         Ok(Self {
             source,
+            packaged,
             data,
             unit: base("XDG_CONFIG_HOME", ".config")?
                 .join("systemd/user")
@@ -424,8 +451,16 @@ where
     let paths = installation()?;
     let unit = cancellable(stop, read_unit(&paths.unit)).await??;
     owned_unit(&unit)?;
-    let expected = service::exec_start(paths.python().to_str().ok_or(Failure::Storage)?)
-        .map_err(|_| Failure::Storage)?;
+    let expected = if paths.packaged.is_some() {
+        service::appimage_exec_start(
+            Payload::stable_image(&paths.data)
+                .to_str()
+                .ok_or(Failure::Storage)?,
+        )
+    } else {
+        service::exec_start(paths.python().to_str().ok_or(Failure::Storage)?)
+    }
+    .map_err(|_| Failure::Storage)?;
     let lock = cancellable(stop, async {
         fs::create_dir_all(&paths.data)
             .await
@@ -534,6 +569,95 @@ where
             return Err(Failure::ForeignService);
         }
     }
+    if let Some(payload) = &paths.packaged {
+        progress(&mut report, Stage::PreparingBundle).await?;
+        cancellable(stop, payload.install(&paths.data, &stop.clone())).await??;
+    } else {
+        prepare_source_environment(&paths, host, stop, &mut report).await?;
+    }
+    // Setup may have taken minutes. Recheck ownership before asking the
+    // authoritative installer to replace anything; it also checks at write time.
+    let unit = cancellable(stop, read_unit(&paths.unit)).await??;
+    owned_unit(&unit)?;
+    let state = service::installation_state(unit.as_deref(), &expected);
+    let pending = paths.data.join("service-install-pending");
+    if !service::installation_valid(unit.is_some(), state.owned, state.exec_start_matches)
+        || cancellable(stop, fs::symlink_metadata(&pending))
+            .await?
+            .is_ok()
+    {
+        progress(&mut report, Stage::InstallingService).await?;
+        cancellable(stop, fs::write(&pending, b"install\n"))
+            .await?
+            .map_err(|_| Failure::Storage)?;
+        let installation = run(
+            host,
+            stop,
+            if let Some(payload) = &paths.packaged {
+                CommandSpec::new(
+                    payload.python(),
+                    [
+                        OsString::from("-I"),
+                        OsString::from("-m"),
+                        OsString::from("airpods_hr.service_installer"),
+                        OsString::from("install"),
+                        OsString::from("--appimage"),
+                        Payload::stable_image(&paths.data).into_os_string(),
+                    ],
+                    COMMAND_TIMEOUT,
+                )
+            } else {
+                CommandSpec::new(paths.installer(), ["install"], COMMAND_TIMEOUT)
+            },
+            Failure::ServiceInstall,
+        )
+        .await?;
+        if !installation.success {
+            owned_unit(&cancellable(stop, read_unit(&paths.unit)).await??)?;
+            return Err(Failure::ServiceInstall);
+        }
+        let installed = cancellable(stop, read_unit(&paths.unit)).await??;
+        let state = service::installation_state(installed.as_deref(), &expected);
+        if !service::installation_valid(installed.is_some(), state.owned, state.exec_start_matches)
+        {
+            return Err(Failure::ServiceInstall);
+        }
+        cancellable(stop, fs::remove_file(pending))
+            .await?
+            .map_err(|_| Failure::Storage)?;
+    }
+    // Recheck immediately before activation; never restart an external session.
+    match host.probe(socket, stop).await? {
+        Probe::Ready => return progress(&mut report, Stage::Ready).await,
+        Probe::Starting => return wait_ready(socket, host, stop, &mut report, false).await,
+        Probe::Missing => {}
+    }
+    progress(&mut report, Stage::StartingDaemon).await?;
+    require(
+        host,
+        stop,
+        CommandSpec::new(
+            "systemctl",
+            ["--user", "start", service::UNIT_NAME],
+            COMMAND_TIMEOUT,
+        ),
+        Failure::ServiceStart,
+    )
+    .await?;
+    wait_ready(socket, host, stop, &mut report, true).await
+}
+
+async fn prepare_source_environment<H, F, Fut>(
+    paths: &InstallPaths,
+    host: &mut H,
+    stop: &mut watch::Receiver<bool>,
+    report: &mut F,
+) -> Result<(), Failure>
+where
+    H: Host,
+    F: FnMut(Stage) -> Fut,
+    Fut: Future<Output = bool>,
+{
     let environment = paths.environment();
     match cancellable(stop, fs::symlink_metadata(&environment)).await? {
         Ok(metadata) if metadata.is_dir() => {}
@@ -573,7 +697,7 @@ where
         };
     }
     if !complete {
-        progress(&mut report, Stage::FindingPython).await?;
+        progress(report, Stage::FindingPython).await?;
         let version = run(
             host,
             stop,
@@ -599,7 +723,7 @@ where
         cancellable(stop, fs::write(marker, ENV_MARKER))
             .await?
             .map_err(|_| Failure::Storage)?;
-        progress(&mut report, Stage::CreatingEnvironment).await?;
+        progress(report, Stage::CreatingEnvironment).await?;
         require(
             host,
             stop,
@@ -617,7 +741,7 @@ where
             Failure::Environment,
         )
         .await?;
-        progress(&mut report, Stage::InstallingDaemon).await?;
+        progress(report, Stage::InstallingDaemon).await?;
         require(
             host,
             stop,
@@ -655,61 +779,7 @@ where
             }
         }
     }
-    // Setup may have taken minutes. Recheck ownership before asking the
-    // authoritative installer to replace anything; it also checks at write time.
-    let unit = cancellable(stop, read_unit(&paths.unit)).await??;
-    owned_unit(&unit)?;
-    let state = service::installation_state(unit.as_deref(), &expected);
-    let pending = paths.data.join("service-install-pending");
-    if !service::installation_valid(unit.is_some(), state.owned, state.exec_start_matches)
-        || cancellable(stop, fs::symlink_metadata(&pending))
-            .await?
-            .is_ok()
-    {
-        progress(&mut report, Stage::InstallingService).await?;
-        cancellable(stop, fs::write(&pending, b"install\n"))
-            .await?
-            .map_err(|_| Failure::Storage)?;
-        let installation = run(
-            host,
-            stop,
-            CommandSpec::new(paths.installer(), ["install"], COMMAND_TIMEOUT),
-            Failure::ServiceInstall,
-        )
-        .await?;
-        if !installation.success {
-            owned_unit(&cancellable(stop, read_unit(&paths.unit)).await??)?;
-            return Err(Failure::ServiceInstall);
-        }
-        let installed = cancellable(stop, read_unit(&paths.unit)).await??;
-        let state = service::installation_state(installed.as_deref(), &expected);
-        if !service::installation_valid(installed.is_some(), state.owned, state.exec_start_matches)
-        {
-            return Err(Failure::ServiceInstall);
-        }
-        cancellable(stop, fs::remove_file(pending))
-            .await?
-            .map_err(|_| Failure::Storage)?;
-    }
-    // Recheck immediately before activation; never restart an external session.
-    match host.probe(socket, stop).await? {
-        Probe::Ready => return progress(&mut report, Stage::Ready).await,
-        Probe::Starting => return wait_ready(socket, host, stop, &mut report, false).await,
-        Probe::Missing => {}
-    }
-    progress(&mut report, Stage::StartingDaemon).await?;
-    require(
-        host,
-        stop,
-        CommandSpec::new(
-            "systemctl",
-            ["--user", "start", service::UNIT_NAME],
-            COMMAND_TIMEOUT,
-        ),
-        Failure::ServiceStart,
-    )
-    .await?;
-    wait_ready(socket, host, stop, &mut report, true).await
+    Ok(())
 }
 
 async fn wait_ready<H, F, Fut>(

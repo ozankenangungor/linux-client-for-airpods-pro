@@ -88,6 +88,7 @@ dependencies = [
  "clap",
  "eframe",
  "rustix 1.1.5",
+ "sha2",
  "tokio",
 ]
 

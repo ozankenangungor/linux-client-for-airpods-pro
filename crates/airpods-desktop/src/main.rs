@@ -5,6 +5,7 @@ mod bootstrap;
 mod chart;
 mod demo;
 mod model;
+mod packaged;
 mod source;
 mod theme;
 

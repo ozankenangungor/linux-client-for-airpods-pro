@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false
+default-run = "airpods-desktop"
 description = "Live AirPods heart rate on the Linux desktop"
 
 [dependencies]
@@ -12,8 +13,10 @@ airpods-client = { path = "../airpods-client" }
 airpods-client-resilient = { path = "../airpods-client-resilient" }
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1", features = ["fs", "process", "thread"] }
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["io-util", "net", "test-util"] }
