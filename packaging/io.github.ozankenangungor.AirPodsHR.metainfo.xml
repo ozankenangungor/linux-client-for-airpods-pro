@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ozankenangungor.AirPodsHR</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Linux Client for AirPods Pro</name>
+  <summary>Heart-rate data from compatible AirPods Pro devices on Linux</summary>
+  <description>
+    <p>An independent Linux client for heart-rate samples from AirPods Pro 3,
+    with live history, session statistics, connection state, and recovery events.</p>
+    <p>The separate airpods-hubd daemon owns Bluetooth and shares readings with
+    local applications. A deterministic demo works without AirPods.</p>
+    <p>Hardware testing covers AirPods Pro 3. Pair AirPods through Linux Bluetooth
+    settings. Heart-rate output is experimental and is not for medical use.</p>
+  </description>
+  <launchable type="desktop-id">AirPods-HR.desktop</launchable>
+  <url type="homepage">https://github.com/ozankenangungor/linux-client-for-airpods-pro</url>
+  <url type="bugtracker">https://github.com/ozankenangungor/linux-client-for-airpods-pro/issues</url>
+  <developer id="io.github.ozankenangungor">
+    <name>Ozan Kenan Güngör</name>
+  </developer>
+  <categories><category>System</category><category>Monitor</category></categories>
+  <content_rating type="oars-1.1"/>
+</component>

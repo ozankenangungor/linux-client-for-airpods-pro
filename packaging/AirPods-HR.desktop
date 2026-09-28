@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Client for AirPods Pro
+Comment=Heart-rate data from compatible AirPods Pro devices
+Exec=airpods-desktop
+Icon=AirPods-HR
+Terminal=false
+Categories=System;Monitor;
+StartupWMClass=airpods-desktop

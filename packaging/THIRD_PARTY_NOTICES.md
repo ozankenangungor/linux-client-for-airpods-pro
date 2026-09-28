@@ -1,7 +1,7 @@
 # Third-party notices
 
-AirPods HR is MIT licensed. The AppImage also contains software under other
-licenses; the project license does not replace those licenses.
+Linux Client for AirPods Pro is MIT licensed. The AppImage also contains
+software under other licenses; the project license does not replace them.
 
 The build keeps license texts and dependency sources under
 `usr/share/licenses/airpods-hr-linux` in the AppImage:
