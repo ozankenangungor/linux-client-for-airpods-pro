@@ -1,0 +1,30 @@
+name: Desktop distribution review
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      # AlmaLinux 9.7 x86_64 manifest; glibc 2.34.
+      image: docker.io/library/almalinux@sha256:7b72041988f07ef5020f7f5da036a9aad9165d996d02946bce29c9a38e99ba59
+    steps:
+      - name: Prepare container checkout tools
+        run: dnf install -y git python3 tar xz gzip
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build and validate review artifacts
+        run: python3 packaging/build-desktop-distribution.py --output dist/desktop
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: airpods-hr-appimage-review-${{ github.sha }}
+          path: dist/desktop/
+          if-no-files-found: error
+          retention-days: 14

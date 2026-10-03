@@ -15,6 +15,16 @@ spec.loader.exec_module(distribution)
 
 
 class DistributionTests(unittest.TestCase):
+    def test_lock_pins_container_and_tools_and_workflow_does_not_publish(self):
+        lock = distribution.load_lock()
+        workflow = (ROOT / '.github/workflows/distribution.yml').read_text()
+        self.assertIn(lock['container'], workflow)
+        self.assertIn('workflow_dispatch:', workflow)
+        self.assertIn('contents: read', workflow)
+        for forbidden in ['contents: write', 'id-token: write', 'cargo publish', 'twine upload', 'gh release']:
+            self.assertNotIn(forbidden, workflow)
+        self.assertEqual(lock['assets']['python']['version'], '3.14.7')
+
     def test_floating_assets_and_wrong_hash_are_rejected(self):
         lock = distribution.load_lock()
         lock['assets']['python']['url'] = 'https://example.com/latest/python.tar.gz'
