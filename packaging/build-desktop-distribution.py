@@ -204,23 +204,137 @@ def collect_licenses(appdir, work, assets, bundled_libraries, env):
         if name.endswith('_source'):
             suffix = '.tar.xz' if name == 'fuse_source' else '.tar.gz'
             shutil.copy2(asset, sources / (name + suffix))
-    system_packages = {}
-    for source, _ in bundled_libraries:
-        package = run(['rpm', '-qf', '--qf', '%{NAME}', source], capture=True)
-        if package in system_packages:
-            continue
-        system_packages[package] = run(['rpm', '-q', '--qf', '%{NEVRA} %{LICENSE}', package], capture=True)
-        for item in run(['rpm', '-ql', package], capture=True).splitlines():
-            file = Path(item)
-            if file.is_file() and '/usr/share/licenses/' in item:
-                dest = target / 'system-libraries' / package / file.name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(file, dest)
-        source_dir = target / 'system-library-sources'
-        source_dir.mkdir(exist_ok=True)
-        run(['dnf', 'download', '--source', '--destdir', source_dir, package], timeout=600)
-    (target / 'system-packages.json').write_text(json.dumps(system_packages, indent=2) + '\n')
-    return system_packages
+    return collect_system_licenses(appdir, target, bundled_libraries)
+
+
+RPM_FIELDS = ('name', 'epoch', 'version', 'release', 'arch')
+RPM_FORMAT = '\t'.join('%{' + field.upper() + '}' if field != 'epoch' else '%{EPOCHNUM}'
+                       for field in RPM_FIELDS)
+# The pinned 9.7 container can retain libraries no longer in the active 9.x
+# repositories. Make its official vault source repositories available too.
+SOURCE_REPO_OPTIONS = [
+    '--repofrompath=airpods-vault-' + repo.lower() + '-source,'
+    + 'https://repo.almalinux.org/vault/9.7/' + repo + '/Source/'
+    for repo in ('BaseOS', 'AppStream', 'CRB')
+]
+
+
+def parse_rpm_identity(record):
+    fields = record.split('\t')
+    if len(fields) != 5 or any('\n' in field for field in fields):
+        raise ValueError('expected one RPM identity record')
+    identity = dict(zip(RPM_FIELDS, fields))
+    if not re.fullmatch(r'[0-9]+', identity['epoch']):
+        raise ValueError('invalid RPM epoch')
+    for field in ('name', 'version', 'release', 'arch'):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+_.~^:-]*', identity[field]):
+            raise ValueError('invalid RPM ' + field)
+    return identity
+
+
+def rpm_nevra(identity):
+    epoch = identity['epoch'] + ':' if int(identity['epoch']) else ''
+    return (identity['name'] + '-' + epoch + identity['version'] + '-'
+            + identity['release'] + '.' + identity['arch'])
+
+
+def source_filename(identity):
+    return (identity['name'] + '-' + identity['version'] + '-'
+            + identity['release'] + '.src.rpm')
+
+
+def parse_sourcerpm(filename):
+    if not filename.endswith('.src.rpm') or '/' in filename:
+        raise ValueError('source RPM filename required')
+    parts = filename[:-len('.src.rpm')].rsplit('-', 2)
+    if len(parts) != 3:
+        raise ValueError('invalid SOURCERPM identity')
+    identity = parse_rpm_identity('\t'.join([parts[0], '0', parts[1], parts[2], 'src']))
+    if source_filename(identity) != filename:
+        raise ValueError('invalid SOURCERPM identity')
+    # SOURCERPM does not encode the epoch. Resolve that from repository metadata.
+    return identity
+
+
+def installed_rpm(source):
+    record = run(['rpm', '-qf', '--qf', RPM_FORMAT + '\t%{NEVRA}\t%{LICENSE}\t%{SOURCERPM}',
+                  source], capture=True)
+    fields = record.split('\t')
+    if len(fields) != 8:
+        raise ValueError('expected one owning binary RPM')
+    identity = parse_rpm_identity('\t'.join(fields[:5]))
+    identity.update(nevra=fields[5], license=fields[6], sourcerpm=fields[7])
+    if identity['arch'] == 'src' or not identity['license'] or not identity['nevra']:
+        raise ValueError('invalid owning binary RPM')
+    parse_sourcerpm(identity['sourcerpm'])
+    return identity
+
+
+def resolve_source_rpm(filename):
+    expected = parse_sourcerpm(filename)
+    query_format = '\t'.join('%{' + field + '}' for field in RPM_FIELDS)
+    output = run(['dnf', '-q', *SOURCE_REPO_OPTIONS, 'repoquery-nevra', '--available',
+                  '--archlist=src', '--qf', query_format, filename[:-4]],
+                 capture=True, timeout=600)
+    matches = []
+    for line in output.splitlines():
+        identity = parse_rpm_identity(line)
+        if identity['arch'] != 'src' or any(identity[k] != expected[k]
+                                         for k in ('name', 'version', 'release')):
+            raise ValueError('repository returned a mismatched source RPM for ' + filename)
+        if identity not in matches:
+            matches.append(identity)
+    if len(matches) != 1:
+        raise ValueError('exact source RPM unavailable or ambiguous: ' + filename)
+    return matches[0]
+
+
+def fetch_source_rpm(filename, destination):
+    identity = resolve_source_rpm(filename)
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination, prefix='.source-') as temporary:
+        staging = Path(temporary)
+        run(['dnf', *SOURCE_REPO_OPTIONS, 'download', '--source', '--destdir', staging,
+             rpm_nevra(identity)], timeout=600)
+        files = list(staging.iterdir())
+        if len(files) != 1 or files[0].name != filename or not files[0].is_file() or files[0].is_symlink():
+            raise ValueError('exact source RPM was not downloaded: ' + filename)
+        # SRPM headers retain the build architecture (often x86_64), while
+        # repository metadata calls their architecture src. Check SOURCEPACKAGE
+        # rather than mistaking a renamed binary RPM for source.
+        headers = run(['rpm', '-qp', '--qf', RPM_FORMAT + '\t%{SOURCEPACKAGE}', files[0]], capture=True).split('\t')
+        if len(headers) != 6 or headers[5] != '1':
+            raise ValueError('downloaded RPM is not a source package: ' + filename)
+        actual = parse_rpm_identity('\t'.join(headers[:5]))
+        if {**actual, 'arch': 'src'} != identity or source_filename(actual) != filename:
+            raise ValueError('downloaded source RPM metadata mismatch: ' + filename)
+        digest = sha256(files[0])
+        files[0].replace(destination / filename)
+    return {'identity': identity, 'rpm_header': actual, 'nevra': rpm_nevra(identity), 'filename': filename,
+            'path': 'system-library-sources/' + filename, 'sha256': digest}
+
+
+def collect_system_licenses(appdir, target, bundled_libraries):
+    packages, sources, mappings = {}, {}, []
+    for source, payload in sorted(bundled_libraries):
+        binary = installed_rpm(source)
+        key = binary['nevra']
+        if key not in packages:
+            filename = binary['sourcerpm']
+            if filename not in sources:
+                sources[filename] = fetch_source_rpm(filename, target / 'system-library-sources')
+            packages[key] = {'binary': binary, 'source': sources[filename]}
+            for item in run(['rpm', '-ql', key], capture=True).splitlines():
+                file = Path(item)
+                if file.is_file() and '/usr/share/licenses/' in item:
+                    dest = target / 'system-libraries' / key / file.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file, dest)
+        mappings.append({'library': str(payload.relative_to(appdir)),
+                         'library_sha256': sha256(payload), **packages[key]})
+    inventory = {'schema_version': 1, 'libraries': mappings, 'packages': packages}
+    (target / 'system-packages.json').write_text(json.dumps(inventory, indent=2, sort_keys=True) + '\n')
+    return inventory
 
 
 def copy_pyserial_license(archive_path, target):

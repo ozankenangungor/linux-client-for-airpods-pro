@@ -168,3 +168,101 @@ class DistributionTests(unittest.TestCase):
                 distribution.build(Path('/unused'))
             self.assertEqual(commands.call_count, 1)
             self.assertEqual(commands.call_args.args[0], ['getconf', 'GNU_LIBC_VERSION'])
+
+    def test_sourcerpm_parsing_preserves_exact_nvr(self):
+        source = distribution.parse_sourcerpm('systemd-252-55.el9_7.9.alma.1.src.rpm')
+        self.assertEqual(source, {'name': 'systemd', 'epoch': '0', 'version': '252',
+                                  'release': '55.el9_7.9.alma.1', 'arch': 'src'})
+        source['epoch'] = '2'
+        self.assertEqual(distribution.rpm_nevra(source), 'systemd-2:252-55.el9_7.9.alma.1.src')
+        self.assertEqual(distribution.source_filename(source), 'systemd-252-55.el9_7.9.alma.1.src.rpm')
+        self.assertEqual(distribution.parse_sourcerpm('lib-with-hyphens-1.2-3.el9.src.rpm')['name'], 'lib-with-hyphens')
+        for invalid in ['../systemd-252-55.src.rpm', 'systemd.src.rpm', 'systemd-252-55.x86_64.rpm', '(none)']:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                distribution.parse_sourcerpm(invalid)
+
+    def test_installed_binary_identity_comes_from_owner_metadata(self):
+        record = 'systemd-libs\t0\t252\t55.el9_7.9.alma.1\tx86_64\tsystemd-libs-252-55.el9_7.9.alma.1.x86_64\tLGPLv2+\tsystemd-252-55.el9_7.9.alma.1.src.rpm'
+        with patch.object(distribution, 'run', return_value=record) as command:
+            actual = distribution.installed_rpm(Path('/usr/lib64/libudev.so.1.7.5'))
+        self.assertEqual(actual['sourcerpm'], 'systemd-252-55.el9_7.9.alma.1.src.rpm')
+        self.assertEqual(actual['name'], 'systemd-libs')
+        self.assertIn('%{SOURCERPM}', command.call_args.args[0][3])
+        self.assertIn('-qf', command.call_args.args[0])
+        for invalid in [record + '\n' + record, record.replace('systemd-252-55.el9_7.9.alma.1.src.rpm', '(none)')]:
+            with patch.object(distribution, 'run', return_value=invalid), self.assertRaises(ValueError):
+                distribution.installed_rpm(Path('/fake'))
+
+    def test_source_query_requires_exact_nvr_and_unambiguous_epoch(self):
+        filename = 'systemd-252-55.el9_7.9.alma.1.src.rpm'
+        correct = 'systemd\t0\t252\t55.el9_7.9.alma.1\tsrc'
+        with patch.object(distribution, 'run', return_value=correct + '\n' + correct) as command:
+            self.assertEqual(distribution.resolve_source_rpm(filename)['release'], '55.el9_7.9.alma.1')
+            self.assertIn(filename[:-4], command.call_args.args[0])
+            self.assertIn('repoquery-nevra', command.call_args.args[0])
+        for output in ['', correct.replace('55.el9_7.9', '67.el9_8.6'), correct + '\n' + correct.replace('\t0\t', '\t1\t')]:
+            with self.subTest(output=output), patch.object(distribution, 'run', return_value=output), self.assertRaises(ValueError):
+                distribution.resolve_source_rpm(filename)
+
+    def test_source_fetch_verifies_headers_and_rejects_unavailable_or_mismatched_rpm(self):
+        filename = 'systemd-252-55.el9_7.9.alma.1.src.rpm'
+        record = 'systemd\t0\t252\t55.el9_7.9.alma.1\tsrc'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for output, download_name, headers, success in [
+                (record, filename, record.replace('\tsrc', '\tx86_64') + '\t1', True),
+                ('', filename, record + '\t1', False),
+                (record, filename, record.replace('55.el9_7.9', '67.el9_8.6') + '\t1', False),
+                (record, filename, record.replace('\tsrc', '\tx86_64') + '\t(none)', False),
+                (record, 'systemd-252-67.el9_8.6.alma.1.src.rpm', record + '\t1', False),
+            ]:
+                dest = root / str(len(list(root.iterdir())))
+                calls = []
+                def command(args, **kwargs):
+                    calls.append(args)
+                    if 'repoquery-nevra' in args:
+                        return output
+                    if 'download' in args:
+                        (Path(args[args.index('--destdir') + 1]) / download_name).write_bytes(b'source RPM bytes')
+                        return ''
+                    if '-qp' in args:
+                        return headers
+                    raise AssertionError(args)
+                with self.subTest(success=success, headers=headers), patch.object(distribution, 'run', side_effect=command):
+                    if success:
+                        mapping = distribution.fetch_source_rpm(filename, dest)
+                        self.assertEqual(mapping['sha256'], distribution.sha256(dest / filename))
+                        self.assertEqual(mapping['filename'], filename)
+                        self.assertEqual(mapping['nevra'], filename[:-4])
+                    else:
+                        with self.assertRaises(ValueError):
+                            distribution.fetch_source_rpm(filename, dest)
+                        self.assertFalse((dest / filename).exists())
+                        if not output:
+                            self.assertFalse(any('download' in args for args in calls))
+                    self.assertFalse(list(dest.glob('.source-*')))
+
+    def test_system_inventory_maps_each_library_and_reuses_matching_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            appdir = Path(temporary)
+            target = appdir / 'licenses'; target.mkdir()
+            libraries = []
+            for name in ['libudev.so.1', 'libsystemd.so.0']:
+                payload = appdir / 'usr/lib' / name; payload.parent.mkdir(parents=True, exist_ok=True)
+                payload.write_bytes(name.encode())
+                libraries.append((Path('/usr/lib64') / name, payload))
+            binary = {'name': 'systemd-libs', 'epoch': '0', 'version': '252', 'release': '55.el9_7.9.alma.1',
+                      'arch': 'x86_64', 'nevra': 'systemd-libs-252-55.el9_7.9.alma.1.x86_64',
+                      'license': 'LGPLv2+', 'sourcerpm': 'systemd-252-55.el9_7.9.alma.1.src.rpm'}
+            source = {'filename': binary['sourcerpm'], 'sha256': 'a' * 64}
+            license_file = appdir / 'usr/share/licenses/systemd/COPYING'; license_file.parent.mkdir(parents=True)
+            license_file.write_text('installed license text')
+            with patch.object(distribution, 'installed_rpm', return_value=binary), patch.object(distribution, 'fetch_source_rpm', return_value=source) as fetch, patch.object(distribution, 'run', return_value=str(license_file)):
+                inventory = distribution.collect_system_licenses(appdir, target, libraries)
+            fetch.assert_called_once_with(binary['sourcerpm'], target / 'system-library-sources')
+            self.assertEqual(len(inventory['libraries']), 2)
+            self.assertEqual(inventory['libraries'][0]['binary'], binary)
+            self.assertEqual(inventory['libraries'][0]['source']['sha256'], 'a' * 64)
+            self.assertEqual(json.loads((target / 'system-packages.json').read_text()), inventory)
+            self.assertEqual((target / 'system-libraries' / binary['nevra'] / 'COPYING').read_text(), 'installed license text')
+            self.assertNotIn(str(appdir), json.dumps(inventory))

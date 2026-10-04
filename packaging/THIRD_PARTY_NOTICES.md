@@ -15,7 +15,9 @@ The build keeps license texts and dependency sources under
 - Rust dependencies: the complete Cargo-verified source tree, including
   license, font, and notice files, plus the lockfile.
 - Bundled system libraries: the installed RPM license texts, exact package
-  identities, and source RPMs.
+  identities, and the exact corresponding source RPMs identified by each binary
+  package's `SOURCERPM` metadata. `system-packages.json` maps each bundled
+  library to its binary RPM, source RPM, and verified source file hash.
 - AppImage runtime: its MIT source and build scripts, the patched libfuse
   3.15.0 source (LGPL-2.1), and squashfuse, musl, zlib, and zstd sources.
   The runtime is redistributed unmodified. Its source includes the libfuse
