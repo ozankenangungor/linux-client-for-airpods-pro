@@ -266,3 +266,116 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(json.loads((target / 'system-packages.json').read_text()), inventory)
             self.assertEqual((target / 'system-libraries' / binary['nevra'] / 'COPYING').read_text(), 'installed license text')
             self.assertNotIn(str(appdir), json.dumps(inventory))
+
+    def test_dbm_exclusion_removes_only_payload_extension_and_records_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            appdir = root / 'AppDir'
+            extensions = appdir / 'usr/lib/airpods-hr-linux/python/lib/python3.14/lib-dynload'
+            extensions.mkdir(parents=True)
+            dbm = extensions / '_dbm.cpython-314-x86_64-linux-gnu.so'; dbm.write_bytes(b'Berkeley DB 6.0.19')
+            expected_hash = distribution.sha256(dbm)
+            other = extensions / '_sqlite3.so'; other.write_bytes(b'required library')
+            stdlib = extensions.parent / 'dbm/__init__.py'; stdlib.parent.mkdir(); stdlib.write_text('stdlib')
+            metadata = root / 'PYTHON.json'; metadata.write_text('{"_dbm": "upstream build metadata"}')
+            excluded = distribution.exclude_unused_dbm(appdir)
+            self.assertFalse(dbm.exists())
+            self.assertTrue(other.exists())
+            self.assertTrue(stdlib.exists())
+            self.assertEqual(metadata.read_text(), '{"_dbm": "upstream build metadata"}')
+            self.assertEqual(excluded[0]['path'], str(dbm.relative_to(appdir)))
+            self.assertEqual(excluded[0]['sha256'], expected_hash)
+            with self.assertRaises(ValueError):
+                distribution.exclude_unused_dbm(appdir)
+
+    def test_payload_inventory_rejects_berkeley_db_code_dependencies_and_symbols(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / 'usr/bin/program'; binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'\x7fELF application')
+            with patch.object(distribution, 'needed', return_value=['libdbus-1.so.3']), patch.object(distribution, 'run', return_value='no db symbols'):
+                inventory = distribution.payload_inventory(root, [{'path': 'excluded/_dbm.so'}])
+                self.assertFalse(inventory['berkeley_db_binary_present'])
+                self.assertFalse(inventory['upstream_metadata_is_payload_inventory'])
+                self.assertEqual(inventory['elf_sha256'], {'usr/bin/program': distribution.sha256(binary)})
+                binary.write_bytes(b'\x7fELF Berkeley DB 6.0.19')
+                with self.assertRaisesRegex(ValueError, 'binary signature'):
+                    distribution.payload_inventory(root, [])
+            binary.write_bytes(b'\x7fELF application')
+            with patch.object(distribution, 'needed', return_value=['libdb-6.0.so']), self.assertRaisesRegex(ValueError, 'ELF dependency'):
+                distribution.payload_inventory(root, [])
+            with patch.object(distribution, 'needed', return_value=[]), patch.object(distribution, 'run', return_value='42 FUNC __db_create_pp'), self.assertRaisesRegex(ValueError, 'ELF symbols'):
+                distribution.payload_inventory(root, [])
+            shared = root / 'libdb-6.0.so'; shared.write_bytes(b'library')
+            with self.assertRaisesRegex(ValueError, 'shared library'):
+                distribution.payload_inventory(root, [])
+
+    def test_import_smoke_blocks_dbm_network_and_processes_without_starting_daemon(self):
+        import sys
+        with tempfile.TemporaryDirectory() as temporary:
+            # Exercise the real imports from the established project environment.
+            evidence = distribution.runtime_import_smoke(Path(sys.executable), Path(temporary))
+            self.assertEqual(evidence['dbm_import_attempts'], [])
+            self.assertIn('airpods_hr._hubd.main', evidence['loaded_modules'])
+            self.assertIn('bumble.transport.usb', evidence['loaded_modules'])
+            self.assertNotIn('_dbm', evidence['loaded_modules'])
+            for operation in ['import _dbm', 'import dbm', 'import socket; socket.socket()',
+                              'import subprocess; subprocess.run(["/bin/true"])']:
+                code = distribution.RUNTIME_IMPORT_SMOKE + '\n' + operation
+                result = subprocess.run([sys.executable, '-I', '-c', code], cwd=temporary,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0, operation)
+
+    def test_new_images_are_source_named_review_artifacts(self):
+        sha = 'a' * 40
+        self.assertEqual(distribution.review_image_name(sha), 'AirPods-HR-review-' + sha + '-x86_64.AppImage')
+        self.assertNotIn('0.1.0', distribution.review_image_name(sha))
+        with self.assertRaises(ValueError):
+            distribution.review_image_name('main')
+
+    def test_license_collection_preserves_upstream_records_and_other_notices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            appdir = root / 'AppDir'; appdir.mkdir()
+            work = root / 'work'; work.mkdir()
+            package_notice = appdir / 'usr/lib/airpods-hr-linux/python/lib/python3.14/site-packages/example.dist-info/LICENSE'
+            package_notice.parent.mkdir(parents=True); package_notice.write_bytes(b'wheel license')
+            pyserial = root / 'pyserial.tar.gz'
+            with tarfile.open(pyserial, 'w:gz') as archive:
+                item = tarfile.TarInfo('pyserial-3.5/LICENSE.txt'); item.size = 8
+                archive.addfile(item, io.BytesIO(b'pyserial'))
+            full = io.BytesIO()
+            with tarfile.open(fileobj=full, mode='w') as archive:
+                for name, content in [('python/PYTHON.json', b'{"upstream _dbm": true}'),
+                                      ('python/licenses/LICENSE.bdb.txt', b'original upstream license')]:
+                    item = tarfile.TarInfo(name); item.size = len(content)
+                    archive.addfile(item, io.BytesIO(content))
+            full.seek(0)
+            class Decompressor:
+                stdout = full
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def wait(self, timeout): return 0
+            runtime_source = root / 'runtime-source.tar.gz'; runtime_source.write_bytes(b'pinned runtime sources')
+            def command(args, **kwargs):
+                if args[:2] == ['cargo', 'vendor']:
+                    vendor = Path(args[-1]); vendor.mkdir()
+                    (vendor / 'LICENSE').write_bytes(b'Rust dependency license')
+                elif args[:2] == ['git', 'archive']:
+                    Path(args[3].removeprefix('--output=')).write_bytes(b'project source archive')
+                else:
+                    raise AssertionError(args)
+                return ''
+            with patch.object(distribution.subprocess, 'Popen', return_value=Decompressor()), patch.object(distribution, 'run', side_effect=command), patch.object(distribution, 'collect_system_licenses', return_value={'libraries': []}) as system:
+                distribution.collect_licenses(appdir, work, {'python_full': root / 'upstream.zst',
+                    'pyserial_license': pyserial, 'runtime_source': runtime_source}, [], {})
+            target = appdir / 'usr/share/licenses/airpods-hr-linux'
+            self.assertEqual((target / 'python-runtime/PYTHON.json').read_bytes(), b'{"upstream _dbm": true}')
+            self.assertEqual((target / 'python-runtime/LICENSE.bdb.txt').read_bytes(), b'original upstream license')
+            self.assertEqual((target / 'python-packages/pyserial-3.5/LICENSE.txt').read_bytes(), b'pyserial')
+            self.assertEqual((target / 'python-packages' / package_notice.relative_to(appdir / 'usr/lib/airpods-hr-linux/python')).read_bytes(), b'wheel license')
+            with tarfile.open(target / 'rust-dependency-sources.tar.gz') as archive:
+                self.assertEqual(archive.extractfile('rust-dependency-sources/LICENSE').read(), b'Rust dependency license')
+                self.assertIn('Cargo.lock', archive.getnames())
+            self.assertTrue((target / 'appimage-runtime-sources/runtime_source.tar.gz').exists())
+            system.assert_called_once_with(appdir, target, [])

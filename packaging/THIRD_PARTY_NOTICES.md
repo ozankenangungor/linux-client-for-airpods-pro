@@ -8,7 +8,12 @@ The build keeps license texts and dependency sources under
 
 - Python 3.14 and its linked libraries: license texts and build metadata from
   the matching python-build-standalone full archive. Python's own license
-  also remains in its standard library.
+  also remains in its standard library. The unused optional `_dbm` extension
+  is excluded from the AppImage, so its Berkeley DB code is not distributed.
+  Upstream `PYTHON.json` and license texts are retained unchanged as build
+  records; they describe the original upstream build, including optional
+  components. `payload-inventory.json` records the actual distributed ELF
+  files and exclusions separately.
 - Python packages: their wheel license files, including vendored notices,
   remain in the installed packages and are copied into the license directory.
   pySerial's omitted wheel notice comes from its matching pinned source archive.

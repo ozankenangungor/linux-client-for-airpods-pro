@@ -117,6 +117,74 @@ def elf_files(root):
                     yield path
 
 
+def exclude_unused_dbm(appdir):
+    directory = appdir / 'usr/lib/airpods-hr-linux/python/lib/python3.14/lib-dynload'
+    extensions = sorted(directory.glob('_dbm*.so'))
+    if len(extensions) != 1 or extensions[0].is_symlink() or not extensions[0].is_file():
+        raise ValueError('expected one optional upstream _dbm extension')
+    extension = extensions[0]
+    excluded = [{'path': str(extension.relative_to(appdir)), 'sha256': sha256(extension),
+                 'reason': 'Unused optional _dbm extension; contains Berkeley DB code'}]
+    extension.unlink()
+    return excluded
+
+
+RUNTIME_IMPORT_SMOKE = """
+import importlib.abc, json, sys
+attempts = []
+class RejectDBM(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == '_dbm' or fullname == 'dbm' or fullname.startswith('dbm.'):
+            attempts.append(fullname)
+            raise ImportError('DBM is excluded from the application payload: ' + fullname)
+def offline(event, args):
+    if event.startswith('socket.') or event in ('subprocess.Popen', 'os.system', 'os.exec'):
+        raise RuntimeError('network/process action during import smoke: ' + event)
+sys.addaudithook(offline)
+sys.meta_path.insert(0, RejectDBM())
+import airpods_hr, airpods_hr._hubd.main, airpods_hr.production_session
+import airpods_hr._airpods_aap_core, airpods_hr.service_installer
+import bumble, bumble.transport, bumble.transport.usb, bumble.keys, dbus_next
+assert not attempts and '_dbm' not in sys.modules
+print(json.dumps({'dbm_import_attempts': attempts, 'loaded_modules': sorted(sys.modules)}))
+"""
+
+
+def runtime_import_smoke(python, cwd):
+    return json.loads(run([python, '-I', '-c', RUNTIME_IMPORT_SMOKE], cwd=cwd,
+                          env={'PATH': '/nonexistent', 'HOME': str(cwd)}, capture=True, timeout=30))
+
+
+def payload_inventory(appdir, excluded):
+    if list(appdir.rglob('_dbm*.so')):
+        raise ValueError('_dbm remains in distributed payload')
+    for path in appdir.rglob('*'):
+        if re.match(r'libdb(?:[-.]|[0-9])', path.name) and '.so' in path.name:
+            raise ValueError('Berkeley DB shared library remains: ' + path.name)
+    libraries = {}
+    for path in elf_files(appdir):
+        # Check actual binary bytes and symbols, not optional upstream metadata.
+        if b'Berkeley DB' in path.read_bytes():
+            raise ValueError('Berkeley DB binary signature remains: ' + path.name)
+        if any(re.match(r'libdb(?:[-.]|[0-9])', name) for name in needed(path)):
+            raise ValueError('Berkeley DB ELF dependency remains: ' + path.name)
+        symbols = run(['readelf', '--symbols', '--wide', path], capture=True, timeout=30)
+        if re.search(r'\b(?:db_create|db_env_create|__db_[A-Za-z0-9_]+)\b', symbols):
+            raise ValueError('Berkeley DB ELF symbols remain: ' + path.name)
+        libraries[str(path.relative_to(appdir))] = sha256(path)
+    return {'schema_version': 1, 'scope': 'actual distributed AppImage payload',
+            'upstream_build_metadata': 'python-runtime/PYTHON.json',
+            'upstream_metadata_is_payload_inventory': False,
+            'excluded_components': excluded, 'berkeley_db_binary_present': False,
+            'elf_sha256': libraries}
+
+
+def review_image_name(commit):
+    if not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise ValueError('full review source commit required')
+    return 'AirPods-HR-review-' + commit + '-x86_64.AppImage'
+
+
 def glibc_requirements(path):
     output = run(['readelf', '--version-info', path], capture=True, timeout=30)
     versions = {tuple(map(int, value.split('.'))) for value in re.findall(r'GLIBC_(\d+(?:\.\d+)+)', output)}
@@ -439,7 +507,8 @@ def build(output):
         run([bundled_python, '-I', '-m', 'pip', 'install', '--require-hashes', '--only-binary=:all:', '-r', ROOT / 'packaging/python-requirements.lock'], env=env)
         run([bundled_python, '-I', '-m', 'pip', 'install', '--no-index', '--no-deps', wheel], env=env)
         run([bundled_python, '-I', '-m', 'pip', 'check'], env=env)
-        run([bundled_python, '-I', '-c', 'import airpods_hr._airpods_aap_core, airpods_hr.service_installer, bumble, dbus_next'], env=env)
+        excluded = exclude_unused_dbm(appdir)
+        import_audit = runtime_import_smoke(bundled_python, work)
         for directory, filename in [('usr/share/applications', 'AirPods-HR.desktop'), ('usr/share/icons/hicolor/scalable/apps', 'AirPods-HR.svg'), ('usr/share/metainfo', 'io.github.ozankenangungor.AirPodsHR.metainfo.xml')]:
             destination = appdir / directory
             destination.mkdir(parents=True, exist_ok=True)
@@ -450,18 +519,22 @@ def build(output):
         run(['appstreamcli', 'validate', '--no-net', appdir / 'usr/share/metainfo/io.github.ozankenangungor.AirPodsHR.metainfo.xml'])
         libraries = bundle_libraries(appdir)
         system_packages = collect_licenses(appdir, work, assets, libraries, env)
+        inventory = payload_inventory(appdir, excluded)
+        inventory['runtime_import_smoke'] = import_audit
+        inventory_path = appdir / 'usr/share/licenses/airpods-hr-linux/payload-inventory.json'
+        inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + '\n')
         versions = json.loads(run([bundled_python, '-I', '-c', 'import importlib.metadata as m,json; print(json.dumps({d.metadata["Name"]:d.version for d in m.distributions()}))'], capture=True, env=env))
         elf_audit = {str(path.relative_to(appdir)): glibc_requirements(path) for path in elf_files(appdir)}
         # Offline import check after relocation, without host Python paths.
         relocated = work / 'relocated payload'
         appdir.rename(relocated)
-        run([relocated / 'usr/lib/airpods-hr-linux/python/bin/python3.14', '-I', '-c', 'import airpods_hr._airpods_aap_core, bumble, dbus_next'], cwd=work, env=env)
+        runtime_import_smoke(relocated / 'usr/lib/airpods-hr-linux/python/bin/python3.14', work)
         relocated.rename(appdir)
         tool = work / 'appimage-tool'
         tool.mkdir()
         assets['appimagetool'].chmod(0o700)
         run([assets['appimagetool'], '--appimage-extract'], cwd=tool, capture=True)
-        image = output / 'AirPods-HR-0.1.0-x86_64.AppImage'
+        image = output / review_image_name(commit)
         run([tool / 'squashfs-root/AppRun', '--runtime-file', assets['runtime'], appdir, image], env={**env, 'ARCH': 'x86_64'}, timeout=600)
         smoke_demo(image, work)
         if run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture=True) != commit or run(['git', 'status', '--porcelain=v1'], cwd=ROOT, capture=True):
@@ -472,6 +545,7 @@ def build(output):
                     'production_wheel_sha256': sha256(wheel), 'appimage_sha256': sha256(image),
                     'tools': {k: v for k, v in lock['assets'].items() if k in ['rust', 'appimagetool', 'runtime']},
                     'bundled_packages': versions, 'system_packages': system_packages, 'elf_glibc_versions': elf_audit,
+                    'payload_inventory': inventory, 'artifact_purpose': 'review-only; not a tagged release',
                     'reproducibility_claimed': False}
         (output / 'distribution-manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
         (output / 'SHA256SUMS').write_text(sha256(image) + '  ' + image.name + '\n')

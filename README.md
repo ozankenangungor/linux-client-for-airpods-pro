@@ -92,11 +92,11 @@ The initial distribution target is x86_64 Linux with glibc 2.34 or newer.
 A reviewed AppImage contains the GUI, Python 3.14, the daemon, and its dependencies.
 It needs no host Python, pip, Rust, Cargo, checkout, or first-run downloads.
 
-For a locally built review artifact:
+For a review artifact, replace `SOURCE_SHA` with its recorded source commit:
 
 ```console
-chmod +x AirPods-HR-0.1.0-x86_64.AppImage
-./AirPods-HR-0.1.0-x86_64.AppImage
+chmod +x AirPods-HR-review-SOURCE_SHA-x86_64.AppImage
+./AirPods-HR-review-SOURCE_SHA-x86_64.AppImage
 ```
 
 Linux must still provide BlueZ, a systemd user session, working FUSE, and
