@@ -2,8 +2,11 @@
 import importlib.util
 import io
 import json
+import re
+import subprocess
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +18,64 @@ spec.loader.exec_module(distribution)
 
 
 class DistributionTests(unittest.TestCase):
+    def test_workflow_trusts_explicit_source_before_build_and_names_its_revision(self):
+        workflow = (ROOT / '.github/workflows/distribution.yml').read_text()
+        triggers = workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertEqual(re.findall(r'^  ([\w_]+):', triggers, re.M), ['workflow_dispatch'])
+        self.assertIn('default: v0.1.0', triggers)
+        self.assertIn('required: true', triggers)
+        permissions = re.findall(r'^\s+([\w-]+):\s+(read|write|none)\s*$', workflow, re.M)
+        self.assertEqual(permissions, [('contents', 'read')])
+        for action in re.findall(r'^\s*- uses:\s*(\S+)', workflow, re.M):
+            self.assertRegex(action, r'^[\w./-]+@[0-9a-f]{40}$')
+        checkout = workflow.split('- uses: actions/checkout@', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('persist-credentials: false', checkout)
+        self.assertIn('fetch-depth: 0', checkout)
+        self.assertIn('ref: ${{ inputs.source_ref }}', checkout)
+        trust = 'git config --global --add safe.directory "$GITHUB_WORKSPACE"'
+        self.assertEqual(workflow.count('safe.directory'), 1)
+        self.assertIn(trust, workflow)
+        self.assertLess(workflow.index('- uses: actions/checkout@'), workflow.index(trust))
+        self.assertLess(workflow.index(trust), workflow.index('git rev-parse HEAD'))
+        self.assertLess(workflow.index('git rev-parse HEAD'), workflow.index('python3 packaging/'))
+        self.assertIn('id: source', workflow)
+        self.assertIn('SOURCE_REF: ${{ inputs.source_ref }}', workflow)
+        self.assertIn('name: airpods-hr-appimage-review-${{ steps.source.outputs.sha }}', workflow)
+        self.assertNotIn('github.sha', workflow)
+
+    def test_source_revision_step_rejects_changed_release_and_treats_ref_as_data(self):
+        workflow = (ROOT / '.github/workflows/distribution.yml').read_text()
+        step = workflow.split('- name: Record source revision\n', 1)[1].split('\n      - ', 1)[0]
+        script = textwrap.dedent(step.split('run: |\n', 1)[1])
+        release = 'bafc22b7e91f204fa6f84b33f2c96f57f828171b'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            git = root / 'git'
+            git.write_text('#!/bin/sh\n[ "$*" = "rev-parse HEAD" ] || exit 2\nprintf "%s\\n" "$TEST_SOURCE_SHA"\n')
+            git.chmod(0o700)
+            for ref, sha, success in [
+                ('v0.1.0', release, True),
+                ('v0.1.0', '0' * 40, False),
+                ('main; touch injected', '1' * 40, True),
+            ]:
+                with self.subTest(ref=ref, sha=sha):
+                    output = root / 'output'
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ['/bin/sh', '-e', '-c', script], cwd=root,
+                        env={'PATH': str(root), 'SOURCE_REF': ref,
+                             'TEST_SOURCE_SHA': sha, 'GITHUB_OUTPUT': str(output)},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode == 0, success, result.stderr)
+                    self.assertIn('Requested source ref: ' + ref, result.stdout)
+                    self.assertIn('Resolved source SHA: ' + sha, result.stdout)
+                    if success:
+                        self.assertEqual(output.read_text(), 'sha=' + sha + '\n')
+                    else:
+                        self.assertFalse(output.exists())
+                    self.assertFalse((root / 'injected').exists())
+
     def test_lock_pins_container_and_tools_and_workflow_does_not_publish(self):
         lock = distribution.load_lock()
         workflow = (ROOT / '.github/workflows/distribution.yml').read_text()

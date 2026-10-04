@@ -2,6 +2,12 @@ name: Desktop distribution review
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source tag, branch, or commit to package
+        required: true
+        default: v0.1.0
+        type: string
 
 permissions:
   contents: read
@@ -20,11 +26,26 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+      - name: Trust checked-out source
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Record source revision
+        id: source
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          printf 'Requested source ref: %s\nResolved source SHA: %s\n' "$SOURCE_REF" "$sha"
+          if [ "$SOURCE_REF" = v0.1.0 ] && [ "$sha" != bafc22b7e91f204fa6f84b33f2c96f57f828171b ]; then
+            echo '::error::v0.1.0 does not match the reviewed release source' >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - name: Build and validate review artifacts
         run: python3 packaging/build-desktop-distribution.py --output dist/desktop
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: airpods-hr-appimage-review-${{ github.sha }}
+          name: airpods-hr-appimage-review-${{ steps.source.outputs.sha }}
           path: dist/desktop/
           if-no-files-found: error
           retention-days: 14
