@@ -9,6 +9,9 @@ pub const HISTORY_SECONDS: u64 = 120;
 pub const HISTORY_CAPACITY: usize = 2048;
 pub const ACTIVITY_CAPACITY: usize = 32;
 pub const FRESH_FOR: Duration = Duration::from_secs(3);
+/// Hardware captures showed startup behavior around the first four samples.
+/// This small presentation window does not classify any BPM value as invalid.
+pub const STARTUP_SAMPLES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Problem {
@@ -104,6 +107,13 @@ pub enum Freshness {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamPhase {
+    Inactive,
+    Starting,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SamplePoint {
     pub at: Duration,
     pub sample: HeartRateSample,
@@ -113,22 +123,29 @@ pub struct SamplePoint {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Statistics {
+    /// All received samples, including startup samples.
     pub count: u64,
+    /// Samples contributing to the displayed average, minimum and maximum.
+    included_count: u64,
     sum: u64,
     pub min: Option<u8>,
     pub max: Option<u8>,
 }
 
 impl Statistics {
-    fn record(&mut self, bpm: u8) {
+    fn record(&mut self, bpm: u8, include: bool) {
         self.count = self.count.saturating_add(1);
+        if !include {
+            return;
+        }
+        self.included_count = self.included_count.saturating_add(1);
         self.sum = self.sum.saturating_add(u64::from(bpm));
         self.min = Some(self.min.map_or(bpm, |value| value.min(bpm)));
         self.max = Some(self.max.map_or(bpm, |value| value.max(bpm)));
     }
 
     pub fn average(self) -> Option<f64> {
-        (self.count > 0).then(|| self.sum as f64 / self.count as f64)
+        (self.included_count > 0).then(|| self.sum as f64 / self.included_count as f64)
     }
 }
 
@@ -150,6 +167,7 @@ pub struct Activity {
 #[derive(Debug)]
 pub struct Model {
     pub connection: Connection,
+    pub stream_phase: StreamPhase,
     pub problem: Option<Problem>,
     pub history: VecDeque<SamplePoint>,
     pub activity: VecDeque<Activity>,
@@ -160,12 +178,14 @@ pub struct Model {
     waiting: bool,
     ever_connected: bool,
     stream_started: bool,
+    segment_samples: usize,
 }
 
 impl Default for Model {
     fn default() -> Self {
         Self {
             connection: Connection::Idle,
+            stream_phase: StreamPhase::Inactive,
             problem: None,
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
             activity: VecDeque::with_capacity(ACTIVITY_CAPACITY),
@@ -176,6 +196,7 @@ impl Default for Model {
             waiting: false,
             ever_connected: false,
             stream_started: false,
+            segment_samples: 0,
         }
     }
 }
@@ -204,6 +225,10 @@ impl Model {
                     .is_some_and(|last| at.saturating_sub(last.at) > FRESH_FOR);
                 if stale_gap && !self.waiting {
                     self.segment += 1;
+                    self.start_segment();
+                }
+                if self.waiting {
+                    self.start_segment();
                 }
                 if self.connection != Connection::Streaming || self.waiting || stale_gap {
                     let text = if self.stream_started {
@@ -222,7 +247,14 @@ impl Model {
                     segment: self.segment,
                 };
                 self.latest = Some(point);
-                self.stats.record(sample.bpm);
+                let include = self.segment_samples >= STARTUP_SAMPLES;
+                self.segment_samples = (self.segment_samples + 1).min(STARTUP_SAMPLES);
+                self.stream_phase = if include {
+                    StreamPhase::Live
+                } else {
+                    StreamPhase::Starting
+                };
+                self.stats.record(sample.bpm, include);
                 self.history.push_back(point);
             }
             AppEvent::Reconnecting { attempt, delay } => {
@@ -302,6 +334,7 @@ impl Model {
     }
 
     fn connected(&mut self, at: Duration, text: String) {
+        self.start_segment();
         self.connection = Connection::Connected;
         self.connection_since = Some(at);
         self.problem = None;
@@ -311,8 +344,14 @@ impl Model {
 
     fn gap(&mut self) {
         self.segment += 1;
+        self.stream_phase = StreamPhase::Inactive;
         self.connection_since = None;
         self.waiting = true;
+    }
+
+    fn start_segment(&mut self) {
+        self.segment_samples = 0;
+        self.stream_phase = StreamPhase::Starting;
     }
 
     fn log(&mut self, at: Duration, kind: ActivityKind, text: impl Into<String>) {
@@ -333,6 +372,7 @@ impl Model {
         {
             self.waiting = true;
             self.segment += 1;
+            self.stream_phase = StreamPhase::Inactive;
             self.log(now, ActivityKind::Info, "Waiting for a new sample");
         }
         self.trim(now);
@@ -427,14 +467,210 @@ mod tests {
                 .all(|point| point.sample.source_side == SourceSide::Unknown(37))
         );
         assert_eq!(model.stats.count, 5);
+        assert_eq!(model.stats.average(), Some(255.0));
+        assert_eq!(model.stats.min, Some(255));
+        assert_eq!(model.stats.max, Some(255));
+    }
+
+    #[test]
+    fn first_stream_counts_and_retains_startup_samples_before_live_statistics() {
+        let mut model = Model::default();
+        assert_eq!(model.stream_phase, StreamPhase::Inactive);
+        send(&mut model, 0, AppEvent::Connecting);
+        send(&mut model, 0, AppEvent::Connected);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        for (index, bpm) in [169, 88, 0, 255].into_iter().enumerate() {
+            send(&mut model, 1, sample(bpm));
+            assert_eq!(model.stream_phase, StreamPhase::Starting);
+            assert_eq!(model.latest.unwrap().sample.bpm, bpm);
+            assert_eq!(model.stats.count, (index + 1) as u64);
+            assert_eq!(model.stats.average(), None);
+            assert_eq!(model.stats.min, None);
+            assert_eq!(model.stats.max, None);
+        }
+        assert_eq!(
+            model
+                .history
+                .iter()
+                .map(|point| point.sample.bpm)
+                .collect::<Vec<_>>(),
+            [169, 88, 0, 255]
+        );
+        send(&mut model, 2, sample(72));
+        assert_eq!(model.stream_phase, StreamPhase::Live);
+        assert_eq!(model.stats.count, 5);
+        assert_eq!(model.stats.average(), Some(72.0));
+        assert_eq!(model.stats.min, Some(72));
+        assert_eq!(model.stats.max, Some(72));
+    }
+
+    #[test]
+    fn live_statistics_accept_169_high_values_zero_and_255_exactly() {
+        let mut model = Model::default();
+        for _ in 0..STARTUP_SAMPLES {
+            send(&mut model, 0, sample(80));
+        }
+        for bpm in [169, 88, 88, 0, 255] {
+            send(&mut model, 1, sample(bpm));
+            assert_eq!(model.latest.unwrap().sample.bpm, bpm);
+            assert_eq!(model.stream_phase, StreamPhase::Live);
+        }
+        assert_eq!(model.stats.count, 9);
         assert_eq!(model.stats.average(), Some(120.0));
         assert_eq!(model.stats.min, Some(0));
         assert_eq!(model.stats.max, Some(255));
+        assert_eq!(
+            model
+                .history
+                .iter()
+                .skip(STARTUP_SAMPLES)
+                .map(|point| point.sample.bpm)
+                .collect::<Vec<_>>(),
+            [169, 88, 88, 0, 255]
+        );
+    }
+
+    #[test]
+    fn startup_depends_on_receipt_count_not_bpm_or_elapsed_time() {
+        let mut model = Model::default();
+        for index in 0..STARTUP_SAMPLES {
+            send(&mut model, index as u64 * 2, sample(72));
+            assert_eq!(model.stream_phase, StreamPhase::Starting);
+        }
+        send(&mut model, 8, sample(169));
+        assert_eq!(model.stream_phase, StreamPhase::Live);
+        assert_eq!(model.stats.average(), Some(169.0));
+        // Without a render tick, a receipt gap still starts a fresh segment.
+        send(&mut model, 12, sample(255));
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        assert_eq!(model.stats.average(), Some(169.0));
+        assert_eq!(model.stats.count, 6);
+        model.tick(Duration::from_secs(16));
+        send(&mut model, 17, sample(0));
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        assert_eq!(model.stats.average(), Some(169.0));
+        assert_eq!(model.stats.count, 7);
+        assert_eq!(model.latest.unwrap().sample.bpm, 0);
+    }
+
+    #[test]
+    fn stale_gap_excludes_exactly_four_samples_with_or_without_render_ticks() {
+        for render_ticks in [false, true] {
+            let mut model = Model::default();
+            for _ in 0..=STARTUP_SAMPLES {
+                send(&mut model, 0, sample(88));
+            }
+            // A receipt exactly at the freshness boundary stays in the live segment.
+            model.tick(FRESH_FOR);
+            send(&mut model, 3, sample(169));
+            assert_eq!(model.stream_phase, StreamPhase::Live);
+            assert_eq!(model.stats.average(), Some(128.5));
+            let segment = model.history.back().unwrap().segment;
+            let before = model.stats;
+            for (index, bpm) in [0, 255, 169, 88, 100].into_iter().enumerate() {
+                let at = Duration::from_millis(6001 + index as u64 * 100);
+                if render_ticks {
+                    model.tick(at);
+                }
+                model.apply(TimedEvent {
+                    at,
+                    event: sample(bpm),
+                });
+                assert_eq!(model.stats.count, before.count + index as u64 + 1);
+                assert_eq!(model.latest.unwrap().sample.bpm, bpm);
+                assert_eq!(model.latest.unwrap().segment, segment + 1);
+                if index < STARTUP_SAMPLES {
+                    assert_eq!(model.stream_phase, StreamPhase::Starting);
+                    assert_eq!(model.stats.average(), before.average());
+                    assert_eq!(model.stats.min, before.min);
+                    assert_eq!(model.stats.max, before.max);
+                } else {
+                    assert_eq!(model.stream_phase, StreamPhase::Live);
+                    assert_eq!(model.stats.average(), Some(119.0));
+                    assert_eq!(model.stats.min, Some(88));
+                    assert_eq!(model.stats.max, Some(169));
+                }
+            }
+            assert_eq!(
+                model
+                    .history
+                    .iter()
+                    .map(|point| point.sample.bpm)
+                    .collect::<Vec<_>>(),
+                [88, 88, 88, 88, 88, 169, 0, 255, 169, 88, 100]
+            );
+        }
+    }
+
+    #[test]
+    fn long_reconnect_and_terminal_retry_have_one_startup_window() {
+        for terminal_retry in [false, true] {
+            let mut model = Model::default();
+            for _ in 0..=STARTUP_SAMPLES {
+                send(&mut model, 0, sample(88));
+            }
+            let segment = model.history.back().unwrap().segment;
+            let before = model.stats;
+            if terminal_retry {
+                send(&mut model, 1, AppEvent::Failed(Problem::Protocol));
+                model.tick(Duration::from_secs(19));
+                send(&mut model, 20, AppEvent::Connecting);
+                // A new retry episode's first sample confirms its connection.
+                assert_eq!(model.stream_phase, StreamPhase::Inactive);
+            } else {
+                send(&mut model, 1, AppEvent::Disconnected);
+                for attempt in 1..=3 {
+                    send(
+                        &mut model,
+                        attempt as u64 * 5,
+                        AppEvent::Reconnecting {
+                            attempt,
+                            delay: Duration::from_secs(5),
+                        },
+                    );
+                    model.tick(Duration::from_secs(attempt as u64 * 5 + 1));
+                    assert_eq!(model.stream_phase, StreamPhase::Inactive);
+                    assert_eq!(model.stats, before);
+                }
+                send(&mut model, 20, AppEvent::Reconnected { attempts: 3 });
+                assert_eq!(model.stream_phase, StreamPhase::Starting);
+                assert_eq!(model.freshness(Duration::from_secs(20)), Freshness::Waiting);
+            }
+            for (index, bpm) in [169, 0, 255, 88, 100].into_iter().enumerate() {
+                model.tick(Duration::from_secs(21 + index as u64));
+                send(&mut model, 21 + index as u64, sample(bpm));
+                assert_eq!(model.stats.count, before.count + index as u64 + 1);
+                assert_eq!(model.latest.unwrap().sample.bpm, bpm);
+                assert_eq!(model.latest.unwrap().segment, segment + 1);
+                if index < STARTUP_SAMPLES {
+                    assert_eq!(model.stream_phase, StreamPhase::Starting);
+                    assert_eq!(model.stats.average(), Some(88.0));
+                    assert_eq!(model.stats.min, Some(88));
+                    assert_eq!(model.stats.max, Some(88));
+                } else {
+                    assert_eq!(model.stream_phase, StreamPhase::Live);
+                    assert_eq!(model.stats.average(), Some(94.0));
+                    assert_eq!(model.stats.min, Some(88));
+                    assert_eq!(model.stats.max, Some(100));
+                }
+            }
+            assert_eq!(
+                model
+                    .history
+                    .iter()
+                    .map(|point| point.sample.bpm)
+                    .collect::<Vec<_>>(),
+                [88, 88, 88, 88, 88, 169, 0, 255, 88, 100]
+            );
+        }
     }
 
     #[test]
     fn reconnect_keeps_session_statistics_and_breaks_the_chart() {
         let mut model = Model::default();
+        for _ in 0..STARTUP_SAMPLES {
+            send(&mut model, 0, sample(90));
+        }
         send(&mut model, 1, sample(90));
         send(
             &mut model,
@@ -451,8 +687,15 @@ mod tests {
         assert_eq!(model.uptime(Duration::from_secs(2)), None);
         send(&mut model, 3, AppEvent::Reconnected { attempts: 1 });
         assert_eq!(model.freshness(Duration::from_secs(3)), Freshness::Waiting);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        for _ in 0..STARTUP_SAMPLES {
+            send(&mut model, 3, sample(169));
+            assert_eq!(model.stream_phase, StreamPhase::Starting);
+            assert_eq!(model.stats.average(), Some(90.0));
+        }
         send(&mut model, 3, sample(100));
-        assert_ne!(model.history[0].segment, model.history[1].segment);
+        assert_eq!(model.stream_phase, StreamPhase::Live);
+        assert_ne!(model.history[0].segment, model.history[5].segment);
         assert_eq!(model.stats.average(), Some(95.0));
         assert_eq!(
             model.uptime(Duration::from_secs(5)),
@@ -476,7 +719,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(model.stats.count, 2);
+        assert_eq!(model.stats.count, 10);
     }
 
     #[test]

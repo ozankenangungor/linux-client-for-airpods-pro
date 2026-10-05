@@ -2,8 +2,8 @@ use crate::bootstrap::Stage;
 use crate::chart;
 use crate::demo::LOOP_DURATION;
 use crate::model::{
-    ActivityKind, AppEvent, Connection, Freshness, Model, Problem, TimedEvent, clock_time,
-    side_label,
+    ActivityKind, AppEvent, Connection, Freshness, Model, Problem, StreamPhase, TimedEvent,
+    clock_time, side_label,
 };
 use crate::source::DataSource;
 use crate::theme::{
@@ -64,10 +64,14 @@ impl DesktopApp {
             Connection::Preparing(_) => ("Preparing daemon", SECONDARY),
             Connection::Idle => ("Idle", MUTED),
             Connection::Connecting => ("Connecting", SECONDARY),
-            Connection::Connected => ("Ready", TEAL),
+            Connection::Connected => ("Starting…", AMBER),
             Connection::Streaming => {
                 if self.model.freshness(now) == Freshness::Fresh {
-                    ("Streaming", TEAL)
+                    if self.model.stream_phase == StreamPhase::Starting {
+                        ("Starting…", AMBER)
+                    } else {
+                        ("Streaming", TEAL)
+                    }
                 } else {
                     ("Waiting for sample", AMBER)
                 }
@@ -87,7 +91,7 @@ impl DesktopApp {
         ui.add_space(PAD);
         self.notice(ui, now);
         let below_chart =
-            theme::STAT_HEIGHT + theme::DETAIL_HEIGHT + theme::FOOTER_HEIGHT + 3.0 * GAP;
+            theme::STAT_HEIGHT + theme::DETAIL_HEIGHT + theme::FOOTER_HEIGHT + 3.0 * GAP + 24.0;
         let used_height = ui.cursor().top() - start_y;
         let top_height = (viewport_height - used_height - below_chart)
             .clamp(theme::MIN_HERO_HEIGHT, theme::HERO_HEIGHT);
@@ -100,6 +104,15 @@ impl DesktopApp {
         ui.add_space(GAP);
         let stats = allocate(ui, theme::STAT_HEIGHT);
         self.statistics(ui.painter(), stats);
+        let note = allocate(ui, 24.0);
+        theme::text(
+            ui.painter(),
+            note.left_center(),
+            Align2::LEFT_CENTER,
+            "Session statistics exclude initial startup samples.",
+            theme::CAPTION,
+            MUTED,
+        );
         ui.add_space(GAP);
         let bottom = allocate(ui, theme::DETAIL_HEIGHT);
         let session = Rect::from_min_size(bottom.min, egui::vec2(hero_width, bottom.height()));
@@ -256,6 +269,9 @@ impl DesktopApp {
             SECONDARY,
         );
         let detail = match freshness {
+            Freshness::Fresh if self.model.stream_phase == StreamPhase::Starting => {
+                "Startup sample"
+            }
             Freshness::Fresh => "Live reading",
             Freshness::Waiting => "Waiting for next reading",
             Freshness::Unavailable => self.status(now).0,
@@ -741,6 +757,88 @@ fn allocate(ui: &mut egui::Ui, height: f32) -> Rect {
 mod tests {
     use super::*;
     use crate::source::RealSource;
+
+    #[test]
+    fn startup_ui_shows_exact_bpm_and_explains_statistics() {
+        let mut app = DesktopApp {
+            model: Model::default(),
+            source: DataSource::Demo(crate::demo::DemoSource::default()),
+            started: Instant::now(),
+            now: Duration::ZERO,
+            chart_window: 60,
+            retry_pending: false,
+        };
+        app.model.apply(TimedEvent {
+            at: Duration::ZERO,
+            event: AppEvent::Sample(airpods_client::HeartRateSample {
+                bpm: 169,
+                source_side: airpods_client::SourceSide::Right,
+            }),
+        });
+        assert_eq!(app.status(Duration::ZERO).0, "Starting…");
+        for size in [egui::vec2(1280.0, 820.0), egui::vec2(760.0, 640.0)] {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui, Duration::ZERO),
+            );
+            // This text-rendering test has no GPU to consume the font atlas.
+            output.textures_delta.clear();
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.job.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for label in [
+                "169",
+                "Startup sample",
+                "Starting…",
+                "Samples received",
+                "Session statistics exclude initial startup samples.",
+            ] {
+                assert!(
+                    text.contains(&label),
+                    "missing UI text at {size:?}: {label}"
+                );
+            }
+            let note = output
+                .shapes
+                .iter()
+                .find(|shape| {
+                    matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                        if text.galley.job.text == "Session statistics exclude initial startup samples.")
+                })
+                .unwrap();
+            let bounds = note.shape.visual_bounding_rect();
+            assert!(screen.contains_rect(bounds), "note is outside {size:?}");
+            assert!(
+                note.clip_rect.contains_rect(bounds),
+                "note is clipped at {size:?}"
+            );
+        }
+        for _ in 0..crate::model::STARTUP_SAMPLES {
+            app.model.apply(TimedEvent {
+                at: Duration::ZERO,
+                event: AppEvent::Sample(airpods_client::HeartRateSample {
+                    bpm: 169,
+                    source_side: airpods_client::SourceSide::Right,
+                }),
+            });
+        }
+        assert_eq!(app.status(Duration::ZERO).0, "Streaming");
+        assert_eq!(app.model.stats.average(), Some(169.0));
+    }
 
     #[test]
     fn receipt_animation_is_bounded_and_idle_repaints_stay_slow() {

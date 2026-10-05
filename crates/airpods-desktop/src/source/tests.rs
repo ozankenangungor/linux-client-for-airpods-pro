@@ -135,7 +135,9 @@ async fn real_reconnect_resubscribes_once_and_reuses_the_session_model() {
             let mut reader = BufReader::new(read);
             assert!(request(&mut reader).await.contains("subscribe"));
             write.write_all(SUBSCRIBED.as_bytes()).await.unwrap();
-            write.write_all(format!("{{\"protocol_version\":1,\"event\":\"heart_rate\",\"bpm\":{bpm},\"source_side\":\"{side}\"}}\n").as_bytes()).await.unwrap();
+            for value in [169, 88, 0, 255, bpm] {
+                write.write_all(format!("{{\"protocol_version\":1,\"event\":\"heart_rate\",\"bpm\":{value},\"source_side\":\"{side}\"}}\n").as_bytes()).await.unwrap();
+            }
             if bpm == 100 {
                 assert!(request(&mut reader).await.contains("unsubscribe"));
                 write.write_all(UNSUBSCRIBED.as_bytes()).await.unwrap();
@@ -160,9 +162,9 @@ async fn real_reconnect_resubscribes_once_and_reuses_the_session_model() {
     let mut model = Model::default();
     let mut allow_disconnect = Some(allow_disconnect);
     tokio::time::timeout(Duration::from_secs(3), async {
-        while model.stats.count < 2 {
+        while model.stats.count < 10 {
             model.apply(events.recv().await.unwrap());
-            if model.stats.count == 1
+            if model.stats.count == 5
                 && let Some(allow) = allow_disconnect.take()
             {
                 allow.send(()).unwrap();
@@ -172,9 +174,18 @@ async fn real_reconnect_resubscribes_once_and_reuses_the_session_model() {
     .await
     .unwrap();
     assert_eq!(model.stats.average(), Some(95.0));
-    assert_ne!(model.history[0].segment, model.history[1].segment);
+    assert_eq!(model.stream_phase, crate::model::StreamPhase::Live);
+    assert_eq!(
+        model
+            .history
+            .iter()
+            .map(|point| point.sample.bpm)
+            .collect::<Vec<_>>(),
+        [169, 88, 0, 255, 90, 169, 88, 0, 255, 100]
+    );
+    assert_ne!(model.history[0].segment, model.history[5].segment);
     assert_eq!(model.history[0].sample.source_side, SourceSide::Left);
-    assert_eq!(model.history[1].sample.source_side, SourceSide::Right);
+    assert_eq!(model.history[5].sample.source_side, SourceSide::Right);
     assert!(
         model
             .activity

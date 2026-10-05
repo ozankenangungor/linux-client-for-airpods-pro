@@ -113,7 +113,7 @@ fn waveform(time_ms: u64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Connection, Freshness, Model};
+    use crate::model::{Connection, Freshness, Model, STARTUP_SAMPLES, StreamPhase};
 
     fn advance(demo: &mut DemoSource, model: &mut Model, millis: u64) {
         let elapsed = Duration::from_millis(millis);
@@ -149,6 +149,35 @@ mod tests {
         all.extend(fine.poll(Duration::from_millis(17_900)));
         let coarse = DemoSource::default().poll(Duration::from_millis(17_900));
         assert_eq!(all, coarse);
+    }
+
+    #[test]
+    fn demo_exercises_startup_again_after_recovery_without_changing_samples() {
+        let mut demo = DemoSource::default();
+        let mut model = Model::default();
+        advance(&mut demo, &mut model, 250);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        advance(&mut demo, &mut model, 2300);
+        assert_eq!(model.stats.count, STARTUP_SAMPLES as u64);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        assert_eq!(model.stats.average(), None);
+        advance(&mut demo, &mut model, 3000);
+        assert_eq!(model.stream_phase, StreamPhase::Live);
+        assert!(model.stats.average().is_some());
+        advance(&mut demo, &mut model, 8000);
+        let before = model.stats;
+        advance(&mut demo, &mut model, 11_000);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        advance(&mut demo, &mut model, 13_400);
+        assert_eq!(model.stream_phase, StreamPhase::Starting);
+        assert_eq!(model.stats.count, before.count + STARTUP_SAMPLES as u64);
+        assert_eq!(model.stats.average(), before.average());
+        advance(&mut demo, &mut model, 14_000);
+        assert_eq!(model.stream_phase, StreamPhase::Live);
+        assert_eq!(model.history.len() as u64, model.stats.count);
+        for point in &model.history {
+            assert_eq!(point.sample.bpm, waveform(point.at.as_millis() as u64));
+        }
     }
 
     #[test]
