@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "airpods-hr-linux"
-version = "0.1.0"
+version = "0.1.1"
 description = "Experimental AirPods Pro 3 heart-rate access for Linux"
 readme = "README.md"
 requires-python = ">=3.14"

@@ -50,7 +50,7 @@ handles IPC disconnects separately. Neither changes the incoming BPM values.
 
 ## Installation
 
-Version 0.1.0 has not been published to PyPI or crates.io yet.
+Version 0.1.1 is being prepared. Packages have not been published to PyPI or crates.io.
 You can build the project from source or run the local test suite.
 
 ### From source

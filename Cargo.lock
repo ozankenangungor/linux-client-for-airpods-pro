@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "airpods-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "airpods-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "airpods-app-core",
  "airpods-client",

@@ -41,9 +41,9 @@ class VersionPolicyTests(unittest.TestCase):
         self.assertEqual(
             validate_release.project_versions(),
             {
-                "airpods-hr-linux": "0.1.0",
-                "python:airpods-client": "0.1.0",
-                "rust:airpods-client": "0.1.0",
+                "airpods-hr-linux": "0.1.1",
+                "python:airpods-client": "0.1.1",
+                "rust:airpods-client": "0.1.1",
             },
         )
         validate_release.validate_version_consistency()
@@ -222,7 +222,7 @@ class VersionPolicyTests(unittest.TestCase):
             release_job[:checkout],
         )
         self.assertIn(
-            "name: airpods-hr-linux-0.1.0-${{ github.sha }}",
+            "name: airpods-hr-linux-0.1.1-${{ github.sha }}",
             release_job[upload:],
         )
         self.assertIn("path: ${{ runner.temp }}/release", release_job[upload:])
@@ -324,7 +324,7 @@ class ManifestSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = {
             "schema_version": 1,
-            "release_version": "0.1.0",
+            "release_version": "0.1.1",
             "git": {"commit": "a" * 40, "clean": True},
             "source_date_epoch": 1,
             "toolchain": {
@@ -341,7 +341,7 @@ class ManifestSchemaTests(unittest.TestCase):
                 {
                     "kind": kind,
                     "package": package,
-                    "version": "0.1.0",
+                    "version": "0.1.1",
                     "filename": filename,
                     "sha256": character * 64,
                     "size": index + 1,
@@ -435,8 +435,8 @@ class SdistPolicyTests(unittest.TestCase):
 
     def test_python_sdists_reject_repository_tests(self) -> None:
         cases = (
-            ("airpods-hr-linux", "airpods_hr_linux-0.1.0", "airpods_hr"),
-            ("airpods-client", "airpods_client-0.1.0", "airpods_client"),
+            ("airpods-hr-linux", "airpods_hr_linux-0.1.1", "airpods_hr"),
+            ("airpods-client", "airpods_client-0.1.1", "airpods_client"),
         )
         with tempfile.TemporaryDirectory() as directory:
             for package, root, import_name in cases:
@@ -458,12 +458,12 @@ class SdistPolicyTests(unittest.TestCase):
 
     def test_production_sdist_requires_rust_build_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "airpods_hr_linux-0.1.0.tar.gz"
+            path = Path(directory) / "airpods_hr_linux-0.1.1.tar.gz"
             self.write_sdist(
                 path,
                 (
-                    "airpods_hr_linux-0.1.0/LICENSE",
-                    "airpods_hr_linux-0.1.0/src/airpods_hr/__init__.py",
+                    "airpods_hr_linux-0.1.1/LICENSE",
+                    "airpods_hr_linux-0.1.1/src/airpods_hr/__init__.py",
                 ),
             )
             with self.assertRaisesRegex(
@@ -472,7 +472,7 @@ class SdistPolicyTests(unittest.TestCase):
                 validate_release.audit_sdist(path, package="airpods-hr-linux")
 
     def test_production_sdist_requires_lifecycle_policy_source(self) -> None:
-        root = "airpods_hr_linux-0.1.0"
+        root = "airpods_hr_linux-0.1.1"
         sources = (
             "LICENSE",
             "src/airpods_hr/__init__.py",
@@ -567,8 +567,8 @@ class PythonBuildPolicyTests(unittest.TestCase):
 
 
 class WheelTagPolicyTests(unittest.TestCase):
-    production_name = "airpods_hr_linux-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl"
-    production_info = "airpods_hr_linux-0.1.0.dist-info"
+    production_name = "airpods_hr_linux-0.1.1-cp314-cp314-manylinux_2_34_x86_64.whl"
+    production_info = "airpods_hr_linux-0.1.1.dist-info"
     production_headers = "Wheel-Version: 1.0\nTag: cp314-cp314-manylinux_2_34_x86_64\n"
 
     @classmethod
@@ -576,11 +576,11 @@ class WheelTagPolicyTests(unittest.TestCase):
         cls, path: Path, *, production: bool = True,
         headers: str | None = None, wheel_names: tuple[str, ...] | None = None,
     ) -> None:
-        info = cls.production_info if production else "airpods_client-0.1.0.dist-info"
+        info = cls.production_info if production else "airpods_client-0.1.1.dist-info"
         package = "airpods-hr-linux" if production else "airpods-client"
         members = {
             f"{info}/METADATA": (
-                f"Name: {package}\nVersion: 0.1.0\nLicense-Expression: MIT\n"
+                f"Name: {package}\nVersion: 0.1.1\nLicense-Expression: MIT\n"
                 + ("Requires-Dist: bumble==0.0.234\nRequires-Dist: dbus-next>=0.2.3\n"
                    if production else "")
             ),
@@ -617,7 +617,7 @@ class WheelTagPolicyTests(unittest.TestCase):
 
     def test_generic_linux_production_wheel_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "airpods_hr_linux-0.1.0-cp314-cp314-linux_x86_64.whl"
+            path = Path(directory) / "airpods_hr_linux-0.1.1-cp314-cp314-linux_x86_64.whl"
             self.write_wheel(path, headers="Tag: cp314-cp314-linux_x86_64\n")
             with self.assertRaisesRegex(validate_release.ValidationError, "filename must be"):
                 validate_release.audit_production_wheel(path)
@@ -631,7 +631,7 @@ class WheelTagPolicyTests(unittest.TestCase):
                 "cp314-cp314-manylinux_2_34_aarch64",
             ):
                 with self.subTest(tag=tag):
-                    path = Path(directory) / f"airpods_hr_linux-0.1.0-{tag}.whl"
+                    path = Path(directory) / f"airpods_hr_linux-0.1.1-{tag}.whl"
                     self.write_wheel(path, headers=f"Tag: {tag}\n")
                     with self.assertRaisesRegex(validate_release.ValidationError, "filename must be"):
                         validate_release.audit_production_wheel(path)
@@ -665,7 +665,7 @@ class WheelTagPolicyTests(unittest.TestCase):
 
     def test_python_client_py3_none_any_remains_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "airpods_client-0.1.0-py3-none-any.whl"
+            path = Path(directory) / "airpods_client-0.1.1-py3-none-any.whl"
             self.write_wheel(path, production=False)
             validate_release.audit_python_client_wheel(path)
 

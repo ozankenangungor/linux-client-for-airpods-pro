@@ -55,7 +55,7 @@ def sha256(path):
 
 def load_lock(path=LOCK):
     lock = json.loads(path.read_text())
-    if lock['version'] != '0.1.0' or lock['architecture'] != 'x86_64' or lock['glibc_floor'] != '2.34':
+    if lock['version'] != '0.1.1' or lock['architecture'] != 'x86_64' or lock['glibc_floor'] != '2.34':
         raise ValueError('unsupported distribution identity')
     if not re.fullmatch(r'docker.io/library/almalinux@sha256:[0-9a-f]{64}', lock['container']):
         raise ValueError('container digest required')
@@ -491,7 +491,7 @@ def build(output):
         # Preserve the canonical five-artifact release authority unchanged.
         release = work / 'canonical-release'
         run([python, ROOT / 'tools/validate_release.py', '--scope', 'artifacts', '--output-dir', release], cwd=ROOT, env=env, timeout=3600)
-        wheel = next(release.glob('airpods_hr_linux-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl'))
+        wheel = next(release.glob(f"airpods_hr_linux-{lock['version']}-cp314-cp314-manylinux_2_34_x86_64.whl"))
         run(['cargo', 'build', '--release', '--locked', '-p', 'airpods-desktop', '--bins'], cwd=ROOT, env=env)
         appdir = work / 'AirPods-HR.AppDir'
         appdir.mkdir()
@@ -500,7 +500,7 @@ def build(output):
         desktop = Path(env['CARGO_TARGET_DIR']) / 'release/airpods-desktop'
         shutil.copy2(desktop, run_dir / 'airpods-desktop')
         shutil.copy2(desktop.with_name('airpods-apprun'), appdir / 'AppRun')
-        (appdir / 'airpods-distribution').write_text('airpods-hr-linux AppImage v1\n0.1.0\n')
+        (appdir / 'airpods-distribution').write_text(f"airpods-hr-linux AppImage v1\n{lock['version']}\n")
         payload = appdir / 'usr/lib/airpods-hr-linux'
         extract(assets['python'], payload)
         bundled_python = payload / 'python/bin/python3.14'

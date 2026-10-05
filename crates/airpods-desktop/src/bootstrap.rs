@@ -26,7 +26,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ENV_MARKER: &str = "airpods-desktop daemon environment v1\n";
 const VERSION_CHECK: &str =
     "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')";
-const ENV_CHECK: &str = "import sys, pathlib, importlib.metadata; assert sys.version_info[:2] == (3, 14); assert pathlib.Path(sys.prefix) == pathlib.Path(sys.argv[1]); import airpods_hr._airpods_aap_core, airpods_hr.service_installer, bumble, dbus_next; assert importlib.metadata.version('airpods-hr-linux') == '0.1.0'";
+const ENV_CHECK: &str = concat!(
+    "import sys, pathlib, importlib.metadata; assert sys.version_info[:2] == (3, 14); assert pathlib.Path(sys.prefix) == pathlib.Path(sys.argv[1]); import airpods_hr._airpods_aap_core, airpods_hr.service_installer, bumble, dbus_next; assert importlib.metadata.version('airpods-hr-linux') == '",
+    env!("CARGO_PKG_VERSION"),
+    "'"
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {

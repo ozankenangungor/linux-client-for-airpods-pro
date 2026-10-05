@@ -19,7 +19,7 @@ from airpods_hr.protocol import HeartRateCommand as Command
 from dbus_next.errors import DBusError
 
 distribution = metadata.distribution("airpods-hr-linux")
-assert distribution.version == "0.1.0"
+assert distribution.version == "0.1.1"
 assert "PYTHONPATH" not in os.environ
 assert "hub" not in " ".join(airpods_hr.__all__).lower()
 installed = Path(distribution.locate_file("")).resolve()

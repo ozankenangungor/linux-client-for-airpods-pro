@@ -73,7 +73,7 @@ class PythonV01ApiContractTests(unittest.IsolatedAsyncioTestCase):
             (PYTHON_CLIENT_ROOT / "pyproject.toml").read_text()
         )["project"]
         self.assertEqual(metadata["name"], "airpods-client")
-        self.assertEqual(metadata["version"], "0.1.0")
+        self.assertEqual(metadata["version"], "0.1.1")
         self.assertEqual(metadata["dependencies"], [])
         self.assertFalse((ROOT / "src/airpods_client").exists())
         self.assertTrue((_CLIENT_SRC / "airpods_client/client.py").is_file())

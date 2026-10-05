@@ -235,7 +235,7 @@ fn static_version_mismatch() {
 fn static_version_documents() {
     for section in ["project", "package"] {
         static_policy::version_document(
-            &format!("[{section}]\nname='fixture'\nversion='0.1.0'\n"),
+            &format!("[{section}]\nname='fixture'\nversion='0.1.1'\n"),
             section,
         )
         .unwrap();
@@ -582,18 +582,18 @@ fn python_client_build_settings_unchanged() {
     }
 }
 
-const PRODUCTION_WHEEL_NAME: &str = "airpods_hr_linux-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl";
-const PRODUCTION_WHEEL_INFO: &str = "airpods_hr_linux-0.1.0.dist-info/WHEEL";
+const PRODUCTION_WHEEL_NAME: &str = "airpods_hr_linux-0.1.1-cp314-cp314-manylinux_2_34_x86_64.whl";
+const PRODUCTION_WHEEL_INFO: &str = "airpods_hr_linux-0.1.1.dist-info/WHEEL";
 const PRODUCTION_WHEEL_HEADERS: &[u8] =
     b"Wheel-Version: 1.0\nTag: cp314-cp314-manylinux_2_34_x86_64\n";
 
 fn write_release_wheel(path: &Path, production: bool, wheels: &[(&str, &[u8])]) {
     let (info, package) = if production {
-        ("airpods_hr_linux-0.1.0.dist-info", "airpods-hr-linux")
+        ("airpods_hr_linux-0.1.1.dist-info", "airpods-hr-linux")
     } else {
-        ("airpods_client-0.1.0.dist-info", "airpods-client")
+        ("airpods_client-0.1.1.dist-info", "airpods-client")
     };
-    let mut metadata = format!("Name: {package}\nVersion: 0.1.0\nLicense-Expression: MIT\n");
+    let mut metadata = format!("Name: {package}\nVersion: 0.1.1\nLicense-Expression: MIT\n");
     if production {
         metadata.push_str("Requires-Dist: bumble==0.0.234\nRequires-Dist: dbus-next>=0.2.3\n");
     }
@@ -644,7 +644,7 @@ fn generic_linux_production_wheel_rejected() {
     let t = tempfile::tempdir().unwrap();
     let path = t
         .path()
-        .join("airpods_hr_linux-0.1.0-cp314-cp314-linux_x86_64.whl");
+        .join("airpods_hr_linux-0.1.1-cp314-cp314-linux_x86_64.whl");
     write_release_wheel(
         &path,
         true,
@@ -666,7 +666,7 @@ fn other_production_filename_tags_rejected() {
         "cp314-cp314-manylinux_2_28_x86_64",
         "cp314-cp314-manylinux_2_34_aarch64",
     ] {
-        let path = t.path().join(format!("airpods_hr_linux-0.1.0-{tag}.whl"));
+        let path = t.path().join(format!("airpods_hr_linux-0.1.1-{tag}.whl"));
         let headers = format!("Tag: {tag}\n");
         write_release_wheel(&path, true, &[(PRODUCTION_WHEEL_INFO, headers.as_bytes())]);
         assert!(
@@ -716,12 +716,12 @@ fn production_wheel_metadata_must_be_unique_and_match_distribution() {
 #[test]
 fn python_client_py3_none_any_remains_accepted() {
     let t = tempfile::tempdir().unwrap();
-    let path = t.path().join("airpods_client-0.1.0-py3-none-any.whl");
+    let path = t.path().join("airpods_client-0.1.1-py3-none-any.whl");
     write_release_wheel(
         &path,
         false,
         &[(
-            "airpods_client-0.1.0.dist-info/WHEEL",
+            "airpods_client-0.1.1.dist-info/WHEEL",
             b"Wheel-Version: 1.0\nTag: py3-none-any\n",
         )],
     );
@@ -836,18 +836,18 @@ fn rust_crate_manifest_document_audit() {
     write_tar(
         &path,
         &[
-            ("airpods-client-0.1.0/LICENSE", b"fixture license"),
+            ("airpods-client-0.1.1/LICENSE", b"fixture license"),
             (
-                "airpods-client-0.1.0/tests/client.rs",
+                "airpods-client-0.1.1/tests/client.rs",
                 b"// public crate contract tests",
             ),
             (
-                "airpods-client-0.1.0/src/lib.rs",
+                "airpods-client-0.1.1/src/lib.rs",
                 b"pub struct AirPodsClient;",
             ),
             (
-                "airpods-client-0.1.0/Cargo.toml",
-                b"[package]\nname='airpods-client'\nversion='0.1.0'\nlicense='MIT'\n",
+                "airpods-client-0.1.1/Cargo.toml",
+                b"[package]\nname='airpods-client'\nversion='0.1.1'\nlicense='MIT'\n",
             ),
         ],
         1,

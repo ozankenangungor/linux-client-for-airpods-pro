@@ -22,7 +22,7 @@ use clap::Parser;
 use cli::{Cli, Command, Release, Scope};
 use std::path::Path;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.1";
 
 fn validate(
     root: &Path,

@@ -7,6 +7,7 @@ import subprocess
 import tarfile
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,11 +19,23 @@ spec.loader.exec_module(distribution)
 
 
 class DistributionTests(unittest.TestCase):
+    def test_distribution_version_matches_desktop_and_public_packages(self):
+        version = distribution.load_lock()['version']
+        for file, section in [
+            ('pyproject.toml', 'project'),
+            ('packages/airpods-client-python/pyproject.toml', 'project'),
+            ('crates/airpods-client/Cargo.toml', 'package'),
+            ('crates/airpods-desktop/Cargo.toml', 'package'),
+        ]:
+            with self.subTest(file=file):
+                metadata = tomllib.loads((ROOT / file).read_text())
+                self.assertEqual(metadata[section]['version'], version)
+
     def test_workflow_trusts_explicit_source_before_build_and_names_its_revision(self):
         workflow = (ROOT / '.github/workflows/distribution.yml').read_text()
         triggers = workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
         self.assertEqual(re.findall(r'^  ([\w_]+):', triggers, re.M), ['workflow_dispatch'])
-        self.assertIn('default: v0.1.0', triggers)
+        self.assertIn('default: main', triggers)
         self.assertIn('required: true', triggers)
         permissions = re.findall(r'^\s+([\w-]+):\s+(read|write|none)\s*$', workflow, re.M)
         self.assertEqual(permissions, [('contents', 'read')])
@@ -329,7 +342,7 @@ class DistributionTests(unittest.TestCase):
     def test_new_images_are_source_named_review_artifacts(self):
         sha = 'a' * 40
         self.assertEqual(distribution.review_image_name(sha), 'AirPods-HR-review-' + sha + '-x86_64.AppImage')
-        self.assertNotIn('0.1.0', distribution.review_image_name(sha))
+        self.assertNotIn(distribution.load_lock()['version'], distribution.review_image_name(sha))
         with self.assertRaises(ValueError):
             distribution.review_image_name('main')
 

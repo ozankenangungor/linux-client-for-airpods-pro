@@ -30,7 +30,7 @@ from typing import Any, NoReturn, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_CLIENT_ROOT = ROOT / "packages/airpods-client-python"
 RUST_CLIENT_ROOT = ROOT / "crates/airpods-client"
-RELEASE_VERSION = "0.1.0"
+RELEASE_VERSION = "0.1.1"
 PRODUCTION_WHEEL_TAG = "cp314-cp314-manylinux_2_34_x86_64"
 MANIFEST_SCHEMA_VERSION = 1
 BUILD_VERSION = "1.3.0"
@@ -669,7 +669,7 @@ def clean_install_production(wheel: Path, work: Path) -> None:
             HeartRateReportTruncatedError, HeartRateReportIDError,
             HeartRateReport, parse_heart_rate_packet,
         )
-        assert importlib.metadata.version("airpods-hr-linux") == "0.1.0"
+        assert importlib.metadata.version("airpods-hr-linux") == "0.1.1"
         assert "hub" not in " ".join(airpods_hr.__all__).lower()
         assert "PYTHONPATH" not in os.environ
         # Public imports alone must load the extension from this installation.
@@ -1046,7 +1046,7 @@ def clean_install_python_client(wheel: Path, work: Path) -> None:
         from pathlib import Path
         from airpods_client import AirPodsClient, ConnectionFailed, XdgRuntimeDirMissing
 
-        assert importlib.metadata.version("airpods-client") == "0.1.0"
+        assert importlib.metadata.version("airpods-client") == "0.1.1"
         async def check():
             os.environ.pop("XDG_RUNTIME_DIR", None)
             try:

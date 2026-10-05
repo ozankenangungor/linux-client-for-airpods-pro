@@ -10,8 +10,12 @@ use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-pub const IDENTITY: &str = "airpods-hr-linux AppImage v1\n0.1.0\n";
-const IMAGE_NAME: &str = "AirPods-HR-0.1.0-x86_64.AppImage";
+pub const IDENTITY: &str = concat!(
+    "airpods-hr-linux AppImage v1\n",
+    env!("CARGO_PKG_VERSION"),
+    "\n"
+);
+const IMAGE_NAME: &str = concat!("AirPods-HR-", env!("CARGO_PKG_VERSION"), "-x86_64.AppImage");
 const MAX_IMAGE: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -92,7 +96,9 @@ impl Payload {
     }
 
     pub fn stable_image(data: &Path) -> PathBuf {
-        data.join("app/0.1.0").join(IMAGE_NAME)
+        data.join("app")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join(IMAGE_NAME)
     }
 
     pub async fn install(

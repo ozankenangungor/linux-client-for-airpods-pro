@@ -6,7 +6,7 @@ on:
       source_ref:
         description: Source tag, branch, or commit to package
         required: true
-        default: v0.1.0
+        default: main
         type: string
 
 permissions:

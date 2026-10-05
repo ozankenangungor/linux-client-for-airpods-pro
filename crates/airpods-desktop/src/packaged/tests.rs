@@ -112,7 +112,7 @@ fn packaged_detection_rejects_spoofed_executable() {
 fn versioned_path_is_stable_and_not_a_mount_path() {
     assert_eq!(
         Payload::stable_image(Path::new("/data/airpods-hr-linux")),
-        Path::new("/data/airpods-hr-linux/app/0.1.0/AirPods-HR-0.1.0-x86_64.AppImage")
+        Path::new("/data/airpods-hr-linux/app/0.1.1/AirPods-HR-0.1.1-x86_64.AppImage")
     );
 }
 #[tokio::test]
@@ -160,8 +160,9 @@ async fn interrupted_copy_never_accepts_partial_executable() {
     let payload = f.payload.clone();
     let target = data.clone();
     let copy = tokio::spawn(async move { payload.install(&target, &stop).await });
-    let stage = data
-        .join("app/0.1.0")
+    let stage = Payload::stable_image(&data)
+        .parent()
+        .unwrap()
         .join(format!(".image-{}", std::process::id()));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !stage.exists() {

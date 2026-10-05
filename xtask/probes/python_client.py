@@ -8,7 +8,7 @@ from pathlib import Path
 import airpods_client as client
 
 distribution = metadata.distribution("airpods-client")
-assert distribution.version == "0.1.0" and not distribution.requires
+assert distribution.version == "0.1.1" and not distribution.requires
 assert "PYTHONPATH" not in os.environ
 installed = Path(distribution.locate_file("")).resolve()
 assert "site-packages" in installed.parts and installed.is_relative_to(Path(sys.prefix).resolve())

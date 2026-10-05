@@ -5,7 +5,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const IDENTITY: &str = "airpods-hr-linux AppImage v1\n0.1.0\n";
+const IDENTITY: &str = concat!(
+    "airpods-hr-linux AppImage v1\n",
+    env!("CARGO_PKG_VERSION"),
+    "\n"
+);
 
 fn command(root: &Path, args: &[std::ffi::OsString]) -> std::io::Result<(Command, bool)> {
     if std::fs::read_to_string(root.join("airpods-distribution"))? != IDENTITY {

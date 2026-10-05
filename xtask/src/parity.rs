@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-const ORACLE_BLOB: &str = "d95585edb6352f954f02c9de78378d3a332d019f";
+const ORACLE_BLOB: &str = "195292950d9698a1f4b3f6bd5329b315a4168eb2";
 const VALIDATOR_STAGE: &str = ".validator-stage";
 
 #[derive(Clone, Copy)]
