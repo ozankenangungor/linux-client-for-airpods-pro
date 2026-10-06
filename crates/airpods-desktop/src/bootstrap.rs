@@ -162,28 +162,22 @@ struct InstallPaths {
 
 impl InstallPaths {
     fn discover() -> Result<Self, Failure> {
-        let packaged = Payload::discover(
-            |key| std::env::var_os(key),
-            &std::env::current_exe().map_err(|_| Failure::PackagedDistribution)?,
-        )?;
-        Self::from_environment_with_payload(
-            |key| std::env::var_os(key),
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-            packaged,
-        )
+        let executable = std::env::current_exe().map_err(|_| Failure::PackagedDistribution)?;
+        let packaged = Payload::discover(|key| std::env::var_os(key), &executable)?;
+        Self::from_environment_with_payload(|key| std::env::var_os(key), &executable, packaged)
     }
 
     #[cfg(test)]
     fn from_environment(
         env: impl Fn(&str) -> Option<OsString>,
-        manifest: &Path,
+        executable: &Path,
     ) -> Result<Self, Failure> {
-        Self::from_environment_with_payload(env, manifest, None)
+        Self::from_environment_with_payload(env, executable, None)
     }
 
     fn from_environment_with_payload(
         env: impl Fn(&str) -> Option<OsString>,
-        manifest: &Path,
+        executable: &Path,
         packaged: Option<Payload>,
     ) -> Result<Self, Failure> {
         let base = |key: &str, fallback: &str| {
@@ -215,22 +209,7 @@ impl InstallPaths {
         let source = if packaged.is_some() {
             PathBuf::new()
         } else {
-            let source = manifest
-                .parent()
-                .and_then(Path::parent)
-                .ok_or(Failure::SourceCheckout)?
-                .canonicalize()
-                .map_err(|_| Failure::SourceCheckout)?;
-            let project = std::fs::read_to_string(source.join("pyproject.toml"))
-                .map_err(|_| Failure::SourceCheckout)?;
-            if !project.contains("\nname = \"airpods-hr-linux\"\n")
-                || !source.join("Cargo.toml").is_file()
-                || !source.join("Cargo.lock").is_file()
-                || !source.join("src/airpods_hr/service_installer.py").is_file()
-            {
-                return Err(Failure::SourceCheckout);
-            }
-            source
+            Self::source_checkout(executable)?
         };
         Ok(Self {
             source,
@@ -240,6 +219,48 @@ impl InstallPaths {
                 .join("systemd/user")
                 .join(service::UNIT_NAME),
         })
+    }
+
+    fn source_checkout(executable: &Path) -> Result<PathBuf, Failure> {
+        let executable = executable
+            .canonicalize()
+            .map_err(|_| Failure::SourceCheckout)?;
+        if executable
+            .file_name()
+            .is_none_or(|name| name != "airpods-desktop")
+            || !executable.is_file()
+        {
+            return Err(Failure::SourceCheckout);
+        }
+        let profile = executable.parent().ok_or(Failure::SourceCheckout)?;
+        if !matches!(
+            profile.file_name().and_then(|name| name.to_str()),
+            Some("debug" | "release")
+        ) {
+            return Err(Failure::SourceCheckout);
+        }
+        // Only ordinary Cargo output layouts establish a source relationship.
+        // A standalone copy must not adopt a checkout from its cwd or ancestors.
+        let parent = profile.parent().ok_or(Failure::SourceCheckout)?;
+        let target = if parent.file_name().is_some_and(|name| name == "target") {
+            parent
+        } else {
+            parent.parent().ok_or(Failure::SourceCheckout)?
+        };
+        if target.file_name().is_none_or(|name| name != "target") {
+            return Err(Failure::SourceCheckout);
+        }
+        let source = target.parent().ok_or(Failure::SourceCheckout)?;
+        let project = std::fs::read_to_string(source.join("pyproject.toml"))
+            .map_err(|_| Failure::SourceCheckout)?;
+        if !project.contains("\nname = \"airpods-hr-linux\"\n")
+            || !source.join("Cargo.toml").is_file()
+            || !source.join("Cargo.lock").is_file()
+            || !source.join("src/airpods_hr/service_installer.py").is_file()
+        {
+            return Err(Failure::SourceCheckout);
+        }
+        Ok(source.to_path_buf())
     }
 
     fn environment(&self) -> PathBuf {

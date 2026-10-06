@@ -1,5 +1,6 @@
 """Offline build-policy tests; no container, user service, or hardware actions."""
 import importlib.util
+import os
 import io
 import json
 import re
@@ -19,6 +20,35 @@ spec.loader.exec_module(distribution)
 
 
 class DistributionTests(unittest.TestCase):
+    def test_build_checkout_gate_rejects_dynamic_root_in_binaries_text_and_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / 'different host' / 'source é'
+            appdir = root / 'AppDir'; appdir.mkdir()
+            with patch.object(distribution, 'ROOT', checkout):
+                for name in ['AppRun', 'usr/bin/airpods-desktop', 'usr/share/metadata.txt']:
+                    file = appdir / name; file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_bytes(b'prefix\0' + os.fsencode(checkout) + b'\0suffix')
+                    with self.subTest(file=name), self.assertRaisesRegex(ValueError, 'build checkout path'):
+                        distribution.reject_build_checkout_paths(appdir)
+                    file.unlink()
+                link = appdir / 'checkout-link'
+                link.symlink_to(checkout / 'missing-file')
+                with self.assertRaisesRegex(ValueError, 'build checkout path'):
+                    distribution.reject_build_checkout_paths(appdir)
+
+    def test_build_checkout_gate_handles_chunk_boundaries_and_final_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / 'review.AppImage'
+            with patch.object(distribution, 'ROOT', root / 'source'):
+                marker = os.fsencode(distribution.ROOT)
+                image.write_bytes(b'\x7fELF' + b'x' * (1024 * 1024 - 8) + marker + b'end')
+                with self.assertRaisesRegex(ValueError, 'build checkout path'):
+                    distribution.reject_build_checkout_paths(image)
+                image.write_bytes(b'\x7fELF /airpods-source/crates/airpods-desktop /github/home/.cargo/registry')
+                distribution.reject_build_checkout_paths(image)
+
     def test_distribution_version_matches_desktop_and_public_packages(self):
         version = distribution.load_lock()['version']
         for file, section in [

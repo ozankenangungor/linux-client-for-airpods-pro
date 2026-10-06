@@ -30,6 +30,31 @@ impl Fixture {
         }
     }
 
+    fn source_executable(&self, layout: &str) -> PathBuf {
+        for (name, contents) in [
+            ("pyproject.toml", "[project]\nname = \"airpods-hr-linux\"\n"),
+            ("Cargo.toml", "[workspace]\n"),
+            ("Cargo.lock", "# fixture lockfile\n"),
+            (
+                "src/airpods_hr/service_installer.py",
+                "# fixture installer\n",
+            ),
+        ] {
+            let path = self.paths.source.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let executable = self
+            .paths
+            .source
+            .join("target")
+            .join(layout)
+            .join("airpods-desktop");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"fixture executable").unwrap();
+        executable
+    }
+
     fn environment(&self) {
         std::fs::create_dir_all(self.paths.environment().join("bin")).unwrap();
         for name in [
@@ -715,7 +740,8 @@ async fn closing_while_waiting_for_setup_lock_is_bounded() {
 
 #[test]
 fn xdg_paths_use_stable_data_and_installer_config_semantics() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = Fixture::new();
+    let executable = fixture.source_executable("debug");
     for xdg in [false, true] {
         let paths = InstallPaths::from_environment(
             |key| match key {
@@ -724,7 +750,7 @@ fn xdg_paths_use_stable_data_and_installer_config_semantics() {
                 "XDG_CONFIG_HOME" if xdg => Some("/home/example/config space".into()),
                 _ => None,
             },
-            manifest,
+            &executable,
         )
         .unwrap();
         assert_eq!(
@@ -749,7 +775,8 @@ fn xdg_paths_use_stable_data_and_installer_config_semantics() {
 
 #[test]
 fn relative_or_volatile_data_paths_and_arbitrary_source_roots_are_rejected() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = Fixture::new();
+    let executable = fixture.source_executable("debug");
     for data in [
         "relative",
         "/tmp/env",
@@ -764,7 +791,7 @@ fn relative_or_volatile_data_paths_and_arbitrary_source_roots_are_rejected() {
                     "XDG_DATA_HOME" => Some(data.into()),
                     _ => None,
                 },
-                manifest
+                &executable
             )
             .unwrap_err(),
             Failure::Storage
@@ -773,10 +800,111 @@ fn relative_or_volatile_data_paths_and_arbitrary_source_roots_are_rejected() {
     assert_eq!(
         InstallPaths::from_environment(
             |key| (key == "HOME").then(|| "/home/example".into()),
-            Path::new("/not/a/source/crates/airpods-desktop")
+            Path::new("/not/a/source/target/debug/airpods-desktop")
         )
         .unwrap_err(),
         Failure::SourceCheckout
+    );
+}
+
+#[test]
+fn source_checkout_is_discovered_from_canonical_cargo_output_layouts() {
+    let fixture = Fixture::new();
+    for layout in [
+        "debug",
+        "release",
+        "x86_64-unknown-linux-gnu/debug",
+        "x86_64-unknown-linux-gnu/release",
+    ] {
+        let executable = fixture.source_executable(layout);
+        assert_eq!(
+            InstallPaths::source_checkout(&executable).unwrap(),
+            fixture.paths.source.canonicalize().unwrap()
+        );
+    }
+    let link = fixture.root.join("standalone-link");
+    std::os::unix::fs::symlink(fixture.source_executable("debug"), &link).unwrap();
+    assert_eq!(
+        InstallPaths::source_checkout(&link).unwrap(),
+        fixture.paths.source.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn source_checkout_requires_every_existing_project_marker() {
+    let fixture = Fixture::new();
+    for marker in [
+        "pyproject.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/airpods_hr/service_installer.py",
+    ] {
+        let executable = fixture.source_executable("debug");
+        std::fs::remove_file(fixture.paths.source.join(marker)).unwrap();
+        assert_eq!(
+            InstallPaths::source_checkout(&executable).unwrap_err(),
+            Failure::SourceCheckout
+        );
+    }
+    let executable = fixture.source_executable("debug");
+    std::fs::write(
+        fixture.paths.source.join("pyproject.toml"),
+        "[project]\nname = \"unrelated\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        InstallPaths::source_checkout(&executable).unwrap_err(),
+        Failure::SourceCheckout
+    );
+}
+
+#[test]
+fn copied_or_moved_standalone_binary_cannot_adopt_an_unrelated_checkout() {
+    let original = Fixture::new();
+    let executable = original.source_executable("debug");
+    let unrelated = Fixture::new();
+    unrelated.source_executable("debug");
+    for location in [
+        "",
+        "bin",
+        "build/debug",
+        "target/other",
+        "target/debug/nested",
+    ] {
+        let copied = unrelated
+            .paths
+            .source
+            .join(location)
+            .join("airpods-desktop");
+        std::fs::create_dir_all(copied.parent().unwrap()).unwrap();
+        std::fs::copy(&executable, &copied).unwrap();
+        assert_eq!(
+            InstallPaths::source_checkout(&copied).unwrap_err(),
+            Failure::SourceCheckout
+        );
+    }
+    let moved = original.root.join("airpods-desktop");
+    std::fs::rename(&executable, &moved).unwrap();
+    assert_eq!(
+        InstallPaths::source_checkout(&moved).unwrap_err(),
+        Failure::SourceCheckout
+    );
+}
+
+#[test]
+fn packaged_paths_skip_source_discovery_even_for_a_nonexistent_executable() {
+    let payload = crate::packaged::tests::Fixture::new();
+    let paths = InstallPaths::from_environment_with_payload(
+        |key| (key == "HOME").then(|| "/home/example".into()),
+        Path::new("/missing/checkout/target/debug/airpods-desktop"),
+        Some(payload.payload.clone()),
+    )
+    .unwrap();
+    assert!(paths.source.as_os_str().is_empty());
+    assert_eq!(paths.packaged.unwrap().root, payload.payload.root);
+    assert_eq!(
+        paths.data,
+        PathBuf::from("/home/example/.local/share/airpods-hr-linux")
     );
 }
 

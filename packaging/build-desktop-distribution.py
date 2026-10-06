@@ -53,6 +53,24 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def reject_build_checkout_paths(payload):
+    marker = os.fsencode(ROOT.resolve())
+    paths = payload.rglob('*') if payload.is_dir() else [payload]
+    for path in paths:
+        label = path.relative_to(payload) if payload.is_dir() else path.name
+        if path.is_symlink():
+            if marker in os.fsencode(os.readlink(path)):
+                raise ValueError('build checkout path remains in ' + str(label))
+        elif path.is_file():
+            with path.open('rb') as stream:
+                overlap = b''
+                while chunk := stream.read(1024 * 1024):
+                    window = overlap + chunk
+                    if marker in window:
+                        raise ValueError('build checkout path remains in ' + str(label))
+                    overlap = window[-(len(marker) - 1):]
+
+
 def load_lock(path=LOCK):
     lock = json.loads(path.read_text())
     if lock['version'] != '0.1.1' or lock['architecture'] != 'x86_64' or lock['glibc_floor'] != '2.34':
@@ -530,12 +548,14 @@ def build(output):
         appdir.rename(relocated)
         runtime_import_smoke(relocated / 'usr/lib/airpods-hr-linux/python/bin/python3.14', work)
         relocated.rename(appdir)
+        reject_build_checkout_paths(appdir)
         tool = work / 'appimage-tool'
         tool.mkdir()
         assets['appimagetool'].chmod(0o700)
         run([assets['appimagetool'], '--appimage-extract'], cwd=tool, capture=True)
         image = output / review_image_name(commit)
         run([tool / 'squashfs-root/AppRun', '--runtime-file', assets['runtime'], appdir, image], env={**env, 'ARCH': 'x86_64'}, timeout=600)
+        reject_build_checkout_paths(image)
         smoke_demo(image, work)
         if run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture=True) != commit or run(['git', 'status', '--porcelain=v1'], cwd=ROOT, capture=True):
             raise ValueError('source changed during distribution build')
