@@ -20,6 +20,72 @@ spec.loader.exec_module(distribution)
 
 
 class DistributionTests(unittest.TestCase):
+    def test_host_desktop_dependencies_do_not_require_bundled_resolution(self):
+        hosts = {'libwayland-client.so.0', 'libwayland-cursor.so.0', 'libwayland-egl.so.1',
+                 'libxkbcommon.so.0', 'libxkbcommon-x11.so.0'}
+        self.assertEqual(distribution.DESKTOP_HOST_LIBRARIES, hosts)
+        self.assertTrue(hosts <= distribution.HOST_LIBRARIES)
+        self.assertFalse(distribution.HOST_LIBRARIES.intersection(distribution.DYNAMIC_LIBRARIES))
+        with tempfile.TemporaryDirectory() as temporary:
+            appdir = Path(temporary)
+            desktop = appdir / 'usr/bin/airpods-desktop'
+            desktop.parent.mkdir(parents=True); desktop.write_bytes(b'\x7fELF desktop')
+            with patch.object(distribution, 'DYNAMIC_LIBRARIES', []), \
+                 patch.object(distribution, 'run', return_value=''), \
+                 patch.object(distribution, 'needed', return_value=sorted(hosts)):
+                self.assertEqual(distribution.bundle_libraries(appdir), [])
+
+    def test_bundled_dependencies_skip_host_desktop_family_but_retain_usb(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            appdir = root / 'AppDir'; appdir.mkdir()
+            source = root / 'libraries'; source.mkdir()
+            for name in ['libusb-1.0.so.0', 'libudev.so.1']:
+                (source / name).write_bytes(name.encode())
+            cache = '\n'.join(name + ' (libc6,x86-64) => ' + str(source / name)
+                              for name in ['libusb-1.0.so.0', 'libudev.so.1'])
+            def dependencies(path):
+                if path.name == 'libusb-1.0.so.0':
+                    return ['libudev.so.1', *sorted(distribution.DESKTOP_HOST_LIBRARIES)]
+                return ['libc.so.6']
+            with patch.object(distribution, 'DYNAMIC_LIBRARIES', ['libusb-1.0.so.0']), \
+                 patch.object(distribution, 'run', return_value=cache), \
+                 patch.object(distribution, 'needed', side_effect=dependencies):
+                copied = distribution.bundle_libraries(appdir)
+            self.assertEqual({dest.name for _, dest in copied}, {'libusb-1.0.so.0', 'libudev.so.1'})
+            self.assertEqual({p.name for p in (appdir / 'usr/lib').iterdir()},
+                             {'libusb-1.0.so.0', 'libudev.so.1'})
+
+    def test_payload_inventory_rejects_host_desktop_files_and_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            appdir = Path(temporary)
+            directory = appdir / 'usr/lib/nested'; directory.mkdir(parents=True)
+            for soname in sorted(distribution.DESKTOP_HOST_LIBRARIES):
+                stem = soname.split('.so.', 1)[0] + '.so'
+                for name in [stem, soname, soname + '.99.1']:
+                    for symlink in [False, True]:
+                        with self.subTest(name=name, symlink=symlink):
+                            path = directory / name
+                            if symlink:
+                                path.symlink_to('missing-versioned-library')
+                            else:
+                                path.write_bytes(b'\x7fELF library')
+                            with self.assertRaisesRegex(ValueError, 'host desktop library'):
+                                distribution.payload_inventory(appdir, [])
+                            path.unlink()
+            harmless = directory / 'libwayland-client-notes.txt'; harmless.write_text('not a library')
+            self.assertEqual(distribution.payload_inventory(appdir, [])['elf_sha256'], {})
+
+    def test_payload_inventory_rejects_renamed_host_desktop_elf(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            appdir = Path(temporary)
+            renamed = appdir / 'renamed-library'; renamed.write_bytes(b'\x7fELF library')
+            for soname in sorted(distribution.DESKTOP_HOST_LIBRARIES):
+                with self.subTest(soname=soname), \
+                     patch.object(distribution, 'run', return_value='(SONAME) Library soname: [' + soname + ']'), \
+                     self.assertRaisesRegex(ValueError, 'host desktop library SONAME'):
+                    distribution.payload_inventory(appdir, [])
+
     def test_build_checkout_gate_rejects_dynamic_root_in_binaries_text_and_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -345,7 +411,7 @@ class DistributionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'binary signature'):
                     distribution.payload_inventory(root, [])
             binary.write_bytes(b'\x7fELF application')
-            with patch.object(distribution, 'needed', return_value=['libdb-6.0.so']), self.assertRaisesRegex(ValueError, 'ELF dependency'):
+            with patch.object(distribution, 'needed', return_value=['libdb-6.0.so']), patch.object(distribution, 'run', return_value=''), self.assertRaisesRegex(ValueError, 'ELF dependency'):
                 distribution.payload_inventory(root, [])
             with patch.object(distribution, 'needed', return_value=[]), patch.object(distribution, 'run', return_value='42 FUNC __db_create_pp'), self.assertRaisesRegex(ValueError, 'ELF symbols'):
                 distribution.payload_inventory(root, [])

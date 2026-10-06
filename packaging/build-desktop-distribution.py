@@ -22,6 +22,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / 'packaging/distribution-lock.json'
+DESKTOP_HOST_LIBRARIES = {
+    # Wayland integration must match the host graphics implementations.
+    'libwayland-client.so.0', 'libwayland-cursor.so.0', 'libwayland-egl.so.1',
+    # Keyboard integration must understand the host keymaps and Compose data.
+    'libxkbcommon.so.0', 'libxkbcommon-x11.so.0',
+}
 HOST_LIBRARIES = {
     'libc.so.6', 'libm.so.6', 'libdl.so.2', 'libpthread.so.0', 'librt.so.1',
     'libresolv.so.2', 'libutil.so.1', 'ld-linux-x86-64.so.2',
@@ -30,11 +36,11 @@ HOST_LIBRARIES = {
     'libgcc_s.so.1',
     # Graphics implementations must match the user's drivers, not the builder.
     'libGL.so.1', 'libEGL.so.1', 'libGLX.so.0', 'libGLdispatch.so.0',
+    *DESKTOP_HOST_LIBRARIES,
 }
 DYNAMIC_LIBRARIES = [
     'libX11.so.6', 'libXcursor.so.1', 'libXi.so.6', 'libXrandr.so.2',
-    'libxkbcommon.so.0', 'libxkbcommon-x11.so.0', 'libwayland-client.so.0',
-    'libwayland-cursor.so.0', 'libwayland-egl.so.1', 'libusb-1.0.so.0',
+    'libusb-1.0.so.0',
 ]
 
 
@@ -179,6 +185,7 @@ def payload_inventory(appdir, excluded):
     for path in appdir.rglob('*'):
         if re.match(r'libdb(?:[-.]|[0-9])', path.name) and '.so' in path.name:
             raise ValueError('Berkeley DB shared library remains: ' + path.name)
+    reject_bundled_desktop_libraries(appdir)
     libraries = {}
     for path in elf_files(appdir):
         # Check actual binary bytes and symbols, not optional upstream metadata.
@@ -214,6 +221,20 @@ def glibc_requirements(path):
 def needed(path):
     output = run(['readelf', '-d', path], capture=True, timeout=30)
     return re.findall(r'\(NEEDED\).*\[(.*?)\]', output)
+
+
+def reject_bundled_desktop_libraries(appdir):
+    stems = tuple(name.split('.so.', 1)[0] + '.so' for name in DESKTOP_HOST_LIBRARIES)
+    for path in appdir.rglob('*'):
+        # Include development names, versioned files and even dangling links.
+        if any(path.name == stem or path.name.startswith(stem + '.') for stem in stems):
+            raise ValueError('host desktop library remains in payload: ' + str(path.relative_to(appdir)))
+    for path in elf_files(appdir):
+        # A renamed ELF must not evade the policy enforced on library names.
+        dynamic = run(['readelf', '-d', path], capture=True, timeout=30)
+        sonames = re.findall(r'\(SONAME\).*\[(.*?)\]', dynamic)
+        if any(name == stem or name.startswith(stem + '.') for name in sonames for stem in stems):
+            raise ValueError('host desktop library SONAME remains in payload: ' + str(path.relative_to(appdir)))
 
 
 def bundle_libraries(appdir):
